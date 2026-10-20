@@ -29,9 +29,8 @@ written before most of the code.
   (ADR-019), limits and stats come from cgroup v2 (ADR-020), ExecSync
   joins a running container (ADR-021), pods get their network from CNI
   plugins (ADR-022), and containers run as the user asked for
-  (ADR-023). What the kubelet needs beyond that, in order: HTTPS
-  registries (TLS), streaming exec, pods that survive a runtime
-  restart.
+  (ADR-023). What the kubelet needs beyond that, in order: streaming
+  exec, pods that survive a runtime restart.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
@@ -76,7 +75,8 @@ built:
 | Later or never | the Stream* variants, CheckpointContainer, CheckpointPod, RestorePod, ListMetricDescriptors, ListPodSandboxMetrics, UpdateRuntimeConfig, UpdatePodSandboxResources | no |
 
 **ImageService:** ListImages, ImageStatus, PullImage, RemoveImage,
-ImageFsInfo, all built; PullImage over plain HTTP only until TLS.
+ImageFsInfo, all built; PullImage over HTTPS with QuantyCore's
+unreviewed TLS, or plain HTTP where asked.
 
 Exec, Attach and PortForward do not stream over gRPC. They return a URL,
 and the kubelet proxies the client's connection to an HTTP server the

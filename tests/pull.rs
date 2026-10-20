@@ -152,6 +152,7 @@ fn an_image_is_pulled_and_imported() {
     }
     let opts = Options {
         plain_http: vec![addr.clone()],
+        ..Default::default()
     };
 
     let image = format!("{addr}/test/box:1");
@@ -213,5 +214,164 @@ fn an_image_is_pulled_and_imported() {
         .insert("realm".into(), ("localhost".into(), Vec::new()));
     let err = registry::pull(&image, &base.join("layout4"), &opts, Some(&creds)).unwrap_err();
     assert!(err.to_string().contains("401"), "{err}");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// Reads a request head off any stream and returns its target.
+fn read_target(s: &mut impl std::io::Read) -> String {
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b).unwrap_or(0) == 0 {
+            break;
+        }
+        head.push(b[0]);
+    }
+    let line = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    line.split_whitespace().nth(1).unwrap_or("").to_string()
+}
+
+#[test]
+fn an_image_is_pulled_over_tls_through_a_proxy() {
+    use quantycore::tls::crypto::ec::Curve;
+    use quantycore::tls::x509::build::{issue, Issuer, Params, SanEntry};
+    use quantycore::tls::x509::{PrivateKey, RootStore};
+    use quantycore::tls::{ClientConfig, ServerConfig, ServerConnection, Stream};
+
+    let base = std::env::temp_dir().join(format!("qk-pull-tls-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("root/etc")).unwrap();
+    fs::write(base.join("root/etc/greeting"), "over tls\n").unwrap();
+    let layer = Command::new("tar")
+        .args(["-czf", "-", "-C"])
+        .arg(base.join("root"))
+        .arg(".")
+        .output()
+        .unwrap()
+        .stdout;
+    let config = br#"{"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#;
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{}","size":{}}}]}}"#,
+        digest(config),
+        config.len(),
+        digest(&layer),
+        layer.len()
+    );
+    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+    files.insert("/v2/test/box/manifests/1".into(), manifest.into_bytes());
+    files.insert(
+        format!("/v2/test/box/blobs/{}", digest(config)),
+        config.to_vec(),
+    );
+    files.insert(format!("/v2/test/box/blobs/{}", digest(&layer)), layer);
+
+    // a CA of the test's own, and a certificate from it for localhost
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ca_key = PrivateKey::generate_ec(Curve::P256).unwrap();
+    let ca = issue(
+        &Params::ca("test CA", now - 3600, now + 3600),
+        &ca_key.public_spki(),
+        None,
+        &ca_key,
+    )
+    .unwrap();
+    let key = PrivateKey::generate_ec(Curve::P256).unwrap();
+    let leaf = issue(
+        &Params::end_entity(
+            "localhost",
+            vec![SanEntry::Dns("localhost".into())],
+            now - 3600,
+            now + 3600,
+        ),
+        &key.public_spki(),
+        Some(&Issuer::from_certificate(&ca, &ca_key).unwrap()),
+        &key,
+    )
+    .unwrap();
+    let server = Arc::new(ServerConfig::new(vec![leaf], key).unwrap());
+
+    let registry = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = registry.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in registry.incoming() {
+            let Ok(tcp) = conn else { return };
+            let mut s = Stream::new(ServerConnection::new(server.clone()), tcp);
+            if s.handshake().is_err() {
+                continue;
+            }
+            let body = files.get(&read_target(&mut s)).cloned();
+            let head = match &body {
+                Some(b) => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    b.len()
+                ),
+                None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            };
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body.unwrap_or_default());
+            let _ = s.close();
+        }
+    });
+
+    // a proxy that only tunnels, and counts the tunnels it made
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = proxy.local_addr().unwrap().port();
+    let tunnels = Arc::new(Mutex::new(0));
+    {
+        let tunnels = tunnels.clone();
+        std::thread::spawn(move || {
+            for conn in proxy.incoming() {
+                let Ok(mut client) = conn else { return };
+                let target = read_target(&mut client);
+                assert_eq!(target, format!("localhost:{port}"));
+                let upstream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                client
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .unwrap();
+                *tunnels.lock().unwrap() += 1;
+                let (mut a, b) = (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                std::thread::spawn(move || std::io::copy(&mut a, &mut b.try_clone().unwrap()));
+                let (mut c, mut d) = (upstream, client);
+                std::thread::spawn(move || std::io::copy(&mut c, &mut d));
+            }
+        });
+    }
+
+    let opts = |roots: RootStore| Options {
+        tls: Some(Arc::new(ClientConfig::new(roots))),
+        proxy: Some(("127.0.0.1".into(), proxy_port)),
+        ..Default::default()
+    };
+    let mut trusted = RootStore::new();
+    trusted.add_der(&ca).unwrap();
+    let image = format!("localhost:{port}/test/box:1");
+
+    // a server whose certificate does not chain to a trusted root is
+    // refused before a byte of the image is read
+    let err = registry::pull(
+        &image,
+        &base.join("untrusted"),
+        &opts(RootStore::new()),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("trusted root"), "{err}");
+
+    registry::pull(&image, &base.join("layout"), &opts(trusted), None).unwrap();
+    assert!(*tunnels.lock().unwrap() >= 4);
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    let img = rt.import(&base.join("layout"), &image).unwrap();
+    let unpacked = base
+        .join("state/images")
+        .join(&img.id[7..])
+        .join("rootfs/etc/greeting");
+    assert_eq!(fs::read_to_string(unpacked).unwrap(), "over tls\n");
     fs::remove_dir_all(&base).unwrap();
 }

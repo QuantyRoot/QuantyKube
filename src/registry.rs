@@ -5,17 +5,73 @@
 
 use quantycore::http1::{self, Request, Url};
 use quantycore::json::{self, Value};
+use quantycore::tls::{self, x509::RootStore, ClientConfig, ClientConnection};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Registries reached without TLS, by host or host:port. Everything else
-/// needs HTTPS, which waits for TLS in QuantyCore.
-#[derive(Debug, Clone, Default)]
+/// How registries are reached.
+#[derive(Clone, Default)]
 pub struct Options {
+    /// Registries reached without TLS, by host or host:port.
     pub plain_http: Vec<String>,
+    /// For everything else; HTTPS is refused without it.
+    pub tls: Option<Arc<ClientConfig>>,
+    /// An HTTP proxy that HTTPS is tunnelled through with CONNECT, and the
+    /// hosts that bypass it, as `HTTPS_PROXY` and `NO_PROXY` name them.
+    pub proxy: Option<(String, u16)>,
+    pub no_proxy: Vec<String>,
+}
+
+impl Options {
+    /// The system's root certificates and the proxy from the environment.
+    pub fn from_system(plain_http: Vec<String>) -> io::Result<Options> {
+        let roots = RootStore::system()?;
+        let env = |k: &str| {
+            std::env::var(k)
+                .or_else(|_| std::env::var(k.to_lowercase()))
+                .ok()
+        };
+        let proxy = env("HTTPS_PROXY")
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let url =
+                    http1::parse_url(&p).map_err(|e| invalid(format!("HTTPS_PROXY: {e:?}")))?;
+                if url.scheme != "http" {
+                    return Err(invalid("HTTPS_PROXY must be an http:// proxy"));
+                }
+                Ok((url.host, url.port))
+            })
+            .transpose()?;
+        let no_proxy = env("NO_PROXY")
+            .map(|v| {
+                v.split(',')
+                    .map(|h| {
+                        h.trim()
+                            .trim_start_matches("*.")
+                            .trim_start_matches('.')
+                            .to_lowercase()
+                    })
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Options {
+            plain_http,
+            tls: Some(Arc::new(ClientConfig::new(roots))),
+            proxy,
+            no_proxy,
+        })
+    }
+
+    fn bypasses_proxy(&self, host: &str) -> bool {
+        self.no_proxy
+            .iter()
+            .any(|n| n == "*" || host == n || host.ends_with(&format!(".{n}")))
+    }
 }
 
 /// What the kubelet passes from an image pull secret.
@@ -120,16 +176,42 @@ impl Client<'_> {
                 .plain_http
                 .iter()
                 .any(|h| *h == url.host || *h == format!("{}:{}", url.host, url.port));
-        if !plain {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("{} needs HTTPS, which is not supported yet", url.host),
-            ));
+        let tcp = |host: &str, port: u16| -> io::Result<TcpStream> {
+            let s = TcpStream::connect((host, port))?;
+            s.set_read_timeout(Some(Duration::from_secs(60)))?;
+            s.set_write_timeout(Some(Duration::from_secs(60)))?;
+            Ok(s)
+        };
+        if plain {
+            return Ok(Box::new(tcp(&url.host, url.port)?));
         }
-        let s = TcpStream::connect((url.host.as_str(), url.port))?;
-        s.set_read_timeout(Some(Duration::from_secs(60)))?;
-        s.set_write_timeout(Some(Duration::from_secs(60)))?;
-        Ok(Box::new(s))
+        let config = self.opts.tls.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{} needs HTTPS, and no TLS configuration was given",
+                    url.host
+                ),
+            )
+        })?;
+        let sock = match &self.opts.proxy {
+            Some((host, port)) if !self.opts.bypasses_proxy(&url.host) => {
+                let mut s = tcp(host, *port)?;
+                let host = if url.host.contains(':') {
+                    format!("[{}]", url.host)
+                } else {
+                    url.host.clone()
+                };
+                tunnel(&mut s, &format!("{host}:{}", url.port))?;
+                s
+            }
+            _ => tcp(&url.host, url.port)?,
+        };
+        let conn = ClientConnection::new(config, &url.host)
+            .map_err(|e| io::Error::other(format!("TLS: {e}")))?;
+        let mut stream = tls::Stream::new(conn, sock);
+        stream.handshake()?;
+        Ok(Box::new(stream))
     }
 
     /// GETs `url`, answering one Bearer challenge and following up to five
@@ -242,6 +324,33 @@ impl Client<'_> {
             .map(|t| format!("Bearer {t}"))
             .ok_or_else(|| invalid("token response without a token"))
     }
+}
+
+/// Asks an HTTP proxy for a tunnel to `authority` and reads its answer,
+/// byte by byte so that nothing of the TLS that follows is consumed.
+fn tunnel(s: &mut TcpStream, authority: &str) -> io::Result<()> {
+    write!(
+        s,
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+    )?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Err(invalid("proxy answer too long"));
+        }
+        s.read_exact(&mut byte)?;
+        head.push(byte[0]);
+    }
+    let line = head.split(|&b| b == b'\r').next().unwrap_or_default();
+    let status = line.split(|&b| b == b' ').nth(1).unwrap_or_default();
+    if !line.starts_with(b"HTTP/1.") || status != b"200" {
+        return Err(io::Error::other(format!(
+            "proxy refused the tunnel: {}",
+            String::from_utf8_lossy(line)
+        )));
+    }
+    Ok(())
 }
 
 fn base64(data: &[u8]) -> String {

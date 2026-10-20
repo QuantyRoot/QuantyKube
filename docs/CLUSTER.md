@@ -40,11 +40,9 @@ k3s agent --server https://<cp>:6443 --token <token> \
 ```
 
 To check first, in this order: that the two CNI paths are where k3s
-v1.37.1 puts them; that the agent leaves out its own containerd when
-given an endpoint; and how images arrive, since registries need HTTPS
-the runtime does not have yet. Until it does, `skopeo copy` to an OCI
-layout and `quantykube import` on w1 (or a registry on cp reached with
-`--plain-http`).
+v1.37.1 puts them; and that the agent leaves out its own containerd
+when given an endpoint. Images are pulled over HTTPS by the runtime
+itself; `quantykube import` from an OCI layout is the fallback.
 
 ## w2, the comparison
 

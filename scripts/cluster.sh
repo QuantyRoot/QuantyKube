@@ -86,8 +86,9 @@ spec:
       exec: {command: [test, -e, /tmp/alive]}
       periodSeconds: 2
   - name: caps
-    image: test/busybox:1
-    imagePullPolicy: Never
+    # pulled by the runtime itself, over HTTPS
+    image: mirror.gcr.io/library/busybox:1.36
+    imagePullPolicy: IfNotPresent
     command: [sh, -c, 'grep CapEff /proc/self/status; exec sleep 3600']
     securityContext:
       capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}

@@ -738,17 +738,26 @@ place whichever way an image arrives, and a registry that serves the
 wrong bytes produces an error, not an image. References are read the
 way Docker reads them: `busybox` is `docker.io/library/busybox:latest`.
 
-HTTP goes through QuantyCore's HTTP/1.1 client. Until QuantyCore has
-TLS, only registries named with `--plain-http` can be reached, which is
-how a local registry in an air gapped network is usually run.
+HTTP goes through QuantyCore's HTTP/1.1 client and HTTPS through its
+TLS, which is unreviewed (QuantyCore ADR-003), against the system's root
+certificates. Behind a proxy, HTTPS is tunnelled with CONNECT through
+the proxy `HTTPS_PROXY` names, except for hosts in `NO_PROXY`, the way
+containerd and most other clients read them. Registries named with
+`--plain-http` are reached without TLS, as a local registry in an air
+gapped network often is. A test pulls through a CONNECT proxy from a
+registry whose certificate comes from a CA made for the test, and is
+refused when that CA is not trusted; by hand, the same binary pulls from
+GCR, registry.k8s.io, GHCR and Quay through an intercepting proxy.
 
 Credentials from an image pull secret are sent only to the token
 endpoint, as HTTP Basic, or to a registry that asks for Basic itself; a
 token issued by the registry is used as it is. They never follow a
 redirect to another host.
 
-**The cost:** no public registry is reachable before TLS, and identity
-tokens, which need an OAuth2 exchange, are refused.
+**The cost:** the registry and the proxy are trusted with whatever TLS
+does not catch until the TLS has been reviewed; identity tokens, which
+need an OAuth2 exchange, are refused; and plain HTTP is never sent
+through the proxy.
 
 ## ADR-026: Without a device filter there is no MKNOD
 

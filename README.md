@@ -69,7 +69,7 @@ watches see the object return.
 | TLS, so the store can be reached over a network | waiting for QuantyCore |
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
 | A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
-| Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls from plain HTTP registries; pod start measured against containerd |
+| Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |
 | Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
 
 ## Trying it
@@ -102,8 +102,10 @@ target/release/quantykube runtime --root /var/lib/quantykube-runtime \
   --socket /run/quantykube-cri.sock
 ```
 
-Images come from `quantykube import` or, until TLS is in, a registry
-reached over plain HTTP (`--plain-http`).
+Images are pulled from their registries, or put there with `quantykube
+import`. **The TLS under those pulls is QuantyCore's own and has not been
+reviewed by anyone who did not write it**; until it has, treat a pull as
+no safer than the network it crosses.
 
 ## How it is built
 

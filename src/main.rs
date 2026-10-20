@@ -43,8 +43,10 @@ runtime serves the kubelet's Container Runtime Interface on the socket,
 keeping images and container state under --root. Pods get their network
 from the first CNI configuration in --cni-conf, /etc/cni/net.d by
 default, with plugins from --cni-bin, /opt/cni/bin. Images are pulled
-only from registries named with --plain-http (host or host:port, comma
-separated) until TLS is in; pull does the same from the command line.
+over HTTPS against the system's root certificates, through HTTPS_PROXY
+unless NO_PROXY names the host, or over plain HTTP from registries named
+with --plain-http (host or host:port, comma separated); pull does the
+same from the command line. The TLS is QuantyCore's and unreviewed.
 import puts an image there from an OCI image layout, as `skopeo copy
 docker://<image> oci:<dir>` writes one, or from a directory holding a
 manifest.json and blobs/. Every blob is checked against its digest.";
@@ -337,7 +339,7 @@ fn runtime(args: &[String]) -> Result<(), String> {
         Some(c) => eprintln!("quantykube: pod network {}", c.name()),
         None => eprintln!("quantykube: no CNI configuration in {} yet", conf.display()),
     }
-    let registries = registry_options(args);
+    let registries = registry_options(args)?;
     // whoever can connect can run anything as root on the node
     let listener = private_socket(&socket)?;
     eprintln!("quantykube: runtime on unix://{}", socket.display());
@@ -345,12 +347,11 @@ fn runtime(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn registry_options(args: &[String]) -> quantykube::registry::Options {
-    quantykube::registry::Options {
-        plain_http: value(args, "--plain-http")
-            .map(|v| v.split(',').map(str::to_string).collect())
-            .unwrap_or_default(),
-    }
+fn registry_options(args: &[String]) -> Result<quantykube::registry::Options, String> {
+    let plain = value(args, "--plain-http")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    quantykube::registry::Options::from_system(plain).map_err(|e| format!("registries: {e}"))
 }
 
 fn pull(args: &[String]) -> Result<(), String> {
@@ -358,7 +359,7 @@ fn pull(args: &[String]) -> Result<(), String> {
     let image = args.last().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
     let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
     let img = rt
-        .pull(image, &registry_options(args), None)
+        .pull(image, &registry_options(args)?, None)
         .map_err(|e| format!("{image}: {e}"))?;
     println!("{}", img.id);
     Ok(())
