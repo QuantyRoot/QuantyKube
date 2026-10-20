@@ -9,17 +9,32 @@ written before most of the code.
 
 - `quantykube unpack` applies real image layers to a directory, safely
   (ADR-016).
-- `quantykube sandbox` starts a command in new mount, PID, UTS, IPC and
-  network namespaces with that directory as its root, read only if asked
-  (ADR-013). alpine, busybox and nginx run in it.
+- `quantykube sandbox` starts a command the way runc's default
+  configuration does, except for seccomp: new mount, PID, UTS, IPC and
+  network namespaces; the root pivoted, read only if asked; a fresh
+  `/dev` with the six standard devices, `devpts` and `/dev/shm`; `/sys`
+  read only; the paths runc masks or makes read only under `/proc` and
+  `/sys`; Docker's fourteen default capabilities in every set, the rest
+  dropped from the bounding set, and `no_new_privs`; and, with
+  `--cgroup`, a cgroup v2 with memory and pid limits that the process is
+  in before any of its own code runs (ADR-013). alpine, busybox and nginx
+  run in it.
 
-`scripts/sandbox.sh` times it against runc on the same root filesystem.
-On the development machine: a median of 2.7 ms against runc's 30 ms to
-run `/bin/true`. That is a floor, not a result. runc also creates a
-cgroup, drops capabilities, installs a seccomp filter, builds `/dev` and
-masks paths under `/proc`, and the sandbox does none of that yet. The
-comparison that counts is the one at the end of this file, with the same
-work done on both sides.
+`scripts/sandbox.sh` checks all of that from inside the container and
+times a start against runc on the same root filesystem. On the
+development machine, two runs of 50 starts of `/bin/true`, quiet machine:
+
+| | median | p90 |
+| --- | --- | --- |
+| `quantykube sandbox` | 3.5 to 4.0 ms | 3.9 to 4.9 ms |
+| `runc run` | 23.7 to 25.1 ms | 35.0 to 35.4 ms |
+
+What the gap is made of, as far as is known: runc is a Go binary that
+starts, re-executes itself to set up namespaces in C, and talks to its
+child over a socket; the sandbox clones once. runc still does more:
+seccomp, cgroup setup on every run, and AppArmor or SELinux labels where
+the host has them. Until the sandbox does those too, this is a lower
+bound on what can be won, not a result.
 
 ## What the kubelet calls
 

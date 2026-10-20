@@ -38,6 +38,14 @@ s -- /bin/sh -c 'exit 7' && code=0 || code=$?
 [ "$code" = 7 ] || { echo "FAIL: exit status $code, want 7"; exit 1; }
 expect "quantykube: setup failed at Exec" s -- /missing
 [ "$(hostname)" != box ] || { echo "FAIL: hostname leaked to the host"; exit 1; }
+expect $'CapEff:\t00000000a80425fb\nCapBnd:\t00000000a80425fb\nNoNewPrivs:\t1' \
+    s -- /bin/sh -c 'while read -r l; do case $l in CapEff*|CapBnd*|NoNewPrivs*) echo "$l";; esac; done < /proc/self/status'
+expect "full null ptmx pts random shm stderr stdin stdout tty urandom zero fd" \
+    s -- /bin/sh -c 'cd /dev; echo full null ptmx pts random shm stderr stdin stdout tty urandom zero fd; for f in *; do case " full null ptmx pts random shm stderr stdin stdout tty urandom zero fd " in *" $f "*) ;; *) echo "extra /dev/$f";; esac; done'
+expect "/bin/sh: 1: cannot create /sys/x: Read-only file system" s -- /bin/sh -c 'echo > /sys/x'
+if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+    expect "0::/quantykube/check" s --cgroup check --pids 20 -- /bin/cat /proc/self/cgroup
+fi
 echo "sandbox: ok"
 
 [ -n "${RUNC:-}" ] || exit 0

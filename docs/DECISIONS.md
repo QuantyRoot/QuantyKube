@@ -391,8 +391,11 @@ may have held a lock at the moment of the clone, and the child's copy of
 that lock would never be released. Failures are reported as the child's
 exit status, one number per setup step.
 
-`quantykube sandbox` exposes it for measuring against runc. It is not a
-runtime: no cgroups yet, no CRI, no images.
+`quantykube sandbox` exposes it for measuring against runc, with what
+runc's default configuration does except seccomp (docs/RUNTIME.md). The
+child waits on a pipe until the parent has put it into its cgroup, so
+none of its own code runs outside the limits. It is not a runtime yet:
+no CRI, no seccomp, no image store.
 
 **The cost:** a crate of code the compiler cannot check, written against
 one libc and one architecture, x86_64 Linux, until a second one is needed.

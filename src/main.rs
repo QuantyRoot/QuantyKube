@@ -15,7 +15,8 @@ const USAGE: &str = "usage:
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube unpack  --to <dir> <layer.tar.gz>...
-  quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly] -- <command>...
+  quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
+                     [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
 
 serve is the store. --retain keeps history, 1h by default; --snapshots
 keeps QuantyDB snapshots, 1m by default, and older revisions are rebuilt
@@ -188,14 +189,51 @@ fn sandbox(args: &[String]) -> Result<(), String> {
     if let Some(h) = value(opts, "--hostname") {
         spawn = spawn.hostname(h.as_bytes()).map_err(|e| e.to_string())?;
     }
-    let pid = spawn.start().map_err(|e| format!("clone: {e}"))?;
-    match quantykube_sys::wait(pid).map_err(|e| e.to_string())? {
+    let child = spawn.start().map_err(|e| format!("clone: {e}"))?;
+    let pid = child.pid;
+    // the child waits until it is in its cgroup, so nothing it runs is
+    // ever outside the limits
+    let cgroup = match value(opts, "--cgroup") {
+        Some(name) => Some(join_cgroup(name, pid, opts)?),
+        None => None,
+    };
+    child.release().map_err(|e| e.to_string())?;
+    let exit = quantykube_sys::wait(pid).map_err(|e| e.to_string())?;
+    if let Some(dir) = cgroup {
+        let _ = std::fs::remove_dir(dir);
+    }
+    match exit {
         quantykube_sys::Exit::Code(0) => Ok(()),
         quantykube_sys::Exit::Code(c) if quantykube_sys::Step::from_status(c).is_none() => {
             std::process::exit(c)
         }
         e => Err(quantykube_sys::describe(e)),
     }
+}
+
+/// Creates `quantykube/<name>` in the cgroup v2 hierarchy, sets the limits
+/// asked for and moves `pid` into it.
+fn join_cgroup(name: &str, pid: i32, opts: &[String]) -> Result<PathBuf, String> {
+    let base = Path::new("/sys/fs/cgroup");
+    if !base.join("cgroup.controllers").exists() {
+        return Err("--cgroup needs the cgroup v2 hierarchy at /sys/fs/cgroup".into());
+    }
+    let parent = base.join("quantykube");
+    let dir = parent.join(name);
+    let io = |e: std::io::Error, p: &Path| format!("{}: {e}", p.display());
+    std::fs::create_dir_all(&dir).map_err(|e| io(e, &dir))?;
+    // limits take effect only where the parent delegates the controller
+    let _ = std::fs::write(base.join("cgroup.subtree_control"), "+memory +pids +cpu");
+    let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+memory +pids +cpu");
+    for (flag, file) in [("--memory", "memory.max"), ("--pids", "pids.max")] {
+        if let Some(v) = value(opts, flag) {
+            let p = dir.join(file);
+            std::fs::write(&p, v).map_err(|e| io(e, &p))?;
+        }
+    }
+    let procs = dir.join("cgroup.procs");
+    std::fs::write(&procs, pid.to_string()).map_err(|e| io(e, &procs))?;
+    Ok(dir)
 }
 
 fn duration(s: &str) -> Result<Duration, String> {
