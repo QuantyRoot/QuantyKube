@@ -12,6 +12,7 @@ through and add a new entry, never silently edit history.
 - [ADR-005](#adr-005-sandbox-means-the-node-runtime-behind-cri) Sandbox means the node runtime behind CRI
 - [ADR-006](#adr-006-one-storage-interface-quantydb-behind-it-first) One storage interface, QuantyDB behind it first
 - [ADR-007](#adr-007-apache-20-and-money-from-what-surrounds-the-code) Apache 2.0, and money from what surrounds the code
+- [ADR-008](#adr-008-raft-comes-later-and-starts-with-a-simulator) Raft comes later, and starts with a simulator
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -182,3 +183,31 @@ what surrounds it: support, operation, and features built on top that are
 offered separately. Anything that might ever be sold separately must be
 designed as a separate piece from the start, not cut out of the open code
 later.
+
+## ADR-008: Raft comes later, and starts with a simulator
+
+Multiple store nodes with Raft are the goal of the next phase, not of the
+first demonstration. ADR-001 stands for that date.
+
+Raft is short on paper and notoriously hard to get right in practice. The
+failures that matter, a lost acknowledged write or two leaders at once,
+appear only under particular interleavings of crashes, partitions and
+delays, and a demonstration date is the wrong pressure to build that
+under. The weeks before it are already filled by HTTP/2, gRPC and Watch,
+which everything else depends on. Raft also needs a transport between the
+store nodes, and across machines that transport needs TLS, which
+QuantyCore does not have yet.
+
+**How it will be built.** The measuring instrument first: a deterministic
+simulator in which several nodes run in one process against a simulated
+network and simulated disks, with time, message order, loss, partitions
+and crashes all driven by a seed. Any failure is reproduced exactly from
+its seed. Only when the simulator can find planted bugs is the protocol
+written against it.
+
+**Until then,** high availability comes from a PostgreSQL backend
+(ADR-006), the way k3s gets it from kine.
+
+**The cost:** the first thing many companies will ask about, a highly
+available store, is answered on 17 November with a plan and not with a
+running system, and the talk has to say so.

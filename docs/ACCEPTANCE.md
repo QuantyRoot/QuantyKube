@@ -29,30 +29,40 @@ Without all of these there is no demonstration.
    from step 4 is read back as of a revision before the delete. This is
    the point of building on QuantyDB and the demonstration is built
    around it.
+7. Measurements, because the talk announces honest benchmarks: the same
+   API server under the same load, once on etcd and once on QuantyKube,
+   on the same machine, comparing memory, request latency and write
+   throughput. The harness and the raw results are in this repository
+   and the numbers are shown whichever way they come out (ADR-002).
+8. Measurements of the sandbox layer as it is today: pod start time and
+   memory per pod with containerd and runc, so that the talk can show
+   where the time goes before any runtime of our own exists.
 
 ## Should
 
-7. A real small cluster: one control plane machine running the API
+9. A real small cluster: one control plane machine running the API
    server, controller manager, scheduler and QuantyKube, plus at least two
-   worker machines with kubelets and an existing CRI runtime, as virtual
-   machines on Elchi's server. `kubectl get nodes` reports every node
+   worker machines with kubelets and an existing CRI runtime, all of them
+   small rented servers. `kubectl get nodes` reports every node
    Ready, a deployment spreads its pods across the workers, and the
    cluster is driven from the presenter's laptop. The store is still a
    single node; only the workers are many, and the talk says so.
-8. `etcdctl get`, `put` and `watch` work against QuantyKube for the keys
-   the API server writes, for showing the raw store on stage.
+10. `etcdctl get`, `put` and `watch` work against QuantyKube for the keys
+    the API server writes, for showing the raw store on stage.
 
 ## Not part of this date
 
-TLS, more than one store node, Raft, the node runtime (ADR-005), authentication
-and authorization on the etcd API, and any RPC the API server does not
-call.
+TLS, more than one store node, Raft (ADR-008), any code of the node
+runtime (ADR-005; the talk shows its design and the measurements from
+item 8), installing into an existing cluster with one command,
+authentication and authorization on the etcd API, and any RPC the API
+server does not call.
 
 ## How it is run on the day
 
 - Must items 1 to 6 also run entirely on the presenter's laptop, so that
   the demonstration survives a venue network that fails. The real cluster
-  from item 7 is reached through a tunnel over a phone hotspot, not over
+  from item 9 is reached through a tunnel over a phone hotspot, not over
   the venue network.
 - `docs/DEMO.md` contains the exact commands, and they are run verbatim
   from a clean machine at least five times before the day. A step that is
