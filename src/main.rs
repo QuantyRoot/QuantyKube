@@ -42,8 +42,9 @@ runtime serves the kubelet's Container Runtime Interface on the socket,
 keeping images and container state under --root. Pods get their network
 from the first CNI configuration in --cni-conf, /etc/cni/net.d by
 default, with plugins from --cni-bin, /opt/cni/bin. It cannot pull yet:
-import puts an image there from a directory holding its manifest.json and
-blobs/, each blob checked against its digest.";
+import puts an image there from an OCI image layout, as `skopeo copy
+docker://<image> oci:<dir>` writes one, or from a directory holding a
+manifest.json and blobs/, each blob checked against its digest.";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();

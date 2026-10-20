@@ -454,3 +454,53 @@ fn a_restart_tears_down_what_the_last_run_left() {
     assert_eq!(fs::read_dir(state.join("containers")).unwrap().count(), 0);
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn an_oci_layout_imports_as_the_same_image() {
+    let base = scratch("layout");
+    build_image(&base.join("image"));
+    let manifest = fs::read(base.join("image/manifest.json")).unwrap();
+    let layout = base.join("layout");
+    let blobs = layout.join("blobs/sha256");
+    fs::create_dir_all(&blobs).unwrap();
+    for e in fs::read_dir(base.join("image/blobs")).unwrap() {
+        let e = e.unwrap();
+        fs::copy(e.path(), blobs.join(e.file_name())).unwrap();
+    }
+    fs::write(blobs.join(digest(&manifest)), &manifest).unwrap();
+    // a multi-platform index, as registries serve, behind the top index
+    let entry = |d: &str, arch: &str| {
+        format!(
+            r#"{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:{d}","size":1,"platform":{{"os":"linux","architecture":"{arch}"}}}}"#
+        )
+    };
+    let inner = format!(
+        r#"{{"schemaVersion":2,"manifests":[{},{}]}}"#,
+        entry(&"0".repeat(64), "arm64"),
+        entry(&digest(&manifest), "amd64")
+    );
+    fs::write(blobs.join(digest(inner.as_bytes())), &inner).unwrap();
+    fs::write(
+        layout.join("oci-layout"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        layout.join("index.json"),
+        format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:{}","size":1}}]}}"#,
+            digest(inner.as_bytes())
+        ),
+    )
+    .unwrap();
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    let a = rt.import(&base.join("image"), "a").unwrap();
+    let b = rt.import(&layout, "b").unwrap();
+    assert_eq!(a.id, b.id);
+
+    fs::write(blobs.join(digest(&manifest)), b"{}").unwrap();
+    let rt = Runtime::new(&base.join("state2")).unwrap();
+    let err = rt.import(&layout, "c").unwrap_err();
+    assert!(err.to_string().contains("does not match"), "{err}");
+    fs::remove_dir_all(&base).unwrap();
+}

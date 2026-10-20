@@ -110,7 +110,8 @@ v2 and the CNI plugins (v1.8.0) under `/opt/cni/bin`. Stop the k3s from
 step 2 first, two k3s on one machine collide (BENCHMARKS.md).
 
 ```
-sudo target/release/quantykube import --root $D/rt <busybox image dir> test/busybox:1
+skopeo copy docker://busybox:1.36 oci:$D/busybox
+sudo target/release/quantykube import --root $D/rt $D/busybox test/busybox:1
 sudo mkdir -p $D/net.d
 sudo cp scripts/demo-net.conflist $D/net.d/10-demo.conflist
 sudo target/release/quantykube runtime --root $D/rt --socket $D/cri.sock \

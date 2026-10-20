@@ -256,6 +256,45 @@ fn digest_hex(d: &str) -> Result<&str> {
         .ok_or_else(|| Error::Invalid(format!("unsupported digest {d}")))
 }
 
+/// The image manifest for this machine in an OCI image layout, the
+/// directory `skopeo copy ... oci:<dir>` and `docker buildx --output
+/// type=oci` write: `index.json` names manifests or further indexes by
+/// digest, and every blob read on the way is checked.
+fn oci_layout_manifest(dir: &Path, blobs: &Path) -> Result<Value> {
+    let text = fs::read_to_string(dir.join("index.json"))?;
+    let mut v = json::parse(&text).map_err(|e| Error::Invalid(format!("index.json: {e}")))?;
+    // an index inside an index is legal; a chain this long is not sane
+    for _ in 0..8 {
+        if v.get("layers").is_some() {
+            return Ok(v);
+        }
+        let entries = v
+            .get("manifests")
+            .and_then(Value::as_array)
+            .unwrap_or_default();
+        let platform = |e: &Value, key: &str| {
+            e.pointer(&format!("/platform/{key}"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let entry = entries
+            .iter()
+            .find(|e| {
+                platform(e, "os").as_deref() == Some("linux")
+                    && platform(e, "architecture").as_deref() == Some("amd64")
+            })
+            .or_else(|| entries.iter().find(|e| e.get("platform").is_none()))
+            .ok_or_else(|| Error::Invalid("no linux/amd64 image in the layout".into()))?;
+        let digest = entry
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("index entry without digest".into()))?;
+        let blob = read_blob(blobs, digest)?;
+        v = json::parse_bytes(&blob).map_err(|e| Error::Invalid(format!("{digest}: {e}")))?;
+    }
+    Err(Error::Invalid("indexes nested too deeply".into()))
+}
+
 fn read_blob(blobs: &Path, digest: &str) -> Result<Vec<u8>> {
     let hex = digest_hex(digest)?;
     let data = fs::read(blobs.join(hex))?;
@@ -369,9 +408,14 @@ impl Runtime {
     /// or Docker v2 image manifest, and `blobs/<hex digest>`. Every blob
     /// is checked against its digest before anything is unpacked.
     pub fn import(&self, from: &Path, reference: &str) -> Result<Image> {
-        let manifest = fs::read_to_string(from.join("manifest.json"))?;
-        let m = json::parse(&manifest).map_err(|e| Error::Invalid(format!("manifest: {e}")))?;
-        let blobs = from.join("blobs");
+        let (m, blobs) = if from.join("oci-layout").exists() {
+            let blobs = from.join("blobs").join("sha256");
+            (oci_layout_manifest(from, &blobs)?, blobs)
+        } else {
+            let manifest = fs::read_to_string(from.join("manifest.json"))?;
+            let m = json::parse(&manifest).map_err(|e| Error::Invalid(format!("manifest: {e}")))?;
+            (m, from.join("blobs"))
+        };
         let config_digest = m
             .pointer("/config/digest")
             .and_then(Value::as_str)
