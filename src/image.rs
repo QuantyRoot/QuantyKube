@@ -29,6 +29,33 @@ pub struct Stats {
     pub whiteouts: u64,
     /// device nodes are left to the runtime, which creates /dev itself
     pub skipped: u64,
+    /// bytes of the uncompressed archive, headers included
+    pub unpacked: u64,
+}
+
+/// Fails the read past `left` bytes, so that a small layer cannot inflate
+/// to fill the disk.
+struct Limited<R> {
+    inner: R,
+    left: u64,
+    read: u64,
+}
+
+impl<R: Read> Read for Limited<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let room = buf
+            .len()
+            .min(usize::try_from(self.left.saturating_add(1)).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..room])?;
+        if n as u64 > self.left {
+            return Err(bad(
+                "the image unpacks to more than the runtime allows".into()
+            ));
+        }
+        self.left -= n as u64;
+        self.read += n as u64;
+        Ok(n)
+    }
 }
 
 fn bad(msg: String) -> io::Error {
@@ -103,8 +130,17 @@ fn remove_any(p: &Path) -> io::Result<()> {
 
 /// Unpacks one gzip compressed layer on top of `root`.
 pub fn unpack_layer(layer: impl Read, root: &Path) -> io::Result<Stats> {
+    unpack_layer_limited(layer, root, u64::MAX)
+}
+
+/// Unpacks a layer, failing once its archive inflates past `limit` bytes.
+pub fn unpack_layer_limited(layer: impl Read, root: &Path, limit: u64) -> io::Result<Stats> {
     let root = fs::canonicalize(root)?;
-    let mut archive = Archive::new(GzipReader::new(layer));
+    let mut archive = Archive::new(Limited {
+        inner: GzipReader::new(layer),
+        left: limit,
+        read: 0,
+    });
     let mut stats = Stats::default();
     // an opaque marker hides what lower layers put in a directory, not
     // what this layer already wrote there
@@ -192,7 +228,9 @@ pub fn unpack_layer(layer: impl Read, root: &Path) -> io::Result<Stats> {
         fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
     }
     // the gzip trailer is only checked once the stream is read to its end
-    io::copy(&mut archive.into_inner(), &mut io::sink())?;
+    let mut rest = archive.into_inner();
+    io::copy(&mut rest, &mut io::sink())?;
+    stats.unpacked = rest.read;
     Ok(stats)
 }
 
@@ -329,5 +367,22 @@ mod tests {
             .stdout;
         let err = unpack_layer(&gz[..], &root.0).unwrap_err();
         assert!(err.to_string().contains("unsafe path"), "{err}");
+    }
+
+    // a few kilobytes of gzip can inflate to fill a disk: the runtime
+    // stops at the size it allows
+    #[test]
+    fn a_layer_that_inflates_past_the_limit_is_refused() {
+        let bomb = layer("head -c 8000000 /dev/zero > big");
+        assert!(bomb.len() < 100_000, "{} bytes compressed", bomb.len());
+        let root = Dir::new("bomb");
+        let err = unpack_layer_limited(&bomb[..], &root.0, 1_000_000).unwrap_err();
+        assert!(
+            err.to_string().contains("more than the runtime allows"),
+            "{err}"
+        );
+        let fits = Dir::new("fits");
+        let s = unpack_layer_limited(&bomb[..], &fits.0, 9_000_000).unwrap();
+        assert!(s.unpacked > 8_000_000);
     }
 }

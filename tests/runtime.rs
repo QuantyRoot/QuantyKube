@@ -265,6 +265,44 @@ fn a_tampered_layer_is_refused() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+// the kubelet can pull one image for two pods at once, and an import
+// from the command line can meet a pull: both must end with one image
+#[test]
+fn one_image_imported_twice_at_once() {
+    let base = scratch("twice");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    let imports: Vec<_> = (0..4)
+        .map(|i| {
+            let (rt, image) = (rt.clone(), base.join("image"));
+            std::thread::spawn(move || rt.import(&image, &format!("x:{i}")).map(|img| img.id))
+        })
+        .collect();
+    let ids: Vec<String> = imports
+        .into_iter()
+        .map(|t| t.join().unwrap().unwrap())
+        .collect();
+    assert!(ids.windows(2).all(|p| p[0] == p[1]));
+    assert_eq!(rt.images().len(), 1);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+// a small layer must not inflate to fill the node's disk
+#[test]
+fn an_image_larger_than_allowed_is_refused() {
+    let base = scratch("large");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.set_max_image_size(1000);
+    let err = rt.import(&base.join("image"), "x").unwrap_err();
+    assert!(
+        err.to_string().contains("more than the runtime allows"),
+        "{err}"
+    );
+    assert!(rt.images().is_empty());
+    fs::remove_dir_all(&base).unwrap();
+}
+
 #[test]
 fn volumes_are_mounted_inside_the_container() {
     if !is_root() {

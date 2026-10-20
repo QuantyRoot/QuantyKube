@@ -102,9 +102,9 @@ process.
 1. Resolve the image to an unpacked root filesystem on the node:
    overlayfs with the image's layers as lower directories and a fresh
    upper directory per container.
-2. `clone3` with new mount and PID namespaces (and a user namespace when
-   the pod asks for one), joining the pod's network, IPC and UTS
-   namespaces.
+2. `clone3` with new mount and PID namespaces, joining the pod's
+   network, IPC and UTS namespaces. There is no user namespace: a pod
+   that asks for one is refused (ADR-018, ADR-023).
 3. In the child: mount `/proc`, `/dev`, `/sys` and the pod's volumes,
    `pivot_root` into the root filesystem, apply capabilities, seccomp and
    no_new_privs, set uid and gid, `execve` the entrypoint.

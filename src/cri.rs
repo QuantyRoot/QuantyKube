@@ -121,18 +121,54 @@ fn now_ns() -> i64 {
         .map_or(0, |d| d.as_nanos() as i64)
 }
 
+/// SELinux labels are not applied (ADR-018), so asking for one fails.
+fn no_selinux(o: &Option<cripb::SeLinuxOption>) -> Result<(), Status> {
+    match o {
+        Some(o)
+            if !(o.user.is_empty()
+                && o.role.is_empty()
+                && o.kind.is_empty()
+                && o.level.is_empty()) =>
+        {
+            Err(unsupported("an SELinux label"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
-    let ns = config
+    let sc = config
         .linux
         .as_ref()
-        .and_then(|l| l.security_context.as_ref())
-        .and_then(|s| s.namespace_options.clone());
+        .and_then(|l| l.security_context.as_ref());
+    if let Some(sc) = sc {
+        no_selinux(&sc.selinux_options)?;
+        if sc.supplemental_groups_policy != cripb::SupplementalGroupsPolicy::Merge {
+            return Err(unsupported("a supplemental groups policy other than Merge"));
+        }
+    }
+    if config.linux.as_ref().is_some_and(|l| !l.sysctls.is_empty()) {
+        return Err(unsupported("setting sysctls"));
+    }
+    let ns = sc.and_then(|s| s.namespace_options.clone());
     if let Some(ns) = ns {
         if ns.network == cripb::NamespaceMode::Node {
             return Err(unsupported("a pod on the host network"));
         }
         if ns.pid == cripb::NamespaceMode::Node || ns.ipc == cripb::NamespaceMode::Node {
             return Err(unsupported("a pod in the host's namespaces"));
+        }
+        if ns.pid == cripb::NamespaceMode::Target {
+            return Err(unsupported("joining another container's PID namespace"));
+        }
+        // without a user namespace, root in a container is root on the
+        // host (ADR-023); a pod that asks for one must not run without it
+        if ns
+            .userns_options
+            .as_ref()
+            .is_some_and(|u| u.mode != cripb::NamespaceMode::Node)
+        {
+            return Err(unsupported("a user namespace"));
         }
     }
     let cgroup_parent = config
@@ -384,6 +420,15 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
             .is_some_and(|p| p.profile_type == cripb::ProfileType::Localhost);
         if localhost {
             return Err(unsupported("a seccomp profile of the node's own"));
+        }
+        no_selinux(&sc.selinux_options)?;
+        if sc.supplemental_groups_policy != cripb::SupplementalGroupsPolicy::Merge {
+            return Err(unsupported("a supplemental groups policy other than Merge"));
+        }
+        if let Some(ns) = &sc.namespace_options {
+            if ns.pid == cripb::NamespaceMode::Target {
+                return Err(unsupported("joining another container's PID namespace"));
+            }
         }
         if sc.privileged {
             return Err(unsupported("a privileged container"));
@@ -1026,5 +1071,57 @@ mod tests {
         );
         assert!(caps(drop_all("SYS_ADMIN")).is_err());
         assert!(caps(drop_all("MKNOD")).is_err());
+    }
+
+    // fields a pod can set that this runtime does not apply: running the
+    // pod anyway would run it with less than it asked for
+    #[test]
+    fn what_the_runtime_does_not_apply_is_refused() {
+        use NamespaceMode::*;
+        let with = |f: &dyn Fn(&mut LinuxPodSandboxConfig)| {
+            let mut p = pod(Pod, Container);
+            f(p.linux.as_mut().unwrap());
+            pod_spec(p)
+        };
+        assert!(with(&|l| {
+            l.sysctls.insert("net.ipv4.ip_forward".into(), "1".into());
+        })
+        .is_err());
+        assert!(with(&|l| {
+            l.security_context.as_mut().unwrap().selinux_options = Some(cripb::SeLinuxOption {
+                level: "s0:c1".into(),
+                ..Default::default()
+            });
+        })
+        .is_err());
+        assert!(with(&|l| {
+            l.security_context.as_mut().unwrap().selinux_options = Some(Default::default());
+        })
+        .is_ok());
+        assert!(with(&|l| {
+            l.security_context
+                .as_mut()
+                .unwrap()
+                .supplemental_groups_policy = cripb::SupplementalGroupsPolicy::Strict;
+        })
+        .is_err());
+        let userns = |mode| {
+            with(&|l: &mut LinuxPodSandboxConfig| {
+                let ns = l
+                    .security_context
+                    .as_mut()
+                    .unwrap()
+                    .namespace_options
+                    .as_mut()
+                    .unwrap();
+                ns.userns_options = Some(cripb::UserNamespace {
+                    mode,
+                    ..Default::default()
+                });
+            })
+        };
+        assert!(userns(Node).is_ok(), "hostUsers: true");
+        assert!(userns(Pod).is_err(), "hostUsers: false");
+        assert!(pod_spec(pod(Pod, Target)).is_err());
     }
 }

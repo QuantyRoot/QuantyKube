@@ -582,6 +582,17 @@ stands.
 **The cost:** a pod that needs any of these does not start here until
 the piece is built, and the kubelet reports the reason.
 
+*Added on 21 October,* after a review found fields that were decoded and
+then ignored: sysctls, SELinux labels, a supplemental groups policy
+other than Merge, a user namespace (`hostUsers: false`, which would
+otherwise run as root on the host while believing it does not) and
+joining another container's PID namespace are refused too. AppArmor is
+the one exception and is still ignored: on hosts with AppArmor the
+kubelet can ask for the default profile for pods that name none, so
+refusing it could refuse every pod there. Profiles are being built; until they
+are applied, pods here run without the confinement containerd gives
+them on such hosts, and the comparison says so.
+
 ## ADR-019: Volumes are attached after the pivot
 
 A volume is a host path the kubelet asks to see at a path inside the

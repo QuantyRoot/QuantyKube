@@ -19,7 +19,9 @@ const USAGE: &str = "usage:
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
   quantykube runtime --root <dir> --socket <path>
                      [--cni-conf <dir>] [--cni-bin <dir>] [--plain-http <host>]
-  quantykube pull    --root <dir> [--plain-http <host>] <image>
+                     [--max-image-size <bytes>]
+  quantykube pull    --root <dir> [--plain-http <host>] [--max-image-size <bytes>]
+                     <image>
   quantykube import  --root <dir> <image dir> <reference>
 
 serve is the store. --retain keeps history, 1h by default; --snapshots
@@ -46,7 +48,9 @@ default, with plugins from --cni-bin, /opt/cni/bin. Images are pulled
 over HTTPS against the system's root certificates, through HTTPS_PROXY
 unless NO_PROXY names the host, or over plain HTTP from registries named
 with --plain-http (host or host:port, comma separated); pull does the
-same from the command line. The TLS is QuantyCore's and unreviewed.
+same from the command line. The TLS is QuantyCore's and unreviewed. An
+image whose layers unpack to more than --max-image-size (16G by default;
+K, M and G suffixes) is refused.
 import puts an image there from an OCI image layout, as `skopeo copy
 docker://<image> oci:<dir>` writes one, or from a directory holding a
 manifest.json and blobs/. Every blob is checked against its digest.";
@@ -255,6 +259,25 @@ fn join_cgroup(name: &str, pid: i32, opts: &[String]) -> Result<PathBuf, String>
     Ok(dir)
 }
 
+fn max_image_size(rt: &quantykube::runtime::Runtime, args: &[String]) -> Result<(), String> {
+    if let Some(v) = value(args, "--max-image-size") {
+        rt.set_max_image_size(size(v)?);
+    }
+    Ok(())
+}
+
+fn size(s: &str) -> Result<u64, String> {
+    let bad = || format!("bad size {s}");
+    let (n, shift) = match s.as_bytes().last() {
+        Some(b'K') => (&s[..s.len() - 1], 10),
+        Some(b'M') => (&s[..s.len() - 1], 20),
+        Some(b'G') => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    let n: u64 = n.parse().map_err(|_| bad())?;
+    n.checked_mul(1 << shift).ok_or_else(bad)
+}
+
 fn duration(s: &str) -> Result<Duration, String> {
     let (n, unit) = s.split_at(s.len().saturating_sub(1));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
@@ -341,6 +364,7 @@ fn runtime(args: &[String]) -> Result<(), String> {
     let bin = PathBuf::from(value(args, "--cni-bin").unwrap_or("/opt/cni/bin"));
     let rt = quantykube::runtime::Runtime::with_network(&root, Some((conf.clone(), bin)))
         .map_err(|e| e.to_string())?;
+    max_image_size(&rt, args)?;
     match rt.network() {
         Some(c) => eprintln!("quantykube: pod network {}", c.name()),
         None => eprintln!("quantykube: no CNI configuration in {} yet", conf.display()),
@@ -364,6 +388,7 @@ fn pull(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(required(args, "--root")?);
     let image = args.last().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
     let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
+    max_image_size(&rt, args)?;
     let img = rt
         .pull(image, &registry_options(args)?, None)
         .map_err(|e| format!("{image}: {e}"))?;

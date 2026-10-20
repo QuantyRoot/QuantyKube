@@ -250,9 +250,10 @@ impl Client<'_> {
                         .header("location")
                         .ok_or_else(|| invalid("redirect without a location"))?;
                     let next = http1::resolve(&url, loc).map_err(|e| invalid(format!("{e:?}")))?;
-                    // a blob store on another host gets no registry token,
-                    // and neither does anything reached without TLS
-                    if next.host != url.host || next.scheme != url.scheme {
+                    // a blob store on another host or port gets no
+                    // registry token, and neither does anything reached
+                    // without TLS
+                    if next.host != url.host || next.port != url.port || next.scheme != url.scheme {
                         self.auth = None;
                     }
                     url = next;

@@ -45,6 +45,9 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
             {
                 authorized = true;
             }
+            if h.to_ascii_lowercase().starts_with("authorization:") {
+                log.lock().unwrap().push(format!("credentials for {path}"));
+            }
         }
         log.lock().unwrap().push(path.clone());
         let port = conn.local_addr().unwrap().port();
@@ -85,7 +88,10 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
             );
             reply(&mut conn, "401 Unauthorized", &challenge, "text/plain", b"");
         } else if let Some(d) = path.strip_prefix("/v2/test/box/blobs/") {
-            let loc = format!("Location: /store/{d}\r\n");
+            let loc = match routes.lock().unwrap().get("store") {
+                Some((at, _)) => format!("Location: http://{at}/store/{d}\r\n"),
+                None => format!("Location: /store/{d}\r\n"),
+            };
             reply(&mut conn, "307 Temporary Redirect", &loc, "text/plain", b"");
         } else {
             match routes.lock().unwrap().get(&path) {
@@ -172,6 +178,32 @@ fn an_image_is_pulled_and_imported() {
         .join("rootfs/etc/greeting");
     assert_eq!(fs::read_to_string(unpacked).unwrap(), "pulled\n");
     assert!(log.lock().unwrap().iter().any(|p| p.starts_with("/store/")));
+
+    // blobs behind a redirect to another port of the same host get no
+    // registry token: whatever listens there is not the registry
+    let store = TcpListener::bind("127.0.0.1:0").unwrap();
+    let store_addr = format!("127.0.0.1:{}", store.local_addr().unwrap().port());
+    let store_log = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (routes, store_log) = (routes.clone(), store_log.clone());
+        std::thread::spawn(move || serve(store, routes, store_log));
+    }
+    routes
+        .lock()
+        .unwrap()
+        .insert("store".into(), (store_addr.clone(), Vec::new()));
+    let both = Options {
+        plain_http: vec![addr.clone(), store_addr],
+        ..Default::default()
+    };
+    registry::pull(&image, &base.join("redirected"), &both, Some(&creds)).unwrap();
+    routes.lock().unwrap().remove("store");
+    let seen = store_log.lock().unwrap().clone();
+    assert!(seen.iter().any(|p| p.starts_with("/store/")), "{seen:?}");
+    assert!(
+        !seen.iter().any(|p| p.starts_with("credentials")),
+        "{seen:?}"
+    );
 
     // a registry that serves other bytes than the digest names is caught
     let mut bad = layer.clone();

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -255,7 +256,16 @@ pub struct Runtime {
     /// The open log file of each running container, shared with the
     /// threads that write it.
     logs: Mutex<HashMap<String, Arc<Mutex<File>>>>,
+    /// Bytes an image may unpack to, all layers together.
+    max_image: AtomicU64,
+    /// Held while an image is unpacked and moved into place, so two
+    /// pulls of one image never share its staging directory.
+    importing: Mutex<()>,
 }
+
+/// What an image may unpack to unless `--max-image-size` says otherwise:
+/// far above any image a node should run, far below a disk.
+pub const MAX_IMAGE: u64 = 16 << 30;
 
 fn strings(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
@@ -349,14 +359,14 @@ impl<R: io::Read> io::Read for Hashing<R> {
 /// Unpacks a layer as it is read from disk, never whole in memory, and
 /// fails if its bytes do not match its digest. What was unpacked by then
 /// is in the caller's staging directory, which it then discards.
-fn unpack_verified(blobs: &Path, digest: &str, root: &Path) -> Result<u64> {
+fn unpack_verified(blobs: &Path, digest: &str, root: &Path, limit: u64) -> Result<(u64, u64)> {
     let hex = digest_hex(digest)?;
     let mut r = Hashing {
         inner: io::BufReader::new(File::open(blobs.join(hex))?),
         hash: Sha256::default(),
         len: 0,
     };
-    let unpacked = image::unpack_layer(&mut r, root);
+    let unpacked = image::unpack_layer_limited(&mut r, root, limit);
     // a layer may carry bytes after the end of its archive; they are part
     // of the digest all the same
     io::copy(&mut r, &mut io::sink())?;
@@ -367,11 +377,16 @@ fn unpack_verified(blobs: &Path, digest: &str, root: &Path) -> Result<u64> {
             "blob {digest} does not match its digest"
         )));
     }
-    unpacked?;
-    Ok(r.len)
+    let stats = unpacked?;
+    Ok((r.len, stats.unpacked))
 }
 
 impl Runtime {
+    /// Images that unpack to more than `bytes` are refused.
+    pub fn set_max_image_size(&self, bytes: u64) {
+        self.max_image.store(bytes, Ordering::Relaxed);
+    }
+
     pub fn new(dir: &Path) -> Result<Arc<Runtime>> {
         Runtime::with_network(dir, None)
     }
@@ -392,6 +407,8 @@ impl Runtime {
             cni: Mutex::new(None),
             cni_dirs,
             logs: Mutex::new(HashMap::new()),
+            max_image: AtomicU64::new(MAX_IMAGE),
+            importing: Mutex::new(()),
         };
         rt.load_images()?;
         rt.clean_up_after_a_restart();
@@ -514,10 +531,13 @@ impl Runtime {
             String::from_utf8(config).map_err(|_| Error::Invalid("config is not UTF-8".into()))?;
         let id = format!("sha256:{}", digest_hex(config_digest)?);
         let dir = self.dir.join("images").join(digest_hex(config_digest)?);
+        let _one_at_a_time = self.importing.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(img) = self.find_image(&id) {
             return self.tag(&img.id, reference);
         }
         let staging = dir.with_extension("partial");
+        let max = self.max_image.load(Ordering::Relaxed);
+        let mut unpacked = 0u64;
         let _ = fs::remove_dir_all(&staging);
         fs::create_dir_all(staging.join("rootfs"))?;
         let mut size = 0;
@@ -531,8 +551,11 @@ impl Runtime {
             if !media.ends_with("tar.gzip") && !media.ends_with("tar+gzip") {
                 return Err(Error::Invalid(format!("unsupported layer type {media}")));
             }
-            match unpack_verified(&blobs, digest, &staging.join("rootfs")) {
-                Ok(n) => size += n,
+            match unpack_verified(&blobs, digest, &staging.join("rootfs"), max - unpacked) {
+                Ok((n, u)) => {
+                    size += n;
+                    unpacked += u;
+                }
                 Err(e) => {
                     let _ = fs::remove_dir_all(&staging);
                     return Err(e);
