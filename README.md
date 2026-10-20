@@ -66,11 +66,11 @@ watches see the object return.
 | `kubectl quanty` plugin | built |
 | Benchmarks against etcd ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) | measured |
 | Retention: long history in the log, short lived snapshots ([ADR-014](docs/DECISIONS.md)) | built, soak tested |
-| TLS, so the store can be reached over a network | waiting for QuantyCore |
+| The store over a network with TLS and client certificates | next; QuantyCore has TLS |
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
 | A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |
-| Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
+| Several store nodes (Raft) | in progress, cut off 7 November ([ADR-027](docs/DECISIONS.md)) |
 
 ## Trying it
 
@@ -115,7 +115,7 @@ no safer than the network it crosses.
   public demonstration, written before the code.
 - [docs/DEMO.md](docs/DEMO.md): that demonstration, as commands.
 - [docs/RUNTIME.md](docs/RUNTIME.md): the node runtime.
-- The protocol stack, protobuf, HPACK, HTTP/2, gRPC and HTTP/1.1, lives in
+- The protocol stack, protobuf, HPACK, HTTP/2, gRPC, HTTP/1.1 and TLS, lives in
   [QuantyCore](https://github.com/QuantyRoot/QuantyCore); the storage
   engine is [QuantyDB](https://github.com/QuantyRoot/QuantyDatabase).
 

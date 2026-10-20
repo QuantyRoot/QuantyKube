@@ -85,7 +85,7 @@ store gave was on disk before it was given.
 kubectl delete configmap important
 kubectl get configmap important
 export QUANTYKUBE_SOCKET=$D/qk.sock
-ln -sf "$PWD/target/release/quantykube" /usr/local/bin/kubectl-quanty
+sudo ln -sf "$PWD/target/release/quantykube" /usr/local/bin/kubectl-quanty
 kubectl quanty history configmap/default/important
 ```
 
@@ -106,12 +106,13 @@ the state five minutes ago.
 
 The control plane from step 2 runs without a node. This adds one whose
 kubelet starts containers through `quantykube runtime`; it needs cgroup
-v2 and the CNI plugins (v1.8.0) under `/opt/cni/bin`. Stop the k3s from
-step 2 first, two k3s on one machine collide (BENCHMARKS.md).
+v2 and the CNI plugins (v1.8.0) under `/opt/cni/bin`. The k3s from step
+2 (job 2 of this shell) stops first, since two k3s on one machine
+collide (BENCHMARKS.md); the store keeps running, so the cluster's
+objects stay.
 
 ```
-skopeo copy docker://busybox:1.36 oci:$D/busybox
-sudo target/release/quantykube import --root $D/rt $D/busybox test/busybox:1
+kill %2; wait %2
 sudo mkdir -p $D/net.d
 sudo cp scripts/demo-net.conflist $D/net.d/10-demo.conflist
 sudo target/release/quantykube runtime --root $D/rt --socket $D/cri.sock \
@@ -124,7 +125,7 @@ sudo k3s server --token demo --data-dir $D/k3s \
   --disable-network-policy --flannel-backend=none --disable-kube-proxy \
   --disable-cloud-controller --disable-helm-controller &
 kubectl get nodes
-kubectl run hello --image=test/busybox:1 --image-pull-policy=Never \
+kubectl run hello --image=mirror.gcr.io/library/busybox:1.36 \
   -- sh -c 'echo hello from QuantyKube; exec sleep 3600'
 kubectl get pod hello -o wide
 kubectl logs hello
@@ -132,7 +133,7 @@ ps -o pid,rss,cmd -C quantykube
 ```
 
 One process for the runtime and none per pod: no shim, no pause
-container. `scripts/cluster.sh` runs the same in CI; these exact lines
+container. The runtime pulled the image itself, over HTTPS. `scripts/cluster.sh` runs the same in CI; these exact lines
 have not been run yet, which this machine (cgroup v1) cannot, and are
 the first thing to run on the rented servers.
 

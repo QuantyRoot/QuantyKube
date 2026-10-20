@@ -5,6 +5,33 @@ QuantyKube must answer, and in what shapes, so that "the etcd subset the
 API server uses" (ADR-001) is a list that can be checked rather than a
 phrase.
 
+## What was built, as of 21 October
+
+This file was written before the code and is kept as the plan it was.
+The code went further than the plan where the API server or `etcdctl`
+needed it, and differs from it in these points:
+
+- Range: `limit` on a single key, `sort_order`, `sort_target`,
+  `serializable` and the `min_` and `max_` filters are answered as etcd
+  answers them, not rejected.
+- Put: `ignore_value` and `ignore_lease` work. DeleteRange works outside
+  a transaction.
+- Txn: any shape is accepted, with compares on version, create, mod,
+  value and lease, compares over a key range, and nested transactions,
+  not only the five shapes below.
+- Several writes share one commit (ADR-012); each write that changes
+  something still gets one revision of its own.
+- Watch: client chosen ids are accepted; ids the server assigns count up
+  per stream and are never reused.
+- Lease: LeaseGrant, LeaseRevoke, LeaseKeepAlive and LeaseTimeToLive.
+  LeaseLeases is not supported.
+- Maintenance: Status and Alarm (no alarms are ever raised). RangeStream
+  is not built.
+
+Known differences from etcd that the API server does not reach: a
+transaction may name one key twice, an empty key is not refused, and
+there is no limit on the operations in one transaction.
+
 ## Where this list comes from
 
 From kine, which has carried production Kubernetes clusters for years

@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
-description = "A Kubernetes data store with time travel"
+description = "A Kubernetes data store with time travel, and a node runtime without shims"
 repository = "https://github.com/QuantyRoot/QuantyKube"
 publish = false
 
