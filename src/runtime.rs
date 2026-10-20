@@ -11,6 +11,7 @@ use crate::cni::{self, Cni};
 use crate::image;
 use crate::user;
 use quantycore::json::{self, Value};
+use quantycore::tls::crypto::sha2::{Hash, Sha256};
 use quantykube_sys as sys;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -309,15 +310,65 @@ fn oci_layout_manifest(dir: &Path, blobs: &Path) -> Result<Value> {
     Err(Error::Invalid("indexes nested too deeply".into()))
 }
 
+/// Manifests, indexes and configs are a few KiB; layers never go through
+/// here.
+const MAX_SMALL_BLOB: u64 = 16 << 20;
+
 fn read_blob(blobs: &Path, digest: &str) -> Result<Vec<u8>> {
     let hex = digest_hex(digest)?;
-    let data = fs::read(blobs.join(hex))?;
+    let file = File::open(blobs.join(hex))?;
+    let mut data = Vec::new();
+    io::Read::read_to_end(&mut io::Read::take(file, MAX_SMALL_BLOB + 1), &mut data)?;
+    if data.len() as u64 > MAX_SMALL_BLOB {
+        return Err(Error::Invalid(format!("blob {digest} is too large")));
+    }
     if quantydb_core::to_hex(&quantydb_core::sha256(&data)) != hex {
         return Err(Error::Invalid(format!(
             "blob {digest} does not match its digest"
         )));
     }
     Ok(data)
+}
+
+/// Hashes what passes through it.
+struct Hashing<R> {
+    inner: R,
+    hash: Sha256,
+    len: u64,
+}
+
+impl<R: io::Read> io::Read for Hashing<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+}
+
+/// Unpacks a layer as it is read from disk, never whole in memory, and
+/// fails if its bytes do not match its digest. What was unpacked by then
+/// is in the caller's staging directory, which it then discards.
+fn unpack_verified(blobs: &Path, digest: &str, root: &Path) -> Result<u64> {
+    let hex = digest_hex(digest)?;
+    let mut r = Hashing {
+        inner: io::BufReader::new(File::open(blobs.join(hex))?),
+        hash: Sha256::default(),
+        len: 0,
+    };
+    let unpacked = image::unpack_layer(&mut r, root);
+    // a layer may carry bytes after the end of its archive; they are part
+    // of the digest all the same
+    io::copy(&mut r, &mut io::sink())?;
+    let mut sum = [0u8; 32];
+    r.hash.finish_into(&mut sum);
+    if quantydb_core::to_hex(&sum) != hex {
+        return Err(Error::Invalid(format!(
+            "blob {digest} does not match its digest"
+        )));
+    }
+    unpacked?;
+    Ok(r.len)
 }
 
 impl Runtime {
@@ -443,8 +494,8 @@ impl Runtime {
 
     /// Imports an image from an OCI image layout, or from a directory
     /// holding `manifest.json`, an OCI or Docker v2 image manifest, and
-    /// `blobs/<hex digest>`. Every blob is checked against its digest
-    /// before anything is unpacked.
+    /// `blobs/<hex digest>`. Every blob is checked against its digest,
+    /// layers while they are unpacked into a staging directory.
     pub fn import(&self, from: &Path, reference: &str) -> Result<Image> {
         let (m, blobs) = if from.join("oci-layout").exists() {
             let blobs = from.join("blobs").join("sha256");
@@ -480,9 +531,13 @@ impl Runtime {
             if !media.ends_with("tar.gzip") && !media.ends_with("tar+gzip") {
                 return Err(Error::Invalid(format!("unsupported layer type {media}")));
             }
-            let data = read_blob(&blobs, digest)?;
-            size += data.len() as u64;
-            image::unpack_layer(&data[..], &staging.join("rootfs"))?;
+            match unpack_verified(&blobs, digest, &staging.join("rootfs")) {
+                Ok(n) => size += n,
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(e);
+                }
+            }
         }
         fs::write(staging.join("config.json"), &config)?;
         let img = Image {

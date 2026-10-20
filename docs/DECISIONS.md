@@ -529,10 +529,14 @@ the image is never written to, and its output goes through a pipe into
 the CRI log format the kubelet reads, split into partial lines past
 16 KiB as containerd splits them.
 
-**Images are imported, not pulled,** from a manifest and its blobs on
-disk, every blob checked against its SHA-256 before anything is
-unpacked and the image visible under its final name only once complete.
-Pulling needs HTTPS and waits for QuantyCore's TLS.
+**Images are imported** from a manifest and its blobs on disk, and a
+pull is an import of what was fetched (ADR-025). Manifests and configs
+are checked against their SHA-256 before they are read; a layer is
+hashed while it is unpacked into a staging directory, read from disk in
+pieces so that no layer is ever whole in memory, and a layer that does
+not match its digest throws the staging directory away. The image is
+visible under its final name only once complete. Pulling nginx this way
+peaks at 6 MiB of memory.
 
 **State is kept in memory.** A restart of the runtime is treated as a
 reboot of the node: at start it kills the containers a previous run left,
