@@ -1,18 +1,22 @@
+use quantycore::proto::{put_bytes, put_int, Reader, Value};
 use quantydb_core::FileStorage;
-use quantykube::store::{self, Kind, Quanty};
+use quantykube::etcdpb::{KeyValue, Message};
+use quantykube::store::{self, Quanty};
 use std::io::Write;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:
   quantykube serve   --data <file> --socket <path> [--retain <duration>]
-  quantykube get     --data <file> (--rev <n> | --ago <duration>) <key>
-  quantykube history --data <file> [--prefix] <key>
+  quantykube history --socket <path> [--prefix] <key>
+  quantykube get     --socket <path> (--rev <n> | --ago <duration>) <key>
+  quantykube restore --socket <path> (--rev <n> | --ago <duration>) <key>
 
-Durations look like 90s, 15m, 2h or 7d. get writes the raw stored value to
-stdout, so piping it into `etcdctl put <key>` restores it.";
+Durations look like 90s, 15m, 2h or 7d. get writes the stored value as it
+was to stdout. restore writes it back, or deletes the key if it did not
+exist then, as a new revision that every watch sees.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -20,6 +24,7 @@ fn main() {
         Some("serve") => serve(&args[1..]),
         Some("get") => get(&args[1..]),
         Some("history") => history(&args[1..]),
+        Some("restore") => restore(&args[1..]),
         Some("--version") => {
             println!("quantykube {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -50,9 +55,8 @@ fn positional(args: &[String]) -> Result<&str, String> {
     for a in args {
         if skip {
             skip = false;
-        } else if a == "--prefix" {
         } else if a.starts_with("--") {
-            skip = true;
+            skip = a != "--prefix";
         } else {
             found = Some(a.as_str());
         }
@@ -117,61 +121,110 @@ fn serve(args: &[String]) -> Result<(), String> {
     quantycore::grpc::serve_unix(listener, etcd).map_err(|e| e.to_string())
 }
 
-fn read_only(args: &[String]) -> Result<Quanty<FileStorage>, String> {
-    let data = required(args, "--data")?;
-    Quanty::open_read_only(Path::new(data)).map_err(|e| format!("{data}: {e}"))
+fn history_call(args: &[String], method: &str, req: &[u8]) -> Result<Vec<u8>, String> {
+    let socket = required(args, "--socket")?;
+    let conn = UnixStream::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
+    quantycore::grpc::call(conn, &format!("/quantykube.History/{method}"), req)
+        .map_err(|s| s.message)
+}
+
+fn request(args: &[String], with_end: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let key = positional(args)?.as_bytes().to_vec();
+    let mut req = Vec::new();
+    put_bytes(&mut req, 1, &key);
+    if with_end && args.iter().any(|a| a == "--prefix") {
+        let mut end = key.clone();
+        end.push(0xff);
+        put_bytes(&mut req, 2, &end);
+    }
+    match (value(args, "--rev"), value(args, "--ago")) {
+        (Some(r), _) => put_int(
+            &mut req,
+            3,
+            r.parse().map_err(|_| format!("bad revision {r}"))?,
+        ),
+        (None, Some(a)) => put_int(&mut req, 4, now_ms() - duration(a)?.as_millis() as i64),
+        (None, None) if !with_end => return Err(format!("needs --rev or --ago\n{USAGE}")),
+        (None, None) => {}
+    }
+    Ok((key, req))
+}
+
+fn fields(buf: &[u8]) -> Result<Vec<(u32, Value<'_>)>, String> {
+    let mut r = Reader::new(buf);
+    let mut out = Vec::new();
+    while let Some(f) = r.next_field().map_err(|e| e.to_string())? {
+        out.push(f);
+    }
+    Ok(out)
+}
+
+fn int_field(fields: &[(u32, Value)], n: u32) -> i64 {
+    fields
+        .iter()
+        .find(|(f, _)| *f == n)
+        .and_then(|(_, v)| v.int(n).ok())
+        .unwrap_or(0)
+}
+
+fn kv_field(fields: &[(u32, Value)], n: u32) -> Option<KeyValue> {
+    fields
+        .iter()
+        .find(|(f, _)| *f == n)
+        .and_then(|(_, v)| v.bytes(n).ok())
+        .and_then(|b| KeyValue::decode(b).ok())
 }
 
 fn get(args: &[String]) -> Result<(), String> {
-    let store = read_only(args)?;
-    let key = positional(args)?;
-    let rev = match (value(args, "--rev"), value(args, "--ago")) {
-        (Some(r), _) => r.parse().map_err(|_| format!("bad revision {r}"))?,
-        (None, Some(a)) => store
-            .revision_at(now_ms() - duration(a)?.as_millis() as i64)
-            .map_err(|e| e.to_string())?,
-        (None, None) => return Err(format!("get needs --rev or --ago\n{USAGE}")),
-    };
-    let mut found = None;
-    store
-        .read_retained(rev, &mut |v| {
-            found = v.get(key.as_bytes())?;
-            Ok(())
-        })
-        .map_err(|e| format!("revision {rev}: {e}"))?;
-    let rec = found.ok_or_else(|| format!("{key} did not exist at revision {rev}"))?;
-    eprintln!("quantykube: {key} as of revision {rev}");
+    let (key, req) = request(args, false)?;
+    let resp = history_call(args, "Get", &req)?;
+    let f = fields(&resp)?;
+    let rev = int_field(&f, 1);
+    let kv = kv_field(&f, 2).ok_or_else(|| {
+        format!(
+            "{} did not exist at revision {rev}",
+            String::from_utf8_lossy(&key)
+        )
+    })?;
+    eprintln!("quantykube: as of revision {rev}");
     std::io::stdout()
-        .write_all(&rec.value)
+        .write_all(&kv.value)
         .map_err(|e| e.to_string())
 }
 
+fn restore(args: &[String]) -> Result<(), String> {
+    let (key, req) = request(args, false)?;
+    let resp = history_call(args, "Restore", &req)?;
+    let f = fields(&resp)?;
+    let key = String::from_utf8_lossy(&key);
+    let (rev, now) = (int_field(&f, 1), int_field(&f, 3));
+    match kv_field(&f, 2) {
+        Some(_) => println!("{key}: restored as of revision {rev}, now revision {now}"),
+        None => println!("{key}: did not exist at revision {rev}, deleted, now revision {now}"),
+    }
+    Ok(())
+}
+
 fn history(args: &[String]) -> Result<(), String> {
-    let store = read_only(args)?;
-    let key = positional(args)?.as_bytes();
-    let end = args.iter().any(|a| a == "--prefix").then(|| {
-        let mut e = key.to_vec();
-        e.push(0xff);
-        e
-    });
-    let entries = store
-        .history(key, end.as_deref())
-        .map_err(|e| e.to_string())?;
+    let (_, req) = request(args, true)?;
+    let resp = history_call(args, "Log", &req)?;
     let mut out = std::io::stdout().lock();
-    for h in entries {
-        let what = match h.change.kind {
-            Kind::Put if h.change.prev.is_none() => "create",
-            Kind::Put => "update",
-            Kind::Delete => "delete",
+    for (_, entry) in fields(&resp)? {
+        let e = fields(entry.bytes(1).map_err(|e| e.to_string())?)?;
+        let kv = kv_field(&e, 4).unwrap_or_default();
+        let what = match (int_field(&e, 3), kv_field(&e, 5).is_some()) {
+            (1, _) => "delete",
+            (_, false) => "create",
+            (_, true) => "update",
         };
         let _ = writeln!(
             out,
             "{:>8}  {}  {:<6}  {}  {} bytes",
-            h.rev,
-            utc(h.unix_ms),
+            int_field(&e, 1),
+            utc(int_field(&e, 2)),
             what,
-            String::from_utf8_lossy(&h.change.kv.key),
-            h.change.kv.value.len()
+            String::from_utf8_lossy(&kv.key),
+            kv.value.len()
         );
     }
     Ok(())

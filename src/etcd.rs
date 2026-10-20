@@ -973,6 +973,7 @@ impl<B: Backend> Service for Etcd<B> {
                 quantycore::proto::put_message(&mut out, 1, &header.encode());
                 Ok(out)
             }
+            ("quantykube.History", m) => self.history_call(m, body),
             ("grpc.health.v1.Health", "Check") => Ok(HealthCheckResponse {
                 status: ServingStatus::Serving,
             }
@@ -1003,7 +1004,89 @@ impl<B: Backend> Service for Etcd<B> {
     }
 }
 
+/// QuantyKube's own service, for history the etcd API cannot express.
+/// Its messages are described in `docs/HISTORY.md`.
 impl<B: Backend> Etcd<B> {
+    fn history_call(&self, method: &str, body: &[u8]) -> Result<Vec<u8>, Status> {
+        use quantycore::proto::{put_int, put_message, Reader};
+        let (mut key, mut end, mut rev, mut unix_ms) = (Vec::new(), Vec::new(), 0, 0);
+        let mut r = Reader::new(body);
+        while let Some((n, v)) = r.next_field().map_err(bad_request)? {
+            match n {
+                1 => key = v.bytes(n).map_err(bad_request)?.to_vec(),
+                2 => end = v.bytes(n).map_err(bad_request)?.to_vec(),
+                3 => rev = v.int(n).map_err(bad_request)?,
+                4 => unix_ms = v.int(n).map_err(bad_request)?,
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        match method {
+            "Log" => {
+                let bound = range_end(&end);
+                for h in self
+                    .store
+                    .history(&key, bound.and_then(|b| b.or(Some(&[0xff][..]))))
+                    .map_err(store_error)?
+                {
+                    let mut e = Vec::new();
+                    put_int(&mut e, 1, h.rev);
+                    put_int(&mut e, 2, h.unix_ms);
+                    put_int(&mut e, 3, (h.change.kind == Kind::Delete) as i64);
+                    put_message(&mut e, 4, &kv(h.change.kv).encode());
+                    if let Some(p) = h.change.prev {
+                        put_message(&mut e, 5, &kv(p).encode());
+                    }
+                    put_message(&mut out, 1, &e);
+                }
+            }
+            "Get" | "Restore" => {
+                let rev = if rev > 0 {
+                    rev
+                } else {
+                    self.store.revision_at(unix_ms).map_err(store_error)?
+                };
+                if rev > self.store.head() {
+                    return Err(store_error(store::Error::FutureRevision));
+                }
+                let mut old = None;
+                self.store
+                    .read_retained(rev, &mut |v| {
+                        old = v.get(&key)?;
+                        Ok(())
+                    })
+                    .map_err(|e| match e {
+                        store::Error::Engine(_) => status(
+                            code::OUT_OF_RANGE,
+                            &format!("revision {rev} is no longer retained"),
+                        ),
+                        e => store_error(e),
+                    })?;
+                put_int(&mut out, 1, rev);
+                if method == "Restore" {
+                    let committed = self.run_write(
+                        |tx| {
+                            match &old {
+                                Some(r) => tx.put(&key, &r.value, 0),
+                                None => tx.delete(&key),
+                            }
+                            .map(|_| ())
+                            .map_err(store_error)
+                        },
+                        |_, _| {},
+                    );
+                    committed?;
+                    put_int(&mut out, 3, self.store.head());
+                }
+                if let Some(r) = old {
+                    put_message(&mut out, 2, &kv(r).encode());
+                }
+            }
+            _ => return Err(Status::new(code::UNIMPLEMENTED, "no such method")),
+        }
+        Ok(out)
+    }
+
     fn etcd_read(
         &self,
         rev: i64,

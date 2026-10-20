@@ -305,10 +305,12 @@ older versions away. QuantyKube honors compaction toward etcd clients
 exactly: a read or a watch below the compacted revision fails with etcd's
 own error, so nothing in Kubernetes sees different behavior. What is
 physically kept is decided separately, by `--retain`, one hour by default.
-Within that window every commit and every log entry stays, and
-`quantykube history` and `quantykube get --rev` or `--ago` read them,
-compacted or not. Piping such a value into `etcdctl put` brings a deleted
-object back, which the end to end test does with a ConfigMap.
+Within that window every commit and every log entry stays. A gRPC
+service of QuantyKube's own on the same socket serves it
+(`docs/HISTORY.md`), and `quantykube history`, `get` and `restore` use
+that service: list what happened to a key, read it as it was at a
+revision or a time, and write it back. A restore is an ordinary write,
+so the API server's watch cache sees the object return.
 
 Once a minute the server drops what is older than the window: log entries
 first, in a commit, then QuantyDB's collector frees the pages. It never
@@ -318,7 +320,7 @@ because etcd clients may still read those.
 **The cost:** disk. Copy on write means every commit writes new pages for
 the path it touched, and keeping an hour of commits keeps all of those
 pages. The benchmarks will say how much that is under a real API server
-before the default is defended in public. The history commands open the
-file without the writer lock; if a collection reuses pages under a long
-read, the page checksums turn that into an error, not wrong data.
+before the default is defended in public. A restore brings back the
+value, not the lease, so an object that had a lease comes back without
+one.
 

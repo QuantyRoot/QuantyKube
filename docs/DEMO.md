@@ -84,22 +84,22 @@ store gave was on disk before it was given.
 ```
 kubectl delete configmap important
 kubectl get configmap important
-target/release/quantykube history --data $D/db /registry/configmaps/default/important
+target/release/quantykube history --socket $D/qk.sock /registry/configmaps/default/important
 ```
 
 The history lists the create, the update and the delete with their
 revisions and times. Take the revision of the update:
 
 ```
-target/release/quantykube get --data $D/db --rev <rev> \
-  /registry/configmaps/default/important \
-  | etcdctl --endpoints=unix://$D/qk.sock put /registry/configmaps/default/important
+target/release/quantykube restore --socket $D/qk.sock --rev <rev> \
+  /registry/configmaps/default/important
 kubectl get configmap important -o jsonpath='{.data.password}'
 ```
 
 The deleted object is back, and the watch from step 3 shows it arriving.
 This works after the API server has compacted etcd, for as long as
-`--retain` keeps history (ADR-011).
+`--retain` keeps history (ADR-011). `--ago 5m` instead of `--rev` picks
+the state five minutes ago.
 
 ## 6. The numbers
 

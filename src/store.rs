@@ -116,6 +116,13 @@ pub trait Backend: Send + Sync + 'static {
     fn compact(&self, rev: i64) -> Result<()>;
     /// Bytes on disk, and of those the bytes in use.
     fn size(&self) -> Result<(i64, i64)>;
+    /// Reads at any retained revision, compacted or not (ADR-011).
+    fn read_retained(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()>;
+    /// The newest revision committed at or before `unix_ms`.
+    fn revision_at(&self, unix_ms: i64) -> Result<i64>;
+    /// Every retained change to keys in `[start, end)`, oldest first;
+    /// `end` None means the single key `start`.
+    fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>>;
 }
 
 const LIVE: u8 = b'k';
@@ -142,20 +149,6 @@ impl Quanty<FileStorage> {
             Self::start(Db::create_file(path)?)
         }
     }
-
-    /// For reading beside a running server. Without the writer lock a
-    /// collection in the server can reuse pages under a long read; the
-    /// page checksums turn that into an error, never into wrong data.
-    pub fn open_read_only(path: &std::path::Path) -> Result<Self> {
-        let db = Db::open_file_unlocked(path)?;
-        let head = db.head_commit() as i64;
-        Ok(Quanty {
-            db: RwLock::new(db),
-            writer: Mutex::new(()),
-            head: head.into(),
-            compacted: 0.into(),
-        })
-    }
 }
 
 impl Quanty<MemStorage> {
@@ -173,55 +166,6 @@ pub struct HistoryEntry {
 }
 
 impl<S: Storage + 'static> Quanty<S> {
-    /// Reads at any retained revision, compacted or not: the history that
-    /// etcd clients may no longer ask for is still here (ADR-010).
-    pub fn read_retained(
-        &self,
-        rev: i64,
-        f: &mut dyn FnMut(&dyn View) -> Result<()>,
-    ) -> Result<()> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let snap = db.snapshot_at(rev as u64)?;
-        f(&Reader { get: &snap })
-    }
-
-    /// The newest revision committed at or before `unix_ms`.
-    pub fn revision_at(&self, unix_ms: i64) -> Result<i64> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        Ok(db.snapshot_at_time(unix_ms.max(0) as u64)?.commit_id() as i64)
-    }
-
-    /// Every retained change to keys in `[start, end)`, oldest first;
-    /// `end` None means the single key `start`.
-    pub fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let times: std::collections::HashMap<u64, u64> = db
-            .log()?
-            .into_iter()
-            .map(|c| (c.commit_id, c.unix_ts_ms))
-            .collect();
-        let snap = db.snapshot();
-        let mut out = Vec::new();
-        for item in snap.scan(Some(&[LOG]), Some(&[LOG + 1]))? {
-            let (k, v) = item?;
-            let change = decode_change(&v)?;
-            let key = change.kv.key.as_slice();
-            let hit = match end {
-                None => key == start,
-                Some(e) => key >= start && key < e,
-            };
-            if hit {
-                let rev = u64::from_be_bytes(k[1..9].try_into().unwrap());
-                out.push(HistoryEntry {
-                    rev: rev as i64,
-                    unix_ms: times.get(&rev).copied().unwrap_or(0) as i64,
-                    change,
-                });
-            }
-        }
-        Ok(out)
-    }
-
     /// Drops history older than `keep_ms`, but never a revision etcd
     /// clients may still read, that is anything from the compaction
     /// revision on. Returns how many commits were collected.
@@ -640,6 +584,46 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
             }
         }
         Ok(())
+    }
+
+    fn read_retained(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let snap = db.snapshot_at(rev as u64)?;
+        f(&Reader { get: &snap })
+    }
+
+    fn revision_at(&self, unix_ms: i64) -> Result<i64> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        Ok(db.snapshot_at_time(unix_ms.max(0) as u64)?.commit_id() as i64)
+    }
+
+    fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let times: std::collections::HashMap<u64, u64> = db
+            .log()?
+            .into_iter()
+            .map(|c| (c.commit_id, c.unix_ts_ms))
+            .collect();
+        let snap = db.snapshot();
+        let mut out = Vec::new();
+        for item in snap.scan(Some(&[LOG]), Some(&[LOG + 1]))? {
+            let (k, v) = item?;
+            let change = decode_change(&v)?;
+            let key = change.kv.key.as_slice();
+            let hit = match end {
+                None => key == start,
+                Some(e) => key >= start && key < e,
+            };
+            if hit {
+                let rev = u64::from_be_bytes(k[1..9].try_into().unwrap());
+                out.push(HistoryEntry {
+                    rev: rev as i64,
+                    unix_ms: times.get(&rev).copied().unwrap_or(0) as i64,
+                    change,
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn size(&self) -> Result<(i64, i64)> {
