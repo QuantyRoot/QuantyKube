@@ -48,6 +48,11 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
         }
         log.lock().unwrap().push(path.clone());
         let port = conn.local_addr().unwrap().port();
+        let realm = routes
+            .lock()
+            .unwrap()
+            .get("realm")
+            .map_or("127.0.0.1".to_string(), |(host, _)| host.clone());
         let reply = |c: &mut TcpStream, status: &str, extra: &str, ctype: &str, body: &[u8]| {
             let head = format!(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\n{extra}Connection: close\r\n\r\n",
@@ -76,7 +81,7 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
             reply(&mut conn, "200 OK", "", "application/octet-stream", body);
         } else if !authorized {
             let challenge = format!(
-                "WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{port}/token\",service=\"test\",scope=\"repository:test/box:pull\"\r\n"
+                "WWW-Authenticate: Bearer realm=\"http://{realm}:{port}/token\",service=\"test\",scope=\"repository:test/box:pull\"\r\n"
             );
             reply(&mut conn, "401 Unauthorized", &challenge, "text/plain", b"");
         } else if let Some(d) = path.strip_prefix("/v2/test/box/blobs/") {
@@ -200,5 +205,13 @@ fn an_image_is_pulled_and_imported() {
     );
     let err = registry::pull(&image, &base.join("layout3"), &opts, Some(&creds)).unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
+
+    // a realm on another host gets no login over plain HTTP
+    routes
+        .lock()
+        .unwrap()
+        .insert("realm".into(), ("localhost".into(), Vec::new()));
+    let err = registry::pull(&image, &base.join("layout4"), &opts, Some(&creds)).unwrap_err();
+    assert!(err.to_string().contains("401"), "{err}");
     fs::remove_dir_all(&base).unwrap();
 }
