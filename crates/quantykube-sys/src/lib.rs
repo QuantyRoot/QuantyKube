@@ -1790,3 +1790,182 @@ mod tests {
         assert_eq!(DEFAULT_CAPS, 0xa00425fb);
     }
 }
+
+/// One instruction of an eBPF program, as `struct bpf_insn`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfInsn {
+    code: u8,
+    regs: u8,
+    off: i16,
+    imm: i32,
+}
+
+const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> BpfInsn {
+    BpfInsn {
+        code,
+        regs: dst | (src << 4),
+        off,
+        imm,
+    }
+}
+
+/// The character devices a container may open, major and minor, minor -1
+/// for any: the six of `/dev`, `/dev/console`, `/dev/ptmx` and the pty
+/// slaves, as runc allows them.
+const ALLOWED_DEVICES: [(i32, i32); 9] = [
+    (1, 3),
+    (1, 5),
+    (1, 7),
+    (1, 8),
+    (1, 9),
+    (5, 0),
+    (5, 1),
+    (5, 2),
+    (136, -1),
+];
+
+/// A device cgroup program: 1 lets the access through, 0 refuses it.
+/// The context is `struct bpf_cgroup_dev_ctx`: access and type in one
+/// word, then major and minor.
+fn device_program() -> Vec<BpfInsn> {
+    const LDX_W: u8 = 0x61;
+    const AND_K: u8 = 0x57;
+    const JNE_K: u8 = 0x55;
+    const JEQ_K: u8 = 0x15;
+    const MOV_K: u8 = 0xb7;
+    const EXIT: u8 = 0x95;
+    const CHAR: i32 = 2;
+    let mut p = vec![
+        insn(LDX_W, 2, 1, 0, 0),
+        insn(AND_K, 2, 0, 0, 0xffff),
+        insn(LDX_W, 3, 1, 4, 0),
+        insn(LDX_W, 4, 1, 8, 0),
+    ];
+    // filled in below: the jump over the allow list to the refusal
+    let not_char = p.len();
+    p.push(insn(JNE_K, 2, 0, 0, CHAR));
+    let mut allows = Vec::new();
+    for (major, minor) in ALLOWED_DEVICES {
+        if minor < 0 {
+            allows.push(p.len());
+            p.push(insn(JEQ_K, 3, 0, 0, major));
+        } else {
+            p.push(insn(JNE_K, 3, 0, 1, major));
+            allows.push(p.len());
+            p.push(insn(JEQ_K, 4, 0, 0, minor));
+        }
+    }
+    let deny = p.len();
+    p.push(insn(MOV_K, 0, 0, 0, 0));
+    p.push(insn(EXIT, 0, 0, 0, 0));
+    let allow = p.len();
+    p.push(insn(MOV_K, 0, 0, 0, 1));
+    p.push(insn(EXIT, 0, 0, 0, 0));
+    p[not_char].off = (deny - not_char - 1) as i16;
+    for at in allows {
+        p[at].off = (allow - at - 1) as i16;
+    }
+    p
+}
+
+/// Loads the device program and attaches it to the cgroup at `dir`, so
+/// that processes in it can open only the devices in ALLOWED_DEVICES,
+/// whatever nodes they find or make.
+pub fn restrict_devices(dir: &std::path::Path) -> io::Result<()> {
+    const SYS_BPF: c_long = 321;
+    const BPF_PROG_LOAD: c_long = 5;
+    const BPF_PROG_ATTACH: c_long = 8;
+    const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+    const BPF_CGROUP_DEVICE: u32 = 6;
+    let prog = device_program();
+    let license = c"Apache-2.0";
+    // union bpf_attr for BPF_PROG_LOAD: type, count, insns, license, then
+    // the log fields, zero
+    let mut load = [0u8; 128];
+    load[0..4].copy_from_slice(&BPF_PROG_TYPE_CGROUP_DEVICE.to_ne_bytes());
+    load[4..8].copy_from_slice(&(prog.len() as u32).to_ne_bytes());
+    load[8..16].copy_from_slice(&(prog.as_ptr() as u64).to_ne_bytes());
+    load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    // SAFETY: the attribute points at the program and license, both live
+    // for the call; the kernel copies them.
+    let fd = unsafe { syscall(SYS_BPF, BPF_PROG_LOAD, load.as_ptr(), load.len()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        use std::os::fd::AsRawFd;
+        let cgroup = std::fs::File::open(dir)?;
+        // union bpf_attr for BPF_PROG_ATTACH: target fd, program fd,
+        // attach type, flags
+        let mut attach = [0u8; 128];
+        attach[0..4].copy_from_slice(&(cgroup.as_raw_fd() as u32).to_ne_bytes());
+        attach[4..8].copy_from_slice(&(fd as u32).to_ne_bytes());
+        attach[8..12].copy_from_slice(&BPF_CGROUP_DEVICE.to_ne_bytes());
+        // SAFETY: as above.
+        if unsafe { syscall(SYS_BPF, BPF_PROG_ATTACH, attach.as_ptr(), attach.len()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    // the cgroup holds the program now; the descriptor is not needed
+    unsafe { close(fd as c_int) };
+    result
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    /// Runs the program the way the kernel would, for the few opcodes it
+    /// uses.
+    fn run(prog: &[BpfInsn], kind: u32, major: u32, minor: u32) -> u64 {
+        let ctx = [kind | (3 << 16), major, minor];
+        let mut r = [0u64; 11];
+        let mut pc = 0;
+        loop {
+            let i = prog[pc];
+            let (dst, src) = ((i.regs & 15) as usize, (i.regs >> 4) as usize);
+            assert_eq!(src, if i.code == 0x61 { 1 } else { 0 });
+            let imm = i.imm as i64 as u64;
+            let jump = |taken: bool| if taken { i.off as usize } else { 0 };
+            pc += 1 + match i.code {
+                0x61 => {
+                    r[dst] = ctx[i.off as usize / 4] as u64;
+                    0
+                }
+                0x57 => {
+                    r[dst] &= imm;
+                    0
+                }
+                0xb7 => {
+                    r[dst] = imm;
+                    0
+                }
+                0x55 => jump(r[dst] != imm),
+                0x15 => jump(r[dst] == imm),
+                0x95 => return r[0],
+                op => panic!("opcode {op:#x}"),
+            };
+        }
+    }
+
+    #[test]
+    fn only_the_standard_devices_are_let_through() {
+        let p = device_program();
+        let (block, char) = (1, 2);
+        for (major, minor) in [(1, 3), (1, 9), (5, 2), (136, 0), (136, 7)] {
+            assert_eq!(run(&p, char, major, minor), 1, "{major}:{minor}");
+        }
+        for (kind, major, minor) in [
+            (block, 8, 0),
+            (block, 1, 3),
+            (char, 1, 1),
+            (char, 4, 0),
+            (char, 10, 200),
+            (char, 5, 3),
+        ] {
+            assert_eq!(run(&p, kind, major, minor), 0, "{kind} {major}:{minor}");
+        }
+    }
+}

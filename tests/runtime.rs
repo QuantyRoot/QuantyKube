@@ -44,6 +44,7 @@ fn build_image_with(at: &Path, extra: &[&Path]) {
         "/bin/ls",
         "/bin/sleep",
         "/bin/hostname",
+        "/bin/mknod",
     ];
     for b in base.iter().map(Path::new).chain(extra.iter().copied()) {
         let real = fs::canonicalize(b).unwrap();
@@ -373,6 +374,22 @@ fn limits_hold_and_an_oom_kill_is_reported() {
     assert!(log.contains("50000 100000"), "{log}");
     assert_eq!((done.exit_code, done.reason.as_str()), (137, "OOMKilled"));
     assert!(!Path::new("/sys/fs/cgroup/quantykube").join(&id).exists());
+
+    // a device node can be made with MKNOD, but not opened
+    let mut c = spec(
+        "devices",
+        &["mknod /tmp/disk b 8 0 && echo made; cat /tmp/disk >/dev/null || echo refused; cat /dev/null && echo null"],
+    );
+    c.capabilities = Some(quantykube_sys::DEFAULT_CAPS | 1 << 27);
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    wait_exited(&rt, &id);
+    let log = fs::read_to_string(logs.join("devices.log")).unwrap();
+    let out: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.split(" stdout F ").nth(1))
+        .collect();
+    assert_eq!(out, ["made", "refused", "null"], "{log}");
 
     // a resize lands in the running container's cgroup
     let mut c = spec("resized", &["sleep 60"]);

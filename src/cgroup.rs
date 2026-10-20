@@ -79,6 +79,8 @@ fn write(dir: &Path, file: &str, value: &str) -> io::Result<()> {
 pub fn create(dir: &Path, limits: &Limits) -> io::Result<()> {
     let root = Path::new(ROOT);
     fs::create_dir_all(dir)?;
+    // the device cgroup of cgroup v2, which runc installs the same way
+    quantykube_sys::restrict_devices(dir)?;
     // a limit takes effect only where every ancestor delegates the
     // controller; this is what the kubelet itself does for its cgroups
     let mut at = dir.parent();
