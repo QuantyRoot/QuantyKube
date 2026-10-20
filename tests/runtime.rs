@@ -375,10 +375,11 @@ fn limits_hold_and_an_oom_kill_is_reported() {
     assert_eq!((done.exit_code, done.reason.as_str()), (137, "OOMKilled"));
     assert!(!Path::new("/sys/fs/cgroup/quantykube").join(&id).exists());
 
-    // a device node can be made with MKNOD, but not opened
+    // with MKNOD held, the device filter still refuses to make or open a
+    // node for a disk, and lets /dev/null through
     let mut c = spec(
         "devices",
-        &["mknod /tmp/disk b 8 0 && echo made; cat /tmp/disk >/dev/null || echo refused; cat /dev/null && echo null"],
+        &["mknod /tmp/disk b 8 0 || echo not made; cat /tmp/disk >/dev/null || echo refused; cat /dev/null && echo null"],
     );
     c.capabilities = Some(quantykube_sys::DEFAULT_CAPS | 1 << 27);
     let id = rt.create_container(&pod, c).unwrap();
@@ -389,7 +390,7 @@ fn limits_hold_and_an_oom_kill_is_reported() {
         .lines()
         .filter_map(|l| l.split(" stdout F ").nth(1))
         .collect();
-    assert_eq!(out, ["made", "refused", "null"], "{log}");
+    assert_eq!(out, ["not made", "refused", "null"], "{log}");
 
     // a resize lands in the running container's cgroup
     let mut c = spec("resized", &["sleep 60"]);
