@@ -30,7 +30,7 @@ jobs:
         run: cargo test --workspace
 
   e2e:
-    name: real etcdctl and a real Kubernetes API server
+    name: real etcdctl, kube-apiserver and k3s
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -41,15 +41,22 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
           curl -fsSLO https://github.com/etcd-io/etcd/releases/download/v3.6.15/etcd-v3.6.15-linux-amd64.tar.gz
           curl -fsSLo k3s https://github.com/k3s-io/k3s/releases/download/v1.37.1%2Bk3s1/k3s
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kube-apiserver
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
           sha256sum -c - <<'SUMS'
           b51d86e6bff2168de5ba8cd631c0fe6c785c7a1b32b083079f5677d6b7e2772c  etcd-v3.6.15-linux-amd64.tar.gz
           92b94582eb7b34a8cf532e6006842b9ed215a6783cf56a3dd6271fd35243b2c0  k3s
+          de9b1b43c10143f448408b3aaf15f44fd5248b97a56301417a1fe2f1fc47a691  kube-apiserver
+          65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  kubectl
           SUMS
           tar xzf etcd-v3.6.15-linux-amd64.tar.gz --strip-components=1 etcd-v3.6.15-linux-amd64/etcdctl
-          chmod +x k3s etcdctl
+          chmod +x k3s etcdctl kube-apiserver kubectl
       - run: cargo build --release
       - name: run
-        run: sudo env ETCDCTL="$RUNNER_TEMP/bin/etcdctl" K3S="$RUNNER_TEMP/bin/k3s" scripts/e2e.sh
+        run: |
+          b=$RUNNER_TEMP/bin
+          sudo env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver \
+            KUBECTL=$b/kubectl K3S=$b/k3s scripts/e2e.sh
 
   msrv:
     name: test on MSRV (1.89)
