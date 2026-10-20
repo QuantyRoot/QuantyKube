@@ -57,8 +57,10 @@ watches see the object return.
 | History beyond compaction: `history`, `get`, `restore` | built |
 | `kubectl quanty` plugin | built |
 | Benchmarks against etcd ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) | measured |
+| Retention: long history in the log, short lived snapshots ([ADR-014](docs/DECISIONS.md)) | built, soak tested |
 | TLS, so the store can be reached over a network | waiting for QuantyCore |
-| Node runtime behind CRI ([docs/RUNTIME.md](docs/RUNTIME.md)) | designed |
+| Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
+| Node runtime: the CRI service the kubelet talks to | designed |
 | Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
 
 ## Trying it
