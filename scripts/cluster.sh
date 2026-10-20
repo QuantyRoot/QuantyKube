@@ -78,7 +78,8 @@ spec:
   - name: hello
     image: test/busybox:1
     imagePullPolicy: Never
-    command: [sh, -c, 'cat /config/text; echo; touch /tmp/alive; exec sleep 3600']
+    command: [sh, -c, 'cat /config/text; echo; id -u; touch /tmp/alive; exec sleep 3600']
+    securityContext: {runAsUser: 1000, runAsGroup: 1000, allowPrivilegeEscalation: false}
     volumeMounts: [{name: config, mountPath: /config}]
     resources: {limits: {memory: 64Mi, cpu: 100m}}
     livenessProbe:
@@ -88,6 +89,7 @@ spec:
 YAML
 until_ok "pod running" sh -c "'$K3S' kubectl get pod hello -o jsonpath='{.status.phase}' | grep -qx Running"
 until_ok "pod logs" sh -c "'$K3S' kubectl logs hello | grep -qx 'hello from a ConfigMap'"
+[ "$(k logs hello | tail -1)" = 1000 ] || fail "runAsUser: $(k logs hello)"
 ip=$(k get pod hello -o jsonpath='{.status.podIP}')
 case $ip in 10.42.0.*) ;; *) fail "pod address: $ip" ;; esac
 sleep 6
