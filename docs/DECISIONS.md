@@ -10,6 +10,7 @@ through and add a new entry, never silently edit history.
 - [ADR-003](#adr-003-no-third-party-crates-the-engine-comes-from-quantydb) No third-party crates, the engine comes from QuantyDB
 - [ADR-004](#adr-004-plaintext-over-a-unix-socket-until-quantycore-has-tls) Plaintext over a Unix socket until QuantyCore has TLS
 - [ADR-005](#adr-005-sandbox-means-the-node-runtime-behind-cri) Sandbox means the node runtime behind CRI
+- [ADR-006](#adr-006-one-storage-interface-quantydb-behind-it-first) One storage interface, QuantyDB behind it first
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -121,3 +122,35 @@ the store runs only beside the API server.
 per pod against containerd and runc, measured on the same machine, or it
 is not said. Stronger isolation through micro VMs is a separate product
 idea and stays out of this record.
+
+## ADR-006: One storage interface, QuantyDB behind it first
+
+The etcd layer talks to storage through one Rust trait, defined from the
+first line of the store. QuantyDB is the default implementation and, until
+after the first demonstration, the only one. Other backends are possible
+later and are chosen by configuration.
+
+**Why the interface now:** it costs a few dozen lines while the store is
+being written and is expensive to retrofit once the etcd layer has grown
+around one engine's habits. It also lets anyone write their own backend in
+Rust without forking the project.
+
+**Why only QuantyDB for now:** every other backend is a separate piece of
+work under ADR-003, since its client has to be written here too. They are
+not equally worth it:
+
+- PostgreSQL is the one with a real reason. It is how k3s gets a highly
+  available control plane from kine without Raft: the database does the
+  replication. Its wire protocol and its SCRAM authentication are
+  manageable, and the hashing SCRAM needs is part of QuantyCore's TLS work
+  anyway. A remote PostgreSQL usually requires TLS, so it waits for that.
+- SQLite is not worth it. Its job, an embedded single file store, is what
+  QuantyDB already does here, and writing to its file format safely is far
+  more work than reading it.
+
+**The cost, and the part that must stay visible:** reading the cluster at
+a past revision cheaply, and branches of cluster state, come from
+QuantyDB's design. Behind another backend they are emulated with a log
+table, as kine does, or not offered. The README must say which features
+depend on the backend, so that nobody picks PostgreSQL for availability
+and expects the history to behave the same.
