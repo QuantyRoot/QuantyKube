@@ -6,8 +6,8 @@ use crate::store::{self, Backend, Change, Kind, Record, Tx, View};
 use quantycore::grpc::{code, Responder, Service, Status};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,10 @@ const CLUSTER_ID: u64 = 0x5155_414e_5459_4b55;
 const MEMBER_ID: u64 = 0x4b55_4245_0000_0001;
 const PROGRESS_EVERY: Duration = Duration::from_secs(600);
 const EVENTS_PER_RESPONSE: usize = 1000;
+/// Messages a watch stream may have waiting. A stream whose client reads
+/// slower than the store writes falls behind instead of growing without
+/// bound, and catches up from the change log (as etcd's victims do).
+const INBOX: usize = 1024;
 
 pub struct Etcd<B: Backend> {
     store: Arc<B>,
@@ -28,6 +32,9 @@ pub struct Etcd<B: Backend> {
     /// How often a watch asking for progress notifications gets one;
     /// shortened by tests.
     progress_ms: AtomicU64,
+    /// EVENTS_PER_RESPONSE and INBOX, shortened by tests.
+    events_per_response: AtomicUsize,
+    inbox: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +148,8 @@ impl<B: Backend> Etcd<B> {
             leases: Mutex::new(leases),
             endpoint,
             progress_ms: AtomicU64::new(PROGRESS_EVERY.as_millis() as u64),
+            events_per_response: AtomicUsize::new(EVENTS_PER_RESPONSE),
+            inbox: AtomicUsize::new(INBOX),
         });
         let weak = Arc::downgrade(&etcd);
         std::thread::spawn(move || {
@@ -492,7 +501,7 @@ impl<B: Backend> Etcd<B> {
     }
 
     fn watch(&self, requests: Receiver<Vec<u8>>, out: &mut dyn WatchOut) {
-        let (tx, rx) = mpsc::channel::<Inbox>();
+        let (tx, rx) = mpsc::sync_channel::<Inbox>(self.inbox.load(Ordering::Relaxed));
         let forward = tx.clone();
         std::thread::spawn(move || {
             for r in requests {
@@ -516,6 +525,9 @@ impl<B: Backend> Etcd<B> {
         // stream must not starve the watches that wait for progress
         let mut next_progress = Instant::now() + every;
         loop {
+            if w.lagging() && !w.recover(&rx, out) {
+                break;
+            }
             if Instant::now() >= next_progress {
                 next_progress = Instant::now() + every;
                 if !w.periodic_progress(&rx, out) {
@@ -585,11 +597,14 @@ enum Inbox {
 struct Sub {
     hub_id: u64,
     progress_notify: bool,
+    filter: Filter,
+    /// Set by the hub to the first revision it could not queue.
+    lagged: Arc<AtomicI64>,
 }
 
 struct WatchStream<'a, B: Backend> {
     etcd: &'a Etcd<B>,
-    tx: Sender<Inbox>,
+    tx: SyncSender<Inbox>,
     local: HashMap<i64, Sub>,
     /// Which watch a hub subscription belongs to. Events are routed by
     /// subscription, so events queued for a canceled watch never reach
@@ -695,10 +710,13 @@ impl<B: Backend> WatchStream<'_, B> {
             prev_kv: c.prev_kv,
         };
         // a start in the future is waited for: nothing before it is sent
-        let (hub_id, head) = self
-            .etcd
-            .hub
-            .add(filter.clone(), c.start_revision, self.tx.clone());
+        let lagged = Arc::new(AtomicI64::new(0));
+        let (hub_id, head) = self.etcd.hub.add(
+            filter.clone(),
+            c.start_revision,
+            self.tx.clone(),
+            lagged.clone(),
+        );
         self.by_hub.insert(hub_id, id);
         self.sent = self.sent.max(head);
         self.local.insert(
@@ -706,6 +724,8 @@ impl<B: Backend> WatchStream<'_, B> {
             Sub {
                 hub_id,
                 progress_notify: c.progress_notify,
+                filter: filter.clone(),
+                lagged,
             },
         );
         if !self.send(
@@ -722,44 +742,99 @@ impl<B: Backend> WatchStream<'_, B> {
         if c.start_revision == 0 || c.start_revision > head {
             return true;
         }
-        let mut batch: Vec<Event> = Vec::new();
-        let mut batch_rev = 0;
-        let mut alive = true;
-        let res = self
-            .etcd
-            .store
-            .changes(c.start_revision, head, &mut |rev, ch| {
+        self.replay(id, &filter, c.start_revision, head, out)
+    }
+
+    /// Sends the events for revisions `[from, to]` from the change log,
+    /// a bounded batch at a time, never holding the store while sending.
+    fn replay(
+        &mut self,
+        id: i64,
+        filter: &Filter,
+        from: i64,
+        to: i64,
+        out: &mut dyn WatchOut,
+    ) -> bool {
+        let limit = self.etcd.events_per_response.load(Ordering::Relaxed);
+        let mut from = from;
+        while from <= to {
+            let mut batch: Vec<Event> = Vec::new();
+            let mut batch_rev = 0;
+            let mut next = None;
+            let res = self.etcd.store.changes(from, to, &mut |rev, ch| {
                 if let Some(e) = filter.event(&ch) {
-                    if batch.len() >= EVENTS_PER_RESPONSE && rev != batch_rev {
-                        let events = std::mem::take(&mut batch);
-                        alive = out.send(
-                            &WatchResponse {
-                                header: self.etcd.header(head),
-                                watch_id: id,
-                                events,
-                                ..Default::default()
-                            }
-                            .encode(),
-                        );
+                    // a revision's events always go out together
+                    if batch.len() >= limit && rev != batch_rev {
+                        next = Some(rev);
+                        return false;
                     }
                     batch.push(e);
                     batch_rev = rev;
                 }
-                alive
+                true
             });
-        if res.is_err() || !alive {
+            if res.is_err() {
+                return false;
+            }
+            if !batch.is_empty()
+                && !self.send(
+                    out,
+                    WatchResponse {
+                        header: self.etcd.header(to),
+                        watch_id: id,
+                        events: batch,
+                        ..Default::default()
+                    },
+                )
+            {
+                return false;
+            }
+            match next {
+                Some(rev) => from = rev,
+                None => break,
+            }
+        }
+        self.sent = self.sent.max(to);
+        true
+    }
+
+    fn lagging(&self) -> bool {
+        self.local
+            .values()
+            .any(|s| s.lagged.load(Ordering::Acquire) != 0)
+    }
+
+    /// Brings watches the hub dropped for falling behind up to date: what
+    /// was queued first, then the missed revisions from the change log
+    /// under a new subscription.
+    fn recover(&mut self, rx: &Receiver<Inbox>, out: &mut dyn WatchOut) -> bool {
+        if self.catch_up(rx, out).is_none() {
             return false;
         }
-        batch.is_empty()
-            || self.send(
-                out,
-                WatchResponse {
-                    header: self.etcd.header(head),
-                    watch_id: id,
-                    events: batch,
-                    ..Default::default()
-                },
-            )
+        let behind: Vec<(i64, i64)> = self
+            .local
+            .iter()
+            .filter_map(|(id, s)| match s.lagged.load(Ordering::Acquire) {
+                0 => None,
+                rev => Some((*id, rev)),
+            })
+            .collect();
+        for (id, from) in behind {
+            let sub = self.local.get_mut(&id).expect("listed above");
+            sub.lagged.store(0, Ordering::Release);
+            self.by_hub.remove(&sub.hub_id);
+            let (hub_id, head) =
+                self.etcd
+                    .hub
+                    .add(sub.filter.clone(), 0, self.tx.clone(), sub.lagged.clone());
+            sub.hub_id = hub_id;
+            let filter = sub.filter.clone();
+            self.by_hub.insert(hub_id, id);
+            if !self.replay(id, &filter, from, head, out) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Delivers every event already queued, and returns the revision up
@@ -873,7 +948,8 @@ struct HubSub {
     /// Revisions below this are not sent: they were replayed already, or
     /// come before the revision the watch asked to start at.
     from: i64,
-    tx: Sender<Inbox>,
+    tx: SyncSender<Inbox>,
+    lagged: Arc<AtomicI64>,
 }
 
 struct HubState {
@@ -885,11 +961,25 @@ struct HubState {
 impl Hub {
     /// Subscribes from `from` on, and returns the subscription's id and
     /// the last revision published, after which events will arrive.
-    fn add(&self, filter: Filter, from: i64, tx: Sender<Inbox>) -> (u64, i64) {
+    fn add(
+        &self,
+        filter: Filter,
+        from: i64,
+        tx: SyncSender<Inbox>,
+        lagged: Arc<AtomicI64>,
+    ) -> (u64, i64) {
         let mut s = self.state.lock().unwrap();
         s.next_id += 1;
         let id = s.next_id;
-        s.subs.insert(id, HubSub { filter, from, tx });
+        s.subs.insert(
+            id,
+            HubSub {
+                filter,
+                from,
+                tx,
+                lagged,
+            },
+        );
         (id, s.last_rev)
     }
 
@@ -908,7 +998,19 @@ impl Hub {
                 return true;
             }
             let events: Vec<Event> = changes.iter().filter_map(|c| sub.filter.event(c)).collect();
-            events.is_empty() || sub.tx.send(Inbox::Events(*id, rev, events)).is_ok()
+            if events.is_empty() {
+                return true;
+            }
+            // never blocks a commit: a full stream is dropped here and
+            // catches up from the log on its own thread
+            match sub.tx.try_send(Inbox::Events(*id, rev, events)) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    sub.lagged.store(rev, Ordering::Release);
+                    false
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
         });
         s.last_rev = rev;
     }
@@ -1621,7 +1723,7 @@ mod tests {
     #[test]
     fn progress_covers_events_delivered_while_catching_up() {
         let e = etcd();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(INBOX);
         let mut w = WatchStream {
             etcd: &e,
             tx: tx.clone(),
@@ -1637,6 +1739,14 @@ mod tests {
             Sub {
                 hub_id: 7,
                 progress_notify: false,
+                filter: Filter {
+                    key: Vec::new(),
+                    end: Vec::new(),
+                    no_put: false,
+                    no_delete: false,
+                    prev_kv: false,
+                },
+                lagged: Arc::new(AtomicI64::new(0)),
             },
         );
         w.by_hub.insert(7, 0);
@@ -1644,5 +1754,130 @@ mod tests {
         tx.send(Inbox::Events(7, head + 1, Vec::new())).unwrap();
         let mut out = Collect(Arc::new(Mutex::new(Vec::new())));
         assert_eq!(w.catch_up(&rx, &mut out), Some(head + 1));
+    }
+
+    /// A client that reads its first response, then nothing until it is
+    /// told to.
+    struct Stalled {
+        got: Arc<Mutex<Vec<WatchResponse>>>,
+        go: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl WatchOut for Stalled {
+        fn send(&mut self, msg: &[u8]) -> bool {
+            let (lock, cv) = &*self.go;
+            let mut go = lock.lock().unwrap();
+            while !*go && !self.got.lock().unwrap().is_empty() {
+                go = cv.wait(go).unwrap();
+            }
+            self.got
+                .lock()
+                .unwrap()
+                .push(WatchResponse::decode(msg).unwrap());
+            true
+        }
+    }
+
+    fn stalled_watch(
+        e: &Arc<Etcd<Quanty<quantydb_core::MemStorage>>>,
+        create: WatchCreateRequest,
+    ) -> (
+        Arc<Mutex<Vec<WatchResponse>>>,
+        Arc<(Mutex<bool>, std::sync::Condvar)>,
+        mpsc::Sender<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        let mut out = Stalled {
+            got: got.clone(),
+            go: go.clone(),
+        };
+        let e2 = e.clone();
+        let t = std::thread::spawn(move || e2.watch(rx, &mut out));
+        let req = WatchRequest {
+            request_union: Some(WatchRequestUnion::Create(create)),
+        };
+        tx.send(req.encode()).unwrap();
+        (got, go, tx, t)
+    }
+
+    fn release(go: &(Mutex<bool>, std::sync::Condvar)) {
+        *go.0.lock().unwrap() = true;
+        go.1.notify_all();
+    }
+
+    // a watch client that stops reading, for example an API server that
+    // hangs, must not stop everybody else from writing
+    #[test]
+    fn a_stalled_watch_client_does_not_stop_writes() {
+        let e = etcd();
+        e.events_per_response.store(10, Ordering::Relaxed);
+        // more than one response's worth, so the replay sends while it
+        // reads the log
+        for i in 0..30 {
+            put(&e, &format!("/r/{i:04}"), "v", 0);
+        }
+        let (got, go, tx, t) = stalled_watch(
+            &e,
+            WatchCreateRequest {
+                key: "/r/".into(),
+                range_end: "/r0".into(),
+                start_revision: 1,
+                ..Default::default()
+            },
+        );
+        // the stream is now stuck sending its first events
+        std::thread::sleep(Duration::from_millis(100));
+        let (done_tx, done_rx) = mpsc::channel();
+        let e2 = e.clone();
+        std::thread::spawn(move || {
+            e2.store
+                .enforce_retention(3_600_000, 3_600_000, now_ms())
+                .unwrap();
+            put(&e2, "/other", "v", 0);
+            let _ = done_tx.send(());
+        });
+        let wrote = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        release(&go);
+        drop(tx);
+        t.join().unwrap();
+        assert!(wrote, "a write waited for a stalled watch client");
+        assert!(!got.lock().unwrap().is_empty());
+    }
+
+    // a stream that fell behind and was dropped by the hub catches up
+    // from the change log: every revision once, in order
+    #[test]
+    fn a_watch_that_fell_behind_misses_nothing() {
+        let e = etcd();
+        e.inbox.store(8, Ordering::Relaxed);
+        let (got, go, tx, t) = stalled_watch(
+            &e,
+            WatchCreateRequest {
+                key: "/k".into(),
+                ..Default::default()
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let first = e.store.head() + 1;
+        let n = 30;
+        for i in 0..n {
+            put(&e, "/k", &i.to_string(), 0);
+        }
+        release(&go);
+        let want: Vec<i64> = (first..first + n).collect();
+        let mut seen = Vec::new();
+        for _ in 0..500 {
+            seen = revisions(&got.lock().unwrap());
+            if seen.len() >= want.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        t.join().unwrap();
+        assert_eq!(seen, want);
     }
 }
