@@ -416,3 +416,41 @@ fn a_user_other_than_root_has_no_capabilities() {
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_restart_tears_down_what_the_last_run_left() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("restart");
+    build_image(&base.join("image"));
+    let state = base.join("state");
+    let before = Runtime::new(&state).unwrap();
+    before.import(&base.join("image"), "test/sh:1").unwrap();
+    let pod = before
+        .run_pod(PodSpec {
+            name: "left".into(),
+            log_directory: base.join("logs").to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let id = before
+        .create_container(&pod, spec("left", &["sleep 600"]))
+        .unwrap();
+    before.start_container(&id).unwrap();
+    let pid = before.container(&id).unwrap().pid;
+
+    let after = Runtime::new(&state).unwrap();
+    assert!(after.pods().is_empty() && after.containers().is_empty());
+    assert_eq!(after.images().len(), 1, "images are kept");
+    assert!(
+        !Path::new(&format!("/proc/{pid}/cmdline")).exists()
+            || fs::read(format!("/proc/{pid}/cmdline")).unwrap().is_empty()
+    );
+    let mounts = fs::read_to_string("/proc/self/mounts").unwrap();
+    assert!(!mounts.contains(state.to_str().unwrap()), "{mounts}");
+    assert_eq!(fs::read_dir(state.join("pods")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(state.join("containers")).unwrap().count(), 0);
+    fs::remove_dir_all(&base).unwrap();
+}

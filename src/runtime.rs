@@ -287,7 +287,50 @@ impl Runtime {
             cni,
         };
         rt.load_images()?;
+        rt.clean_up_after_a_restart();
         Ok(Arc::new(rt))
+    }
+
+    /// State lives in memory (ADR-017), so whatever a previous run left
+    /// is torn down, as a reboot would: its containers are killed, its
+    /// pods leave their network, and the kubelet starts them again.
+    fn clean_up_after_a_restart(&self) {
+        let entries = |sub: &str| -> Vec<PathBuf> {
+            fs::read_dir(self.dir.join(sub))
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+                .unwrap_or_default()
+        };
+        for dir in entries("containers") {
+            if let Ok(text) = fs::read_to_string(dir.join("process")) {
+                let mut f = text.split_whitespace();
+                let pid: i32 = f.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                let started = f.next().unwrap_or("");
+                if pid > 0 && start_time(pid).as_deref() == Some(started) {
+                    let _ = sys::signal(pid, 9);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                if let Some(cg) = f.next() {
+                    cgroup::remove(Path::new(cg));
+                }
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        for dir in entries("pods") {
+            let id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let (Some(cni), Ok(text)) = (&self.cni, fs::read_to_string(dir.join("network.json")))
+            {
+                let result = json::parse(&text).ok();
+                let _ = cni.del(&id, &dir.join("ns").join("net"), result.as_ref());
+            }
+            let _ = sys::release_namespaces(&dir.join("ns"));
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     pub fn network(&self) -> Option<&Cni> {
@@ -449,6 +492,9 @@ impl Runtime {
         fs::write(dir.join("hostname"), format!("{hostname}\n"))?;
         if !spec.resolv_conf.is_empty() {
             fs::write(dir.join("resolv.conf"), &spec.resolv_conf)?;
+        }
+        if let Some(result) = &network {
+            fs::write(dir.join("network.json"), result.to_string())?;
         }
         if !spec.log_directory.is_empty() {
             fs::create_dir_all(&spec.log_directory)?;
@@ -695,6 +741,15 @@ impl Runtime {
             return Err(e.into());
         }
         started.release()?;
+        let cg = cgroup.as_deref().map(|d| d.to_string_lossy().into_owned());
+        fs::write(
+            dir.join("process"),
+            format!(
+                "{pid} {} {}\n",
+                start_time(pid).unwrap_or_default(),
+                cg.unwrap_or_default()
+            ),
+        )?;
         if let Some(path) = self.log_path(&c) {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -878,6 +933,14 @@ impl Runtime {
         self.containers.lock().unwrap().remove(id);
         Ok(())
     }
+}
+
+/// When the process started, in clock ticks since boot: with the pid, it
+/// names one process even after the pid is reused.
+fn start_time(pid: i32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19).map(str::to_string)
 }
 
 fn container_env(image: &[String], spec: &[(String, String)]) -> Vec<String> {

@@ -525,13 +525,17 @@ disk, every blob checked against its SHA-256 before anything is
 unpacked and the image visible under its final name only once complete.
 Pulling needs HTTPS and waits for QuantyCore's TLS.
 
-**State is kept in memory.** After a restart the runtime has forgotten
-its pods and the kubelet recreates them, as it does after a reboot.
+**State is kept in memory.** A restart of the runtime is treated as a
+reboot of the node: at start it kills the containers a previous run left,
+found by pid and start time so that a reused pid is never hit, takes
+their pods off the network with the CNI result saved for each, releases
+their namespaces and cgroups, and the kubelet starts the pods again.
 
-**The cost:** a runtime restart kills nothing but orphans running
-containers and their mounts until the node reboots; making state
-durable is required before this runs anywhere real. And a pod with a
-shared PID namespace is refused.
+**The cost:** every pod on a node restarts when the runtime does, where
+containerd keeps them running through its shims. Keeping them would need
+a process per container that holds its output pipe and its exit status,
+which is what a shim is. And a pod with a shared PID namespace is
+refused.
 
 A test builds an image from this machine's own binaries with real
 digests and takes a pod through its whole life as root, in CI too: two
