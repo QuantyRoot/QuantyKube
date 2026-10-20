@@ -27,8 +27,8 @@ The second half is a node runtime, the program the kubelet starts
 containers through. In CI a k3s node runs on both halves at once, its
 API server on the store and its kubelet on the runtime, and an unchanged
 kubelet starts a pod with a ConfigMap volume, a service account token,
-CPU and memory limits, a pod network and an exec liveness probe
-(`scripts/cluster.sh`).
+CPU and memory limits, a pod network, an exec liveness probe, a user
+other than root and dropped capabilities (`scripts/cluster.sh`).
 
 ## What it does
 
