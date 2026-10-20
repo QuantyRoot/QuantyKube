@@ -183,6 +183,21 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
         .and_then(|l| l.security_context.as_ref())
         .and_then(|s| s.namespace_options.as_ref())
         .is_some_and(|ns| ns.pid == cripb::NamespaceMode::Pod);
+    let dir = std::path::Path::new(&config.log_directory);
+    if !config.log_directory.is_empty()
+        && (!dir.is_absolute()
+            || dir
+                .components()
+                .any(|c| c == std::path::Component::ParentDir))
+    {
+        return Err(Status::new(
+            code::INVALID_ARGUMENT,
+            format!(
+                "log directory {} is not a plain absolute path",
+                config.log_directory
+            ),
+        ));
+    }
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
         share_pid,
@@ -198,6 +213,90 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
         labels: pairs(&config.labels),
         annotations: pairs(&config.annotations),
     })
+}
+
+const CAPABILITIES: [&str; 41] = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "DAC_READ_SEARCH",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "SETGID",
+    "SETUID",
+    "SETPCAP",
+    "LINUX_IMMUTABLE",
+    "NET_BIND_SERVICE",
+    "NET_BROADCAST",
+    "NET_ADMIN",
+    "NET_RAW",
+    "IPC_LOCK",
+    "IPC_OWNER",
+    "SYS_MODULE",
+    "SYS_RAWIO",
+    "SYS_CHROOT",
+    "SYS_PTRACE",
+    "SYS_PACCT",
+    "SYS_ADMIN",
+    "SYS_BOOT",
+    "SYS_NICE",
+    "SYS_RESOURCE",
+    "SYS_TIME",
+    "SYS_TTY_CONFIG",
+    "MKNOD",
+    "LEASE",
+    "AUDIT_WRITE",
+    "AUDIT_CONTROL",
+    "SETFCAP",
+    "MAC_OVERRIDE",
+    "MAC_ADMIN",
+    "SYSLOG",
+    "WAKE_ALARM",
+    "BLOCK_SUSPEND",
+    "AUDIT_READ",
+    "PERFMON",
+    "BPF",
+    "CHECKPOINT_RESTORE",
+];
+
+/// The kubelet's drops applied to the default set. Dropping is always
+/// honoured; adding is refused beyond the default set, since without a
+/// device filter or user namespace most added capabilities lead out of
+/// the container.
+fn capability_set(c: &cripb::Capability) -> Result<u64, Status> {
+    let bit = |name: &str| -> Result<u64, Status> {
+        let n = name.trim_start_matches("CAP_");
+        CAPABILITIES
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(n))
+            .map(|i| 1u64 << i)
+            .ok_or_else(|| {
+                Status::new(code::INVALID_ARGUMENT, format!("unknown capability {name}"))
+            })
+    };
+    let mut caps = quantykube_sys::DEFAULT_CAPS;
+    for name in &c.drop_capabilities {
+        if name.eq_ignore_ascii_case("ALL") {
+            caps = 0;
+        } else {
+            caps &= !bit(name)?;
+        }
+    }
+    for name in &c.add_capabilities {
+        let add = if name.eq_ignore_ascii_case("ALL") {
+            u64::MAX
+        } else {
+            bit(name)?
+        };
+        if add & !quantykube_sys::DEFAULT_CAPS != 0 {
+            return Err(unsupported(&format!("adding capability {name}")));
+        }
+        caps |= add;
+    }
+    if !c.add_ambient_capabilities.is_empty() {
+        return Err(unsupported("ambient capabilities"));
+    }
+    Ok(caps)
 }
 
 fn limits_of(r: &cripb::LinuxContainerResources) -> cgroup::Limits {
@@ -240,6 +339,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         });
     }
     let mut readonly_rootfs = false;
+    let mut capabilities = None;
     let mut user = crate::user::Request::default();
     let mut limits = cgroup::Limits::default();
     let mut oom_score_adj = 0;
@@ -253,12 +353,38 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
     if config.tty || config.stdin {
         return Err(unsupported("a terminal or stdin"));
     }
+    // the runtime writes the log as root, so it must stay in the pod's
+    // log directory
+    let log = std::path::Path::new(&config.log_path);
+    if log.is_absolute()
+        || log
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(Status::new(
+            code::INVALID_ARGUMENT,
+            format!("log path {} leaves the log directory", config.log_path),
+        ));
+    }
     if let Some(sc) = config
         .linux
         .as_ref()
         .and_then(|l| l.security_context.as_ref())
     {
         readonly_rootfs = sc.readonly_rootfs;
+        if let Some(c) = &sc.capabilities {
+            capabilities = Some(capability_set(c)?);
+        }
+        // the kubelet sends Unconfined for every pod that names no
+        // profile, so it gets the default filter, as with the kubelet's
+        // --seccomp-default
+        let localhost = sc
+            .seccomp
+            .as_ref()
+            .is_some_and(|p| p.profile_type == cripb::ProfileType::Localhost);
+        if localhost {
+            return Err(unsupported("a seccomp profile of the node's own"));
+        }
         if sc.privileged {
             return Err(unsupported("a privileged container"));
         }
@@ -310,6 +436,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         limits,
         oom_score_adj,
         user,
+        capabilities,
     })
 }
 
@@ -871,5 +998,33 @@ mod tests {
             ..Default::default()
         };
         assert!(container_spec(bad_env).is_err());
+        for log_path in ["/etc/cron.d/x", "../../etc/x", "a/../../x"] {
+            let c = ContainerConfig {
+                log_path: log_path.into(),
+                ..Default::default()
+            };
+            assert!(container_spec(c).is_err(), "{log_path}");
+        }
+        let drop_all = |add: &str| ContainerConfig {
+            linux: Some(LinuxContainerConfig {
+                security_context: Some(LinuxContainerSecurityContext {
+                    capabilities: Some(cripb::Capability {
+                        drop_capabilities: vec!["ALL".into()],
+                        add_capabilities: vec![add.into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let caps = |c| container_spec(c).map(|s| s.capabilities);
+        assert_eq!(
+            caps(drop_all("CAP_NET_BIND_SERVICE")).unwrap(),
+            Some(1 << 10)
+        );
+        assert!(caps(drop_all("SYS_ADMIN")).is_err());
+        assert!(caps(drop_all("MKNOD")).is_err());
     }
 }

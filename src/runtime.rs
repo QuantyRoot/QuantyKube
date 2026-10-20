@@ -94,6 +94,9 @@ pub struct ContainerSpec {
     pub limits: cgroup::Limits,
     pub oom_score_adj: i64,
     pub user: user::Request,
+    /// The capability set, sys::DEFAULT_CAPS unless the kubelet asked
+    /// for less.
+    pub capabilities: Option<u64>,
 }
 
 /// A host file or directory mounted into the container.
@@ -375,7 +378,8 @@ impl Runtime {
             if let Ok(text) = fs::read_to_string(dir.join("holder")) {
                 let mut f = text.split_whitespace();
                 let pid: i32 = f.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-                if pid > 0 && start_time(pid).as_deref() == f.next() {
+                let started = f.next().unwrap_or("");
+                if pid > 0 && start_time(pid).as_deref() == Some(started) {
                     let _ = sys::signal(pid, 9);
                 }
             }
@@ -800,6 +804,7 @@ impl Runtime {
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(cwd.as_bytes())?
             .user(u.uid, u.gid, &u.groups)
+            .capabilities(c.spec.capabilities.unwrap_or(sys::DEFAULT_CAPS))
             .readonly(c.spec.readonly_rootfs)
             .cgroup_namespace(cgroup::available());
         if let Some(holder) = self.pod(&c.pod_id)?.pid_holder {
@@ -968,6 +973,7 @@ impl Runtime {
         let u = user::resolve(&lower, &img.config.user, &c.spec.user).map_err(Error::Invalid)?;
         let spawn = sys::Spawn::enter(c.pid, &argv_b, &env_b)?
             .user(u.uid, u.gid, &u.groups)
+            .capabilities(c.spec.capabilities.unwrap_or(sys::DEFAULT_CAPS))
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(working_dir(&c, &img).as_bytes())?;
         let started = spawn.start()?;

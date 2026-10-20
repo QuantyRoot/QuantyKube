@@ -97,9 +97,12 @@ const PR_CAPBSET_DROP: c_int = 24;
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
-/// The capabilities Docker and containerd leave a container by default:
-/// CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID, SETPCAP,
-/// NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, MKNOD, AUDIT_WRITE, SETFCAP.
+/// The capabilities Docker and containerd leave a container by default,
+/// except MKNOD: CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID,
+/// SETUID, SETPCAP, NET_BIND_SERVICE, NET_RAW, SYS_CHROOT, AUDIT_WRITE,
+/// SETFCAP. They keep MKNOD because a device cgroup refuses access to
+/// any node made with it; without that filter here, MKNOD would let a
+/// container make a node for the host's disk and open it.
 pub const DEFAULT_CAPS: u64 = (1 << 0)
     | (1 << 1)
     | (1 << 3)
@@ -111,7 +114,6 @@ pub const DEFAULT_CAPS: u64 = (1 << 0)
     | (1 << 10)
     | (1 << 13)
     | (1 << 18)
-    | (1 << 27)
     | (1 << 29)
     | (1 << 31);
 
@@ -1195,19 +1197,21 @@ impl Spawn {
             }
             self.drop_capabilities();
             // last: the filter refuses mount and pivot_root, used above
-            let prog = SockFprog {
-                len: self.seccomp.len() as u16,
-                filter: self.seccomp.as_ptr(),
-            };
-            if prctl(
-                PR_SET_SECCOMP,
-                SECCOMP_MODE_FILTER,
-                &prog as *const SockFprog as c_ulong,
-                0,
-                0,
-            ) != 0
-            {
-                fail(Step::Seccomp);
+            if !self.seccomp.is_empty() {
+                let prog = SockFprog {
+                    len: self.seccomp.len() as u16,
+                    filter: self.seccomp.as_ptr(),
+                };
+                if prctl(
+                    PR_SET_SECCOMP,
+                    SECCOMP_MODE_FILTER,
+                    &prog as *const SockFprog as c_ulong,
+                    0,
+                    0,
+                ) != 0
+                {
+                    fail(Step::Seccomp);
+                }
             }
             execve(
                 self.path.as_ptr(),
@@ -1334,19 +1338,21 @@ impl Spawn {
                 fail(Step::EnterRoot);
             }
             self.drop_capabilities();
-            let prog = SockFprog {
-                len: self.seccomp.len() as u16,
-                filter: self.seccomp.as_ptr(),
-            };
-            if prctl(
-                PR_SET_SECCOMP,
-                SECCOMP_MODE_FILTER,
-                &prog as *const SockFprog as c_ulong,
-                0,
-                0,
-            ) != 0
-            {
-                fail(Step::Seccomp);
+            if !self.seccomp.is_empty() {
+                let prog = SockFprog {
+                    len: self.seccomp.len() as u16,
+                    filter: self.seccomp.as_ptr(),
+                };
+                if prctl(
+                    PR_SET_SECCOMP,
+                    SECCOMP_MODE_FILTER,
+                    &prog as *const SockFprog as c_ulong,
+                    0,
+                    0,
+                ) != 0
+                {
+                    fail(Step::Seccomp);
+                }
             }
             execve(
                 self.path.as_ptr(),
@@ -1779,8 +1785,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_capabilities_are_dockers_fourteen() {
-        assert_eq!(DEFAULT_CAPS.count_ones(), 14);
-        assert_eq!(DEFAULT_CAPS, 0xa80425fb);
+    fn the_default_capabilities_are_dockers_without_mknod() {
+        assert_eq!(DEFAULT_CAPS.count_ones(), 13);
+        assert_eq!(DEFAULT_CAPS, 0xa00425fb);
     }
 }

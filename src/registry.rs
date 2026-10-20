@@ -80,9 +80,14 @@ pub fn parse(image: &str) -> io::Result<Reference> {
         repository
     };
     let ok = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-/".contains(&b))
+        s.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        })
     };
     let ref_ok = reference
         .bytes()
@@ -176,7 +181,7 @@ impl Client<'_> {
                         .header("www-authenticate")
                         .ok_or_else(|| invalid("401 without a challenge"))?
                         .to_string();
-                    self.auth = Some(self.authenticate(&header)?);
+                    self.auth = Some(self.authenticate(&header, &url)?);
                 }
                 status => {
                     return Err(io::Error::other(format!(
@@ -189,7 +194,7 @@ impl Client<'_> {
         Err(io::Error::other("too many redirects"))
     }
 
-    fn authenticate(&mut self, challenge: &str) -> io::Result<String> {
+    fn authenticate(&mut self, challenge: &str, registry: &Url) -> io::Result<String> {
         let (scheme, params) = http1::parse_www_authenticate(challenge)
             .ok_or_else(|| invalid("unreadable challenge"))?;
         let basic = self.creds.filter(|c| !c.username.is_empty()).map(|c| {
@@ -221,6 +226,9 @@ impl Client<'_> {
             }
         }
         let url = http1::parse_url(&target).map_err(|e| invalid(format!("{e:?}")))?;
+        // the registry names the realm, so a login goes there only over
+        // TLS or to the registry's own host, never in the clear elsewhere
+        let basic = basic.filter(|_| url.scheme == "https" || url.host == registry.host);
         let mut token_client = Client {
             opts: self.opts,
             creds: None,
@@ -423,5 +431,7 @@ mod tests {
         assert_eq!(base64(b"user:pas"), "dXNlcjpwYXM=");
         assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
         assert!(parse("a/b:../x").is_err());
+        assert!(parse("a/../b").is_err());
+        assert!(parse("a//b").is_err());
     }
 }

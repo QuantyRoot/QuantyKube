@@ -14,8 +14,8 @@ written before most of the code.
   the root pivoted, read only if asked; a fresh `/dev` with the six
   standard devices, `devpts` and `/dev/shm`; `/sys` read only; the paths
   runc masks or makes read only under `/proc` and `/sys`; Docker's
-  fourteen default capabilities in every set, the rest dropped from the
-  bounding set; `no_new_privs`; Docker's seccomp allowlist (ADR-024);
+  default capabilities except MKNOD in every set (ADR-026), the rest
+  dropped from the bounding set; `no_new_privs`; Docker's seccomp allowlist (ADR-024);
   and, with `--cgroup`, a cgroup v2 with memory and pid limits that the
   process is in before any of its own code runs (ADR-013). alpine,
   busybox and nginx run in it.

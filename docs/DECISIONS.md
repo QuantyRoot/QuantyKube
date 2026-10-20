@@ -30,6 +30,7 @@ through and add a new entry, never silently edit history.
 - [ADR-023](#adr-023-users-resolve-inside-the-image-and-non-root-means-no-capabilities) Users resolve inside the image, and non-root means no capabilities
 - [ADR-024](#adr-024-the-seccomp-filter-is-dockers-allowlist) The seccomp filter is Docker's allowlist
 - [ADR-025](#adr-025-pulls-go-through-the-import) Pulls go through the import
+- [ADR-026](#adr-026-without-a-device-filter-there-is-no-mknod) Without a device filter there is no MKNOD
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -673,7 +674,7 @@ error, not root. ImageStatus reports the image's user so that the
 kubelet can enforce `runAsNonRoot` before a container starts.
 
 A process that is not root starts with no capabilities at all, the
-bounding set still limited to the default fourteen and `no_new_privs`
+bounding set still limited to the default set and `no_new_privs`
 set, which is what Docker and containerd give it. The ids are set with
 raw system calls: glibc's wrappers would try to synchronise threads that
 exist only in the parent.
@@ -748,4 +749,33 @@ redirect to another host.
 
 **The cost:** no public registry is reachable before TLS, and identity
 tokens, which need an OAuth2 exchange, are refused.
+
+## ADR-026: Without a device filter there is no MKNOD
+
+A review of the runtime against what a container can reach found that
+Docker's default capabilities include MKNOD, and Docker can afford it
+because every container also gets a device cgroup that refuses to open
+any node but the standard ones. This runtime has no such filter, so with
+MKNOD a container could make a node for the host's disk in its own
+`/dev` and open it: root in a container is root on the host here
+(ADR-023). MKNOD is therefore not in the default set, cannot be added
+back, and the kubelet's capability lists are honoured otherwise: drops
+always, adds only within the default set, since most capabilities
+beyond it lead out of a container without a user namespace. Device
+nodes in image layers were already skipped when unpacking (ADR-016).
+
+The same review closed three smaller holes. A log path from the kubelet
+that is absolute or climbs out with `..` is refused, since the runtime
+writes the log as root. A registry login goes to the token realm the
+registry names only over TLS or on the registry's own host. And image
+references whose repository has empty, `.` or `..` parts are refused.
+
+A seccomp profile of the node's own (Localhost) is refused; Unconfined,
+which the kubelet sends for every pod that names no profile, gets the
+default filter, as with the kubelet's `--seccomp-default`.
+
+**The cost:** a program that makes device nodes fails here where it
+works under Docker, and a pod that asks for Unconfined to make a call
+Docker's profile refuses fails too. The device filter, a cgroup BPF
+program as runc loads, would allow MKNOD back.
 
