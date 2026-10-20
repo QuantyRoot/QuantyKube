@@ -35,6 +35,10 @@ expect() {
     got=$("$@" 2>&1) || true
     if [ "$got" != "$want" ]; then
         printf 'FAIL: %s\nwant:\n%s\ngot:\n%s\n' "$*" "$want" "$got"
+        for log in "$work"/*.log; do
+            printf '\n--- %s\n' "$log"
+            tail -40 "$log"
+        done
         exit 1
     fi
 }
@@ -80,10 +84,13 @@ echo "etcdctl: ok"
     --disable-cloud-controller --disable-helm-controller >"$work/k3s.log" 2>&1 &
 pids+=($!)
 k() { "$K3S" kubectl --kubeconfig "$work/k.yaml" "$@"; }
-for _ in $(seq 120); do
-    k get --raw /readyz >/dev/null 2>&1 && break
-    sleep 1
-done
+ready() {
+    for _ in $(seq 120); do
+        k get --raw /readyz >/dev/null 2>&1 && return
+        sleep 1
+    done
+}
+ready
 expect ok k get --raw /readyz
 expect $'default\nkube-node-lease\nkube-public\nkube-system' \
     k get namespaces -o 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
@@ -92,6 +99,7 @@ k patch configmap e2e -p '{"data":{"v":"2"}}' >/dev/null
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
 kill -9 "$qk"
 start
+ready
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
 k delete configmap e2e >/dev/null
 expect 'Error from server (NotFound): configmaps "e2e" not found' last k get configmap e2e
