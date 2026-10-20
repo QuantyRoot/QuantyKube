@@ -1,9 +1,10 @@
 # QuantyKube
 
-A Kubernetes data store with an undo button. It speaks the etcd v3 API the
-Kubernetes API server uses, keeps history after the API server compacts
-it, and is written in Rust against the standard library and other
-QuantyRoot crates only.
+Two parts of Kubernetes, rewritten in Rust against the standard library
+and other QuantyRoot crates only: a data store with an undo button that
+speaks the etcd v3 API the API server uses and keeps history after the
+API server compacts it, and a node runtime the kubelet starts containers
+through, with no shim and no pause container per pod.
 
 [![CI](https://github.com/QuantyRoot/QuantyKube/actions/workflows/ci.yml/badge.svg)](https://github.com/QuantyRoot/QuantyKube/actions/workflows/ci.yml)
 ![Status](https://img.shields.io/badge/status-early-red)
@@ -92,6 +93,18 @@ kubectl quanty history --prefix configmap/default/
 `etcdctl --endpoints=unix:///run/quantykube.sock` works for looking at
 the raw keys.
 
+The runtime, on a node with cgroup v2 and CNI plugins, for a kubelet
+started with `--container-runtime-endpoint=unix:///run/quantykube-cri.sock`
+and `--cgroup-driver=cgroupfs`:
+
+```
+target/release/quantykube runtime --root /var/lib/quantykube-runtime \
+  --socket /run/quantykube-cri.sock
+```
+
+Images come from `quantykube import` or, until TLS is in, a registry
+reached over plain HTTP (`--plain-http`).
+
 ## How it is built
 
 - [docs/DECISIONS.md](docs/DECISIONS.md): every decision that might be
@@ -99,7 +112,8 @@ the raw keys.
 - [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md): what has to work for the first
   public demonstration, written before the code.
 - [docs/DEMO.md](docs/DEMO.md): that demonstration, as commands.
-- The protocol stack, protobuf, HPACK, HTTP/2 and gRPC, lives in
+- [docs/RUNTIME.md](docs/RUNTIME.md): the node runtime.
+- The protocol stack, protobuf, HPACK, HTTP/2, gRPC and HTTP/1.1, lives in
   [QuantyCore](https://github.com/QuantyRoot/QuantyCore); the storage
   engine is [QuantyDB](https://github.com/QuantyRoot/QuantyDatabase).
 
