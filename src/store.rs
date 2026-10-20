@@ -884,8 +884,24 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
             )));
         }
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        // what this write reads includes the batch's writes so far, which
+        // are not on disk until the batch commits
+        let pending = g.members > 0;
         let mut tx = match g.tx.take() {
-            Some(t) => db.resume(t)?,
+            Some(t) => match db.resume(t) {
+                Ok(t) => t,
+                Err(e) => {
+                    // the batch's writes are lost: its writers must hear so
+                    let epoch = g.epoch;
+                    self.stop(&mut g, epoch, &e.to_string());
+                    g.epoch += 1;
+                    g.members = 0;
+                    g.changes.clear();
+                    g.committed = epoch;
+                    self.done.notify_all();
+                    return Err(e.into());
+                }
+            },
             None => db.begin(),
         };
         let rev = g.next_rev;
@@ -931,9 +947,11 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
         };
         drop(db);
         res?;
-        if !wrote {
+        if !wrote && !pending {
             return Ok(None);
         }
+        // a write, or a read of writes that are not yet durable, answers
+        // only once they are: etcd never shows a client what it might lose
         while g.committed < epoch {
             g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
         }
@@ -942,7 +960,7 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
                 return Err(Error::Commit(msg.clone()));
             }
         }
-        Ok((!changes.is_empty()).then_some((rev, changes)))
+        Ok((wrote && !changes.is_empty()).then_some((rev, changes)))
     }
 
     fn set_publisher(&self, p: Publisher) {
@@ -1327,5 +1345,46 @@ mod tests {
         assert!(s.enforce_retention(0, 0, now_ms()).is_err());
         assert_eq!(s.head(), head);
         assert_eq!(stops.lock().unwrap().len(), 1);
+    }
+
+    // a read inside a batch sees the batch's writes; if their commit then
+    // fails, the reader must not have been told about them
+    #[test]
+    fn a_read_of_writes_that_fail_to_commit_fails_too() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = Arc::new(
+            Quanty::start(
+                Db::create(
+                    Flaky {
+                        mem: MemStorage::new(),
+                        fail: fail.clone(),
+                    },
+                    Default::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        s.write(&mut |tx| tx.put(b"k", b"old", 0).map(|_| ()))
+            .unwrap();
+        // someone else is about to join: the writer below leaves its
+        // batch open for them
+        s.lock_batch().waiting += 1;
+        let s2 = s.clone();
+        let writer =
+            std::thread::spawn(move || s2.write(&mut |tx| tx.put(b"k", b"new", 0).map(|_| ())));
+        while s.lock_batch().tx.is_none() {
+            std::thread::yield_now();
+        }
+        s.lock_batch().waiting -= 1;
+        fail.store(true, Ordering::SeqCst);
+        let mut seen = None;
+        let read = s.write(&mut |tx| {
+            seen = tx.get(b"k")?.map(|r| r.value);
+            Ok(())
+        });
+        assert_eq!(seen.as_deref(), Some(&b"new"[..]), "read inside the batch");
+        assert!(read.is_err(), "told about a write that was lost");
+        assert!(writer.join().unwrap().is_err());
     }
 }
