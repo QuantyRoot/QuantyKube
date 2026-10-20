@@ -22,14 +22,6 @@ fail() { echo "FAIL: $*"; exit 1; }
 
 "$QK" import --root "$work/root" "$IMAGE" test/busybox:1 >/dev/null
 mkdir "$work/net.d"
-if [ -n "${CNI_BIN:-}" ]; then
-    cat >"$work/net.d/10-test.conflist" <<JSON
-{"cniVersion": "1.0.0", "name": "test", "plugins": [{"type": "bridge",
- "bridge": "qktest0", "isGateway": true, "ipam": {"type": "host-local",
- "ranges": [[{"subnet": "10.88.77.0/24"}]], "dataDir": "$work/ipam"}},
- {"type": "portmap", "capabilities": {"portMappings": true}}]}
-JSON
-fi
 "$QK" runtime --root "$work/root" --socket "$work/cri.sock" \
     --cni-conf "$work/net.d" --cni-bin "${CNI_BIN:-/nonexistent}" 2>"$work/rt.log" &
 rt=$!
@@ -40,6 +32,16 @@ image-endpoint: unix://$work/cri.sock
 timeout: 10
 YAML
 c() { "$CRICTL" -c "$work/crictl.yaml" "$@" 2>/dev/null; }
+
+# the network is installed after the runtime started, as an add-on is
+if [ -n "${CNI_BIN:-}" ]; then
+    cat >"$work/net.d/10-test.conflist" <<JSON
+{"cniVersion": "1.0.0", "name": "test", "plugins": [{"type": "bridge",
+ "bridge": "qktest0", "isGateway": true, "ipam": {"type": "host-local",
+ "ranges": [[{"subnet": "10.88.77.0/24"}]], "dataDir": "$work/ipam"}},
+ {"type": "portmap", "capabilities": {"portMappings": true}}]}
+JSON
+fi
 
 [ "$(c version | grep RuntimeName)" = "RuntimeName:  quantykube" ] ||
     fail "version"

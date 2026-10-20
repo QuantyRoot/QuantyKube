@@ -240,7 +240,10 @@ pub struct Runtime {
     pods: Mutex<HashMap<String, Pod>>,
     containers: Mutex<HashMap<String, Container>>,
     exited: Condvar,
-    cni: Option<Cni>,
+    /// Loaded on first use, so a network add-on installed after the
+    /// runtime started is found without a restart.
+    cni: Mutex<Option<Arc<Cni>>>,
+    cni_dirs: Option<(PathBuf, PathBuf)>,
     /// The open log file of each running container, shared with the
     /// threads that write it.
     logs: Mutex<HashMap<String, Arc<Mutex<File>>>>,
@@ -317,7 +320,8 @@ impl Runtime {
 
     /// Pods get their network from `cni`; without it they have only
     /// their own loopback.
-    pub fn with_network(dir: &Path, cni: Option<Cni>) -> Result<Arc<Runtime>> {
+    /// `cni_dirs` are the configuration and plugin directories.
+    pub fn with_network(dir: &Path, cni_dirs: Option<(PathBuf, PathBuf)>) -> Result<Arc<Runtime>> {
         for sub in ["images", "pods", "containers"] {
             fs::create_dir_all(dir.join(sub))?;
         }
@@ -327,7 +331,8 @@ impl Runtime {
             pods: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
             exited: Condvar::new(),
-            cni,
+            cni: Mutex::new(None),
+            cni_dirs,
             logs: Mutex::new(HashMap::new()),
         };
         rt.load_images()?;
@@ -367,7 +372,8 @@ impl Runtime {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let (Some(cni), Ok(text)) = (&self.cni, fs::read_to_string(dir.join("network.json")))
+            if let (Some(cni), Ok(text)) =
+                (self.network(), fs::read_to_string(dir.join("network.json")))
             {
                 let result = json::parse(&text).ok();
                 let ports = read_ports(&dir);
@@ -378,8 +384,18 @@ impl Runtime {
         }
     }
 
-    pub fn network(&self) -> Option<&Cni> {
-        self.cni.as_ref()
+    /// The pod network, once a CNI configuration exists.
+    pub fn network(&self) -> Option<Arc<Cni>> {
+        let mut cni = self.cni.lock().unwrap();
+        if cni.is_none() {
+            if let Some((conf, bin)) = &self.cni_dirs {
+                match Cni::load(conf, bin) {
+                    Ok(loaded) => *cni = loaded.map(Arc::new),
+                    Err(e) => eprintln!("quantykube: {}: {e}", conf.display()),
+                }
+            }
+        }
+        cni.clone()
     }
 
     pub fn dir(&self) -> &Path {
@@ -544,7 +560,7 @@ impl Runtime {
             &spec.hostname
         };
         sys::hold_namespaces(&dir.join("ns"), hostname.as_bytes())?;
-        let network = match &self.cni {
+        let network = match self.network() {
             Some(cni) => match cni.add(&id, &dir.join("ns").join("net"), &spec.ports) {
                 Ok(result) => Some(result),
                 Err(e) => {
@@ -621,7 +637,7 @@ impl Runtime {
         }
         let ns = self.dir.join("pods").join(id).join("ns");
         if pod.state == PodState::Ready {
-            if let Some(cni) = &self.cni {
+            if let Some(cni) = self.network() {
                 cni.del(id, &ns.join("net"), pod.network.as_ref(), &pod.spec.ports)?;
             }
         }

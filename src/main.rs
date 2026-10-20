@@ -331,12 +331,12 @@ fn runtime(args: &[String]) -> Result<(), String> {
     let socket = PathBuf::from(required(args, "--socket")?);
     let conf = PathBuf::from(value(args, "--cni-conf").unwrap_or("/etc/cni/net.d"));
     let bin = PathBuf::from(value(args, "--cni-bin").unwrap_or("/opt/cni/bin"));
-    let cni = quantykube::cni::Cni::load(&conf, &bin).map_err(|e| e.to_string())?;
-    match &cni {
+    let rt = quantykube::runtime::Runtime::with_network(&root, Some((conf.clone(), bin)))
+        .map_err(|e| e.to_string())?;
+    match rt.network() {
         Some(c) => eprintln!("quantykube: pod network {}", c.name()),
-        None => eprintln!("quantykube: no CNI configuration in {}", conf.display()),
+        None => eprintln!("quantykube: no CNI configuration in {} yet", conf.display()),
     }
-    let rt = quantykube::runtime::Runtime::with_network(&root, cni).map_err(|e| e.to_string())?;
     let registries = registry_options(args);
     // whoever can connect can run anything as root on the node
     let listener = private_socket(&socket)?;

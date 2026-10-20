@@ -649,8 +649,11 @@ namespace is made, so containers of a pod reach each other on
 Status reports NetworkReady only once a configuration exists, which is
 how the kubelet learns that the network add-on has been installed.
 
-**The cost:** the configuration is read once at start, where containerd
-watches the directory; a network installed later needs a restart of the
+The configuration is looked for until one is found, so a network add-on
+installed after the runtime started, as they usually are, is picked up.
+
+**The cost:** once found, the configuration is kept, where containerd
+watches the directory; a changed network needs a restart of the
 runtime. CNI's CHECK and GC commands are not run, and of the plugin
 capabilities only port mappings are passed, to plugins such as
 `portmap` that declare them, which is how a pod's `hostPort` works.
