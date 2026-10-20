@@ -13,7 +13,7 @@
 
 use quantydb_core::{Db, FileStorage, MemStorage, Storage, SuspendedTx};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -152,6 +152,19 @@ const COMMITS: &[u8] = b"c/";
 /// default size, and every key here carries a one byte prefix.
 pub const MAX_KEY: usize = 511;
 
+#[derive(Debug, Clone, Copy)]
+struct CommitEntry {
+    last_rev: i64,
+    id: u64,
+    unix_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
 /// Writes gathered into one QuantyDB commit (ADR-012). Writes that arrive
 /// while a commit is on its way to disk wait, apply one after another into
 /// a new transaction, and the last of them commits it for all.
@@ -177,10 +190,12 @@ pub struct Quanty<S: Storage + 'static> {
     compacted: AtomicI64,
     /// the oldest revision history can still be read at
     retained_from: AtomicI64,
-    /// (last revision, commit id) of every retained commit that carries
-    /// revisions, oldest first; a commit holds the revisions after the
-    /// previous entry's up to its own
-    commits: RwLock<Vec<(i64, u64)>>,
+    /// every commit that carries revisions and whose history is retained,
+    /// oldest first; a commit holds the revisions after the previous
+    /// entry's up to its own
+    commits: RwLock<Vec<CommitEntry>>,
+    /// the oldest commit QuantyDB still keeps a snapshot of (ADR-014)
+    snap_floor: AtomicU64,
 }
 
 impl Quanty<FileStorage> {
@@ -214,6 +229,12 @@ fn commit_key(id: u64) -> Vec<u8> {
     k
 }
 
+fn commit_value(last_rev: i64, unix_ms: i64) -> Vec<u8> {
+    let mut out = varint(last_rev);
+    put_varint(&mut out, unix_ms as u64);
+    out
+}
+
 fn varint(v: i64) -> Vec<u8> {
     let mut out = Vec::new();
     put_varint(&mut out, v as u64);
@@ -225,9 +246,10 @@ impl<S: Storage + 'static> Quanty<S> {
         if db.head_commit() == 0 {
             let mut tx = db.begin();
             let id = tx.pending_commit_id();
-            tx.put(&commit_key(id), &varint(1))?;
+            tx.put(&commit_key(id), &commit_value(1, now_ms()))?;
             tx.commit()?;
         }
+        let snap_floor = db.log()?.last().map_or(0, |c| c.commit_id);
         let (compacted, retained_from, commits, head) = {
             let snap = db.snapshot();
             let meta = |name: &[u8], default: i64| -> Result<i64> {
@@ -248,9 +270,17 @@ impl<S: Storage + 'static> Quanty<S> {
                         .try_into()
                         .map_err(|_| Error::Corrupt("commit index"))?,
                 );
-                commits.push((decode_i64(&v)?, id));
+                let mut b = &v[..];
+                commits.push(CommitEntry {
+                    last_rev: take_varint(&mut b)? as i64,
+                    id,
+                    unix_ms: take_varint(&mut b).unwrap_or(0) as i64,
+                });
             }
-            let head = commits.last().ok_or(Error::Corrupt("commit index"))?.0;
+            let head = commits
+                .last()
+                .ok_or(Error::Corrupt("commit index"))?
+                .last_rev;
             (compacted, retained_from, commits, head)
         };
         Ok(Quanty {
@@ -272,6 +302,7 @@ impl<S: Storage + 'static> Quanty<S> {
             compacted: compacted.into(),
             retained_from: retained_from.into(),
             commits: RwLock::new(commits),
+            snap_floor: snap_floor.into(),
         })
     }
 
@@ -294,8 +325,9 @@ impl<S: Storage + 'static> Quanty<S> {
         drop(g);
         let last = changes.last().map(|c| c.0);
         let id = tx.pending_commit_id();
+        let at = now_ms();
         let result = match last {
-            Some(l) => tx.put(&commit_key(id), &varint(l)).map(|()| tx),
+            Some(l) => tx.put(&commit_key(id), &commit_value(l, at)).map(|()| tx),
             None => Ok(tx),
         }
         .and_then(|tx| tx.commit());
@@ -306,7 +338,11 @@ impl<S: Storage + 'static> Quanty<S> {
                     self.commits
                         .write()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push((l, id));
+                        .push(CommitEntry {
+                            last_rev: l,
+                            id,
+                            unix_ms: at,
+                        });
                     self.head.store(l, Ordering::Release);
                 }
                 if let Some(p) = &*self.publisher.read().unwrap_or_else(|e| e.into_inner()) {
@@ -326,16 +362,28 @@ impl<S: Storage + 'static> Quanty<S> {
         g
     }
 
-    /// The commit holding `rev` and the last revision in it.
+    /// The oldest commit with a snapshot that holds `rev` or comes after
+    /// it, and the last revision in that commit. Everything between `rev`
+    /// and that revision is undone from the log.
     fn commit_of(&self, rev: i64) -> Result<(i64, u64)> {
-        if rev < self.retained_from.load(Ordering::Acquire) {
-            return Err(Error::NotRetained(
-                self.retained_from.load(Ordering::Acquire),
-            ));
+        let from = self.retained_from.load(Ordering::Acquire);
+        if rev < from {
+            return Err(Error::NotRetained(from));
         }
+        let floor = self.snap_floor.load(Ordering::Acquire);
         let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
-        let i = commits.partition_point(|c| c.0 < rev);
-        commits.get(i).copied().ok_or(Error::FutureRevision)
+        let i = commits.partition_point(|c| c.last_rev < rev);
+        let held = commits.get(i).ok_or(Error::FutureRevision)?;
+        if held.id >= floor {
+            return Ok((held.last_rev, held.id));
+        }
+        // the snapshot is gone: rebuild from the oldest one left, which
+        // may be a bookkeeping commit after the newest revision
+        let j = commits.partition_point(|c| c.id < floor);
+        Ok(match commits.get(j) {
+            Some(c) => (c.last_rev, c.id),
+            None => (commits.last().map_or(rev, |c| c.last_rev), floor),
+        })
     }
 
     /// The store as it was right after `rev`.
@@ -360,68 +408,66 @@ impl<S: Storage + 'static> Quanty<S> {
         })
     }
 
-    /// Drops history older than `keep_ms`, but never a revision etcd
-    /// clients may still read, that is anything from the compaction
-    /// revision on. Returns how many commits were collected.
-    pub fn enforce_retention(&self, keep_ms: i64, now_ms: i64) -> Result<usize> {
+    /// Keeps the change log, and so the history, for `keep_ms`, and
+    /// QuantyDB's snapshots for `snapshot_ms` (ADR-014). The log never
+    /// loses a revision an etcd client may still read, that is anything
+    /// from the compaction revision on. Returns how many snapshots were
+    /// collected.
+    pub fn enforce_retention(&self, keep_ms: i64, snapshot_ms: i64, now_ms: i64) -> Result<usize> {
         let mut g = self.lock_batch();
         while g.committing || g.tx.is_some() {
             g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
         }
-        let (keep, floor_id, total) = {
-            let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-            let log = db.log()?;
-            let cutoff = now_ms - keep_ms;
-            // the newest commit older than the cutoff stays: it is the
-            // state at the cutoff itself
-            let by_time = log
-                .iter()
-                .position(|c| (c.unix_ts_ms as i64) < cutoff)
-                .map_or(log.len(), |i| i + 1);
-            let needed = match self.commit_of(self.compacted().max(1)) {
-                Ok((_, id)) => id,
-                Err(_) => 0,
-            };
-            let by_etcd = log.iter().filter(|c| c.commit_id >= needed).count();
-            let keep = by_time.max(by_etcd).clamp(1, log.len());
-            (keep, log[keep - 1].commit_id, log.len())
-        };
-        if keep >= total {
-            return Ok(0);
-        }
-        let (dropped, from) = {
+        let retained = self.retained_from.load(Ordering::Acquire);
+        // the newest revision at or before the cutoff stays readable,
+        // since `get --ago` asks for exactly that state
+        let (from, dropped) = {
             let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
-            let n = commits.partition_point(|c| c.1 < floor_id);
-            let from = if n == 0 {
-                self.retained_from.load(Ordering::Acquire)
+            let n = commits.partition_point(|c| c.unix_ms <= now_ms - keep_ms);
+            let by_time = if n == 0 {
+                retained
             } else {
-                commits[n - 1].0 + 1
+                commits[n - 1].last_rev
             };
-            (commits[..n].to_vec(), from)
+            let from = by_time.min(self.compacted().max(1)).max(retained);
+            let d = commits.partition_point(|c| c.last_rev < from);
+            (from, commits[..d].to_vec())
         };
-        {
+        let moved = from > retained;
+        if moved {
             let db = self.db.read().unwrap_or_else(|e| e.into_inner());
             let mut tx = db.begin();
             let old: Vec<Vec<u8>> = tx
-                .scan(Some(&[LOG]), Some(&log_key(from, 0)))?
+                .scan(Some(&[LOG]), Some(&log_key(from + 1, 0)))?
                 .map(|r| r.map(|(k, _)| k))
                 .collect::<std::result::Result<_, _>>()?;
             for k in &old {
                 tx.delete(k)?;
             }
-            for (_, id) in &dropped {
-                tx.delete(&commit_key(*id))?;
+            for c in &dropped {
+                tx.delete(&commit_key(c.id))?;
             }
             tx.put(&prefixed(META, RETAINED_FROM), &varint(from))?;
             tx.commit()?;
+            self.commits
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..dropped.len());
+            self.retained_from.store(from, Ordering::Release);
         }
-        self.commits
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..dropped.len());
-        self.retained_from.store(from, Ordering::Release);
         let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
-        let report = db.gc(keep + 1)?;
+        let log = db.log()?;
+        let keep = log
+            .iter()
+            .position(|c| (c.unix_ts_ms as i64) < now_ms - snapshot_ms)
+            .map_or(log.len(), |i| i + 1)
+            .max(1);
+        if keep >= log.len() {
+            return Ok(0);
+        }
+        let report = db.gc(keep)?;
+        let floor = db.log()?.last().map_or(0, |c| c.commit_id);
+        self.snap_floor.store(floor, Ordering::Release);
         drop(g);
         Ok(report.pruned_commits as usize)
     }
@@ -889,31 +935,16 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
     }
 
     fn revision_at(&self, unix_ms: i64) -> Result<i64> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let id = match db.snapshot_at_time(unix_ms.max(0) as u64) {
-            Ok(s) => s.commit_id(),
-            Err(_) => {
-                return Err(Error::NotRetained(
-                    self.retained_from.load(Ordering::Acquire),
-                ))
-            }
-        };
+        let from = self.retained_from.load(Ordering::Acquire);
         let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
-        match commits.partition_point(|c| c.1 <= id) {
-            0 => Err(Error::NotRetained(
-                self.retained_from.load(Ordering::Acquire),
-            )),
-            i => Ok(commits[i - 1].0),
+        match commits.partition_point(|c| c.unix_ms <= unix_ms) {
+            0 => Err(Error::NotRetained(from)),
+            i => Ok(commits[i - 1].last_rev.max(from)),
         }
     }
 
     fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>> {
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let times: std::collections::HashMap<u64, u64> = db
-            .log()?
-            .into_iter()
-            .map(|c| (c.commit_id, c.unix_ts_ms))
-            .collect();
         let commits = self
             .commits
             .read()
@@ -931,10 +962,10 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
             };
             if hit {
                 let rev = u64::from_be_bytes(k[1..9].try_into().unwrap()) as i64;
-                let commit = commits.get(commits.partition_point(|c| c.0 < rev));
+                let commit = commits.get(commits.partition_point(|c| c.last_rev < rev));
                 out.push(HistoryEntry {
                     rev,
-                    unix_ms: commit.and_then(|c| times.get(&c.1)).copied().unwrap_or(0) as i64,
+                    unix_ms: commit.map_or(0, |c| c.unix_ms),
                     change,
                 });
             }
@@ -1052,34 +1083,45 @@ mod tests {
             revs.len()
         );
 
-        let mut model = BTreeMap::new();
-        for (rev, changes) in &log {
-            for c in changes {
-                match c.kind {
-                    Kind::Put => model.insert(c.kv.key.clone(), c.kv.value.clone()),
-                    Kind::Delete => model.remove(&c.kv.key),
-                };
-            }
-            let mut got = BTreeMap::new();
-            s.read(*rev, &mut |v| {
-                v.scan(b"/", None, &mut |r| {
-                    got.insert(r.key, r.value);
-                    true
-                })
-            })
-            .unwrap();
-            assert_eq!(got, model, "scan at revision {rev}");
-            for k in 0..12 {
-                let key = format!("/k/{k}").into_bytes();
-                let mut one = None;
+        let check = |when: &str| {
+            let mut model = BTreeMap::new();
+            for (rev, changes) in &log {
+                for c in changes {
+                    match c.kind {
+                        Kind::Put => model.insert(c.kv.key.clone(), c.kv.value.clone()),
+                        Kind::Delete => model.remove(&c.kv.key),
+                    };
+                }
+                let mut got = BTreeMap::new();
                 s.read(*rev, &mut |v| {
-                    one = v.get(&key)?.map(|r| r.value);
-                    Ok(())
+                    v.scan(b"/", None, &mut |r| {
+                        got.insert(r.key, r.value);
+                        true
+                    })
                 })
                 .unwrap();
-                assert_eq!(one.as_ref(), model.get(&key), "get at revision {rev}");
+                assert_eq!(got, model, "{when}: scan at revision {rev}");
+                for k in 0..12 {
+                    let key = format!("/k/{k}").into_bytes();
+                    let mut one = None;
+                    s.read(*rev, &mut |v| {
+                        one = v.get(&key)?.map(|r| r.value);
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(
+                        one.as_ref(),
+                        model.get(&key),
+                        "{when}: get at revision {rev}"
+                    );
+                }
             }
-        }
+        };
+        check("with every snapshot");
+        s.enforce_retention(3_600_000, 0, super::tests_now() + 1000)
+            .unwrap();
+        assert_eq!(s.db.read().unwrap().log().unwrap().len(), 1);
+        check("rebuilt from the log");
     }
 
     #[test]
@@ -1116,25 +1158,56 @@ mod tests {
     }
 
     #[test]
-    fn retention_keeps_what_etcd_clients_may_read_and_drops_the_rest() {
+    fn retention_drops_snapshots_and_old_history_but_not_what_etcd_may_read() {
         let s = Quanty::in_memory().unwrap();
-        for v in [b"1", b"2", b"3", b"4"] {
+        for v in [b"1", b"2", b"3", b"4", b"5"] {
             put(&s, b"/k", v);
         }
-        assert_eq!(s.history(b"/k", None).unwrap().len(), 4);
         s.compact(4).unwrap();
         let later = super::tests_now() + 1000;
-        assert!(s.enforce_retention(0, later).unwrap() > 0);
+        assert!(s.enforce_retention(0, 0, later).unwrap() > 0);
+        assert_eq!(
+            s.db.read().unwrap().log().unwrap().len(),
+            1,
+            "one snapshot left"
+        );
+        // revision 4 survives the loss of its snapshot: it is rebuilt from
+        // the newest one and the changes after 4
+        assert_eq!(get(&s, 4, b"/k").unwrap().value, b"3");
+        assert_eq!(get(&s, 5, b"/k").unwrap().value, b"4");
+        assert_eq!(get(&s, 0, b"/k").unwrap().value, b"5");
+        assert!(matches!(
+            s.read_retained(3, &mut |_| Ok(())),
+            Err(Error::NotRetained(4))
+        ));
         let kept: Vec<i64> = s
             .history(b"/k", None)
             .unwrap()
             .iter()
             .map(|h| h.rev)
             .collect();
-        assert_eq!(kept, [4, 5]);
-        assert!(s.read_retained(2, &mut |_| Ok(())).is_err());
-        assert_eq!(get(&s, 4, b"/k").unwrap().value, b"3");
-        assert_eq!(get(&s, 0, b"/k").unwrap().value, b"4");
+        assert_eq!(kept, [5, 6]);
+    }
+
+    #[test]
+    fn history_outlives_snapshots_within_its_window() {
+        let s = Quanty::in_memory().unwrap();
+        for v in [b"1", b"2", b"3"] {
+            put(&s, b"/k", v);
+        }
+        let later = super::tests_now() + 1000;
+        // keep an hour of history but no snapshots beyond the newest
+        s.enforce_retention(3_600_000, 0, later).unwrap();
+        assert_eq!(s.db.read().unwrap().log().unwrap().len(), 1);
+        let mut first = None;
+        s.read_retained(2, &mut |v| {
+            first = v.get(b"/k")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(first.unwrap().value, b"1");
+        assert_eq!(s.history(b"/k", None).unwrap().len(), 3);
+        assert_eq!(s.revision_at(later).unwrap(), 4);
     }
 
     #[test]

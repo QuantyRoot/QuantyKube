@@ -28,4 +28,9 @@ version = "0.0.0"
 dependencies = [
  "quantycore",
  "quantydb-core",
+ "quantykube-sys",
 ]
+
+[[package]]
+name = "quantykube-sys"
+version = "0.0.0"

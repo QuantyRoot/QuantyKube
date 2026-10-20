@@ -17,6 +17,9 @@ through and add a new entry, never silently edit history.
 - [ADR-010](#adr-010-a-revision-is-a-commit-and-the-change-log-keeps-both-sides) A revision is a commit, and the change log keeps both sides
 - [ADR-011](#adr-011-history-is-kept-by-time-whatever-the-api-server-compacts) History is kept by time, whatever the API server compacts
 - [ADR-012](#adr-012-a-commit-holds-a-range-of-revisions-so-writes-share-fsyncs) A commit holds a range of revisions, so writes share fsyncs
+- [ADR-013](#adr-013-the-runtimes-syscalls-sit-behind-one-unsafe-crate) The runtime's syscalls sit behind one unsafe crate
+- [ADR-014](#adr-014-history-lives-in-the-change-log-snapshots-only-briefly) History lives in the change log, snapshots only briefly
+- [ADR-015](#adr-015-two-malloc-arenas-for-the-server) Two malloc arenas for the server
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -304,6 +307,8 @@ the old value is stored a second time.
 
 ## ADR-011: History is kept by time, whatever the API server compacts
 
+*How it is kept changed with ADR-014; what is kept did not.*
+
 The API server compacts etcd every five minutes, and etcd then throws the
 older versions away. QuantyKube honors compaction toward etcd clients
 exactly: a read or a watch below the compacted revision fails with etcd's
@@ -368,4 +373,83 @@ leases, no longer take a revision at all, which also makes revisions
 dense again. etcd is still faster at 16 clients on this machine, by
 roughly half again; the server is now bound by CPU per write, which is
 the next thing to profile.
+
+## ADR-013: The runtime's syscalls sit behind one unsafe crate
+
+The node runtime (ADR-005) needs namespaces, mounts, `pivot_root` and a
+clone into new namespaces, none of which the standard library wraps. They
+are declared by hand against glibc in `crates/quantykube-sys`, and that
+crate holds every `unsafe` block in QuantyKube. This is QuantyDB's answer
+to the same question (its ADR-023): unsafe at one small boundary where no
+safe way exists, never as a shortcut.
+
+The one rule the crate exists to keep: between the clone and the exec,
+the child only makes syscalls on memory prepared before the clone. It
+does not allocate, lock or print, because another thread of the parent
+may have held a lock at the moment of the clone, and the child's copy of
+that lock would never be released. Failures are reported as the child's
+exit status, one number per setup step.
+
+`quantykube sandbox` exposes it for measuring against runc. It is not a
+runtime: no cgroups yet, no CRI, no images.
+
+**The cost:** a crate of code the compiler cannot check, written against
+one libc and one architecture, x86_64 Linux, until a second one is needed.
+
+## ADR-014: History lives in the change log, snapshots only briefly
+
+ADR-011 kept every QuantyDB commit for the whole history window. A soak
+run with a k3s control plane under steady writes showed what that costs
+with copy on write: about 30 KB of disk per revision, because every
+commit keeps every page it replaced, and nothing came back until the API
+server's compaction, five to ten minutes later, let go. Memory grew
+alongside.
+
+The change log already stores the state before every change (ADR-010).
+So any revision can be rebuilt from any later snapshot by undoing the
+changes in between, the same mechanism ADR-012 uses inside a group. That
+makes old snapshots a speed-up, not the history itself:
+
+- `--snapshots`, one minute by default, is how long QuantyDB keeps
+  commits. Reading a revision inside it is a snapshot read.
+- `--retain`, one hour by default, is how long the change log is kept.
+  Reading a revision inside it but outside the snapshot window starts
+  from the oldest snapshot left and undoes the log back to it.
+- Neither drops anything an etcd client may still read: the log keeps
+  everything after the compaction revision, whatever the windows say.
+
+The commit index now records each commit's time too, so `--ago` and
+`history` work for the whole window after the snapshots are gone. A test
+writes from eight threads, then reads a scan and every key at every
+revision against a model, once with all snapshots and once after all but
+one are collected.
+
+**The cost:** an old read is no longer one snapshot lookup. It costs a
+scan of the log from that revision to the oldest snapshot and memory for
+every key changed in between. The API server reads at old revisions
+rarely, mostly to resume a paginated list a few seconds old, which is
+inside the snapshot window. And "the revision is a QuantyDB commit"
+holds only for the last minute; beyond it, the history is QuantyKube's
+own log on top of QuantyDB.
+
+## ADR-015: Two malloc arenas for the server
+
+A soak run, a k3s control plane on QuantyKube under steady writes for
+eight minutes, showed the server's memory growing by about 7 MB a minute
+and not stopping: 18 MB to 74 MB. The store alone, driven in a loop with
+retention, stayed flat at 7 MB, so the growth was in the server around
+it. Rerunning with `MALLOC_ARENA_MAX=2` cut it to a curve that levelled
+off near 26 MB.
+
+The cause is glibc's allocator, not a leak in the code: it gives
+contending threads arenas of their own, up to eight per core, and memory
+freed into one arena is not reused by a thread allocating from another.
+A gRPC call is read on one thread, handled on a pool thread and answered
+on a third, so memory moves between arenas all day. The server now caps
+glibc at two arenas through `mallopt` at startup, from the syscall crate
+(ADR-013).
+
+**The cost:** some contention inside malloc under heavy parallel load,
+which the benchmarks will show if it matters, and a dependency on glibc's
+behavior that a musl build would not share.
 

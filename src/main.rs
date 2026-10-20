@@ -10,14 +10,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:
   quantykube serve   --data <file> --socket <path> [--retain <duration>]
+                     [--snapshots <duration>]
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
+
+--retain keeps history, 1h by default. --snapshots keeps QuantyDB's
+snapshots, 1m by default; older revisions are rebuilt from the history,
+which costs a little more per read and much less disk (ADR-014).
 
 The socket defaults to $QUANTYKUBE_SOCKET, then /run/quantykube.sock.
 Linked or copied as kubectl-quanty on the PATH, this is also the kubectl
 plugin `kubectl quanty`, and keys may be given as kind/name or
 kind/namespace/name, such as configmap/default/important.
+  quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly] -- <command>...
+
+sandbox starts one command in its own namespaces with <dir> as its root,
+waits for it and exits with its status. It is the first piece of the node
+runtime (docs/RUNTIME.md), here to be measured, not used.
 
 Durations look like 90s, 15m, 2h or 7d. get writes the stored value as it
 was to stdout. restore writes it back, or deletes the key if it did not
@@ -36,6 +46,7 @@ fn main() {
         Some("get") => get(&args[1..]),
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
+        Some("sandbox") => sandbox(&args[1..]),
         Some("--version") => {
             println!("quantykube {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -102,6 +113,32 @@ fn registry_key(a: &str) -> String {
     format!("/registry/{plural}/{rest}")
 }
 
+fn sandbox(args: &[String]) -> Result<(), String> {
+    let split = args
+        .iter()
+        .position(|a| a == "--")
+        .ok_or_else(|| format!("missing -- before the command\n{USAGE}"))?;
+    let (opts, cmd) = (&args[..split], &args[split + 1..]);
+    let root = required(opts, "--rootfs")?;
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{root}: {e}"))?;
+    let argv: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+    let env: [&[u8]; 1] = [b"PATH=/usr/local/bin:/usr/bin:/bin"];
+    let mut spawn = quantykube_sys::Spawn::new(root.as_os_str().as_encoded_bytes(), &argv, &env)
+        .map_err(|e| e.to_string())?
+        .readonly(opts.iter().any(|a| a == "--readonly"));
+    if let Some(h) = value(opts, "--hostname") {
+        spawn = spawn.hostname(h.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    let pid = spawn.start().map_err(|e| format!("clone: {e}"))?;
+    match quantykube_sys::wait(pid).map_err(|e| e.to_string())? {
+        quantykube_sys::Exit::Code(0) => Ok(()),
+        quantykube_sys::Exit::Code(c) if quantykube_sys::Step::from_status(c).is_none() => {
+            std::process::exit(c)
+        }
+        e => Err(quantykube_sys::describe(e)),
+    }
+}
+
 fn duration(s: &str) -> Result<Duration, String> {
     let (n, unit) = s.split_at(s.len().saturating_sub(1));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
@@ -137,17 +174,22 @@ fn open(data: &Path) -> Result<Quanty<FileStorage>, store::Error> {
 }
 
 fn serve(args: &[String]) -> Result<(), String> {
+    // a soak run with a k3s control plane grew 7 MB a minute without this
+    // and levelled off with it (ADR-015)
+    quantykube_sys::limit_malloc_arenas(2);
     let data = PathBuf::from(required(args, "--data")?);
     let socket = PathBuf::from(required(args, "--socket")?);
     let retain = duration(value(args, "--retain").unwrap_or("1h"))?;
+    let snapshots = duration(value(args, "--snapshots").unwrap_or("1m"))?;
     let store = Arc::new(open(&data).map_err(|e| format!("{}: {e}", data.display()))?);
     let endpoint = format!("unix://{}", socket.display());
     let etcd =
         quantykube::etcd::Etcd::new(store.clone(), endpoint.clone()).map_err(|e| e.to_string())?;
     let keep = retain.as_millis() as i64;
+    let snap = snapshots.as_millis() as i64;
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(60));
-        if let Err(e) = store.enforce_retention(keep, now_ms()) {
+        if let Err(e) = store.enforce_retention(keep, snap, now_ms()) {
             eprintln!("quantykube: retention: {e}");
         }
     });

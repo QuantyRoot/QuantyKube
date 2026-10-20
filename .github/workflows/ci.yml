@@ -69,6 +69,20 @@ jobs:
         env:
           QUANTY_CRASH_ITERS: "200"
 
+  sandbox:
+    name: sandbox namespaces, and its start time against runc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: fetch runc at a pinned version
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/runc" https://github.com/opencontainers/runc/releases/download/v1.3.2/runc.amd64
+          echo "e7a8e30bd6d248f494aae9163521ff4eb112a30602ac56ada0871e3531269c2d  $RUNNER_TEMP/runc" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/runc"
+      - run: cargo build --release
+      - run: sudo env RUNC="$RUNNER_TEMP/runc" scripts/sandbox.sh
+
   msrv:
     name: test on MSRV (1.89)
     runs-on: ubuntu-latest
