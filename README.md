@@ -66,7 +66,7 @@ watches see the object return.
 | `kubectl quanty` plugin | built |
 | Benchmarks against etcd ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) | measured |
 | Retention: long history in the log, short lived snapshots ([ADR-014](docs/DECISIONS.md)) | built, soak tested |
-| The store over a network with TLS and client certificates | next; QuantyCore has TLS |
+| The store over a network with TLS and client certificates ([ADR-031](docs/DECISIONS.md)) | built, unreviewed TLS |
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
 | A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |

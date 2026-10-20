@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Runs QuantyKube against the real etcdctl, then against an unmodified
-# kube-apiserver if KUBE_APISERVER and KUBECTL are set, then against a k3s
+# Runs QuantyKube against the real etcdctl, on the Unix socket and over
+# TLS with client certificates, then against an unmodified kube-apiserver
+# over TLS if KUBE_APISERVER and KUBECTL are set, then against a k3s
 # control plane if K3S is set. Exits non-zero on the first answer that
 # differs from what etcd would give.
 #
@@ -18,9 +19,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# a CA of the test's own, a certificate for the store and one for clients
+pki=$work/pki
+mkdir -p "$pki"
+cert() {
+    openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null |
+        openssl pkcs8 -topk8 -nocrypt -out "$pki/$1.key"
+    openssl req -new -key "$pki/$1.key" -subj "/CN=$1" -out "$pki/$1.csr" 2>/dev/null
+    printf '%s\nbasicConstraints=CA:FALSE\n' "$2" >"$pki/$1.ext"
+    openssl x509 -req -in "$pki/$1.csr" -CA "$pki/ca.pem" -CAkey "$pki/ca.key" \
+        -CAcreateserial -days 1 -extfile "$pki/$1.ext" -out "$pki/$1.pem" 2>/dev/null
+}
+openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key" 2>/dev/null
+openssl req -x509 -new -key "$pki/ca.key" -subj /CN=e2e-ca -days 1 \
+    -out "$pki/ca.pem" 2>/dev/null
+cert server $'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth'
+cert client 'extendedKeyUsage=clientAuth'
+tls_port=23790
+
 start() {
     rm -f "$sock"
-    "$QK" serve --data "$work/db" --socket "$sock" 2>>"$work/qk.log" &
+    "$QK" serve --data "$work/db" --socket "$sock" \
+        --listen "127.0.0.1:$tls_port" --cert "$pki/server.pem" \
+        --key "$pki/server.key" --client-ca "$pki/ca.pem" 2>>"$work/qk.log" &
     qk=$!
     pids+=("$qk")
     for _ in $(seq 50); do [ -S "$sock" ] && return; sleep 0.1; done
@@ -79,13 +100,34 @@ start
 expect $'/b\ncreated' e get /b
 echo "etcdctl: ok"
 
+t() {
+    "$ETCDCTL" --endpoints="https://127.0.0.1:$tls_port" --cacert "$pki/ca.pem" \
+        --cert "$pki/client.pem" --key "$pki/client.key" "$@"
+}
+expect OK t put /tls over-tls
+expect $'/tls\nover-tls' t get /tls
+t watch /tw --prefix >"$work/tls-watch" 2>&1 &
+pids+=($!)
+sleep 0.5
+for i in $(seq 20); do t put "/tw/$i" x >/dev/null; done
+sleep 0.5
+expect 20 grep -c '^PUT' "$work/tls-watch"
+# without a client certificate nothing is answered
+if "$ETCDCTL" --endpoints="https://127.0.0.1:$tls_port" --cacert "$pki/ca.pem" \
+    --dial-timeout=2s --command-timeout=3s get /tls >/dev/null 2>&1; then
+    echo "FAIL: a client without a certificate was answered"; exit 1
+fi
+echo "etcdctl over TLS: ok"
+
 if [ -n "${KUBE_APISERVER:-}" ]; then
     openssl genrsa -out "$work/sa.key" 2048 2>/dev/null
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
         -addext subjectAltName=IP:127.0.0.1 \
         -keyout "$work/tls.key" -out "$work/tls.crt" 2>/dev/null
     echo "e2e-token,admin,admin,system:masters" >"$work/tokens.csv"
-    "$KUBE_APISERVER" --etcd-servers="unix://$sock" --etcd-prefix=/upstream \
+    "$KUBE_APISERVER" --etcd-servers="https://127.0.0.1:$tls_port" \
+        --etcd-cafile="$pki/ca.pem" --etcd-certfile="$pki/client.pem" \
+        --etcd-keyfile="$pki/client.key" --etcd-prefix=/upstream \
         --bind-address=127.0.0.1 --secure-port=6555 \
         --tls-cert-file="$work/tls.crt" --tls-private-key-file="$work/tls.key" \
         --service-account-issuer=https://kubernetes.default.svc \
@@ -113,7 +155,7 @@ if [ -n "${KUBE_APISERVER:-}" ]; then
     up delete configmaps --all >/dev/null
     expect 0 bash -c "$(declare -f up); KUBECTL=$KUBECTL; up get configmaps -o name | wc -l"
     kill "${pids[-1]}"
-    echo "kube-apiserver: ok"
+    echo "kube-apiserver over TLS: ok"
 fi
 
 [ -n "${K3S:-}" ] || exit 0

@@ -35,6 +35,7 @@ through and add a new entry, never silently edit history.
 - [ADR-028](#adr-028-history-is-served-through-the-kubernetes-api) History is served through the Kubernetes API
 - [ADR-029](#adr-029-the-demonstration-and-the-installer-target-kubeadm) The demonstration and the installer target kubeadm
 - [ADR-030](#adr-030-a-failed-commit-stops-the-store) A failed commit stops the store
+- [ADR-031](#adr-031-over-a-network-the-store-speaks-tls-and-wants-a-client-certificate) Over a network the store speaks TLS and wants a client certificate
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -927,3 +928,36 @@ which answers reads from a state the disk may not hold.
 readable, and the restart fails too until there is space. A quota that
 refuses writes before the disk is full, as etcd's NOSPACE alarm does, is
 the friendlier half and comes later.
+
+## ADR-031: Over a network the store speaks TLS and wants a client certificate
+
+*Supersedes ADR-004 where the store is reached over a network; the Unix
+socket stays as it was.*
+
+`quantykube serve --listen` serves the same etcd API over TCP with
+QuantyCore's TLS, as etcd does on port 2379. Every client must present a
+certificate from the CA given with `--client-ca`; a connection without
+one ends in the handshake. On the node the socket's mode was the only
+access control (ADR-004), and over a network the certificate takes its
+place: whoever holds one can read and write every object, which is what
+an etcd client certificate means too. kube-apiserver connects with its
+usual `--etcd-cafile`, `--etcd-certfile` and `--etcd-keyfile`.
+
+Raft between store nodes (ADR-027), the API server on another machine,
+and the installer (ADR-009) all need this. In CI an unmodified
+kube-apiserver runs against the store over TLS, and `etcdctl` reads,
+writes and watches over it, and is refused without a certificate.
+
+The gRPC server reads a connection on one thread and writes on another.
+The TLS state of a connection is shared between them behind a lock that
+each holds only while it moves bytes through it, never while it waits
+on the network.
+
+Rejected: a token or password on top of TLS, which etcd's clients
+support but the API server does not use for etcd.
+
+**The cost:** the TLS is QuantyCore's and has not been reviewed by
+anyone who did not write it (QuantyCore ADR-003), and it is now the
+lock on the whole cluster's data whenever the store is reached over a
+network. Until the review, a store reachable over a network should
+also be fenced in by the network itself.

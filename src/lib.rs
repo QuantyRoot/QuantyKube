@@ -11,4 +11,5 @@ pub mod image;
 pub mod registry;
 pub mod runtime;
 pub mod store;
+pub mod tlsnet;
 pub mod user;

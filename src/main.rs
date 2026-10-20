@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const USAGE: &str = "usage:
   quantykube serve   --data <file> --socket <path>
                      [--retain <duration>] [--snapshots <duration>]
+                     [--listen <addr:port> --cert <pem> --key <pem>
+                      --client-ca <pem>]
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
@@ -27,6 +29,10 @@ const USAGE: &str = "usage:
 serve is the store. --retain keeps history, 1h by default; --snapshots
 keeps QuantyDB snapshots, 1m by default, and older revisions are rebuilt
 from the history (ADR-014). Durations look like 90s, 15m, 2h or 7d.
+With --listen it also serves the etcd API over TLS on that address,
+only to clients with a certificate from the --client-ca PEM file, as an
+API server's --etcd-certfile gives it; --cert and --key are the
+server's own certificate chain and key.
 
 history, get and restore read that history through the server's socket,
 $QUANTYKUBE_SOCKET or /run/quantykube.sock unless --socket says otherwise.
@@ -340,8 +346,27 @@ fn serve(args: &[String]) -> Result<(), String> {
     });
     // whoever can connect can read and write every object in the cluster
     let listener = private_socket(&socket)?;
-    eprintln!("quantykube: serving {} on {endpoint}", data.display());
-    quantycore::grpc::serve_unix(listener, etcd).map_err(|e| e.to_string())
+    let server = quantykube::tlsnet::grpc_server(etcd);
+    let Some(addr) = value(args, "--listen") else {
+        eprintln!("quantykube: serving {} on {endpoint}", data.display());
+        return server.serve_unix(listener).map_err(|e| e.to_string());
+    };
+    // over a network only clients with a certificate from --client-ca
+    // get in (ADR-031)
+    let config = quantykube::tlsnet::server_config(
+        Path::new(required(args, "--cert")?),
+        Path::new(required(args, "--key")?),
+        Path::new(required(args, "--client-ca")?),
+    )?;
+    let tcp = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
+    let unix = server.clone();
+    std::thread::spawn(move || unix.serve_unix(listener));
+    eprintln!(
+        "quantykube: serving {} on {endpoint} and https://{}",
+        data.display(),
+        tcp.local_addr().map_err(|e| e.to_string())?
+    );
+    quantykube::tlsnet::serve(tcp, Arc::new(config), server).map_err(|e| e.to_string())
 }
 
 /// A socket only its owner can connect to: for both servers the mode is
