@@ -18,7 +18,8 @@ const USAGE: &str = "usage:
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
   quantykube runtime --root <dir> --socket <path>
-                     [--cni-conf <dir>] [--cni-bin <dir>]
+                     [--cni-conf <dir>] [--cni-bin <dir>] [--plain-http <host>]
+  quantykube pull    --root <dir> [--plain-http <host>] <image>
   quantykube import  --root <dir> <image dir> <reference>
 
 serve is the store. --retain keeps history, 1h by default; --snapshots
@@ -41,10 +42,12 @@ namespaces with <dir> as its root and exits with its status.
 runtime serves the kubelet's Container Runtime Interface on the socket,
 keeping images and container state under --root. Pods get their network
 from the first CNI configuration in --cni-conf, /etc/cni/net.d by
-default, with plugins from --cni-bin, /opt/cni/bin. It cannot pull yet:
+default, with plugins from --cni-bin, /opt/cni/bin. Images are pulled
+only from registries named with --plain-http (host or host:port, comma
+separated) until TLS is in; pull does the same from the command line.
 import puts an image there from an OCI image layout, as `skopeo copy
 docker://<image> oci:<dir>` writes one, or from a directory holding a
-manifest.json and blobs/, each blob checked against its digest.";
+manifest.json and blobs/. Every blob is checked against its digest.";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +66,7 @@ fn main() {
         Some("unpack") => unpack(&args[1..]),
         Some("runtime") => runtime(&args[1..]),
         Some("import") => import(&args[1..]),
+        Some("pull") => pull(&args[1..]),
         Some("--version") => {
             println!("quantykube {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -333,10 +337,31 @@ fn runtime(args: &[String]) -> Result<(), String> {
         None => eprintln!("quantykube: no CNI configuration in {}", conf.display()),
     }
     let rt = quantykube::runtime::Runtime::with_network(&root, cni).map_err(|e| e.to_string())?;
+    let registries = registry_options(args);
     // whoever can connect can run anything as root on the node
     let listener = private_socket(&socket)?;
     eprintln!("quantykube: runtime on unix://{}", socket.display());
-    quantycore::grpc::serve_unix(listener, quantykube::cri::Cri::new(rt)).map_err(|e| e.to_string())
+    quantycore::grpc::serve_unix(listener, quantykube::cri::Cri::new(rt, registries))
+        .map_err(|e| e.to_string())
+}
+
+fn registry_options(args: &[String]) -> quantykube::registry::Options {
+    quantykube::registry::Options {
+        plain_http: value(args, "--plain-http")
+            .map(|v| v.split(',').map(str::to_string).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn pull(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(required(args, "--root")?);
+    let image = args.last().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
+    let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
+    let img = rt
+        .pull(image, &registry_options(args))
+        .map_err(|e| format!("{image}: {e}"))?;
+    println!("{}", img.id);
+    Ok(())
 }
 
 fn import(args: &[String]) -> Result<(), String> {

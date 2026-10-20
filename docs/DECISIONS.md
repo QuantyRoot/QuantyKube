@@ -29,6 +29,7 @@ through and add a new entry, never silently edit history.
 - [ADR-022](#adr-022-pod-networks-come-from-cni-plugins) Pod networks come from CNI plugins
 - [ADR-023](#adr-023-users-resolve-inside-the-image-and-non-root-means-no-capabilities) Users resolve inside the image, and non-root means no capabilities
 - [ADR-024](#adr-024-the-seccomp-filter-is-dockers-allowlist) The seccomp filter is Docker's allowlist
+- [ADR-025](#adr-025-pulls-go-through-the-import) Pulls go through the import
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -713,3 +714,24 @@ the EPERM the program gets.
 needs a call Docker refuses fails here as it does there; starts are no
 slower (3.73 against 3.74 ms median over 300 alternating starts), since
 the kernel caches its answer for calls allowed whatever their arguments.
+
+## ADR-025: Pulls go through the import
+
+PullImage fetches an image over the OCI distribution API
+(`src/registry.rs`): the manifest or index by tag or digest, an index
+resolved to linux/amd64, a Bearer token fetched anonymously when the
+registry challenges for one, and blobs followed through the redirects
+registries use to send them to a storage host, which never gets the
+registry's token. What it fetches is written as an OCI image layout and
+imported from there (ADR-017), so a digest is checked in exactly one
+place whichever way an image arrives, and a registry that serves the
+wrong bytes produces an error, not an image. References are read the
+way Docker reads them: `busybox` is `docker.io/library/busybox:latest`.
+
+HTTP goes through QuantyCore's HTTP/1.1 client. Until QuantyCore has
+TLS, only registries named with `--plain-http` can be reached, which is
+how a local registry in an air gapped network is usually run.
+
+**The cost:** no public registry is reachable before TLS, and none with
+credentials after: PullImage refuses an image that comes with any.
+

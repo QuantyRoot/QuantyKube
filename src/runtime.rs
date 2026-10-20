@@ -478,6 +478,19 @@ impl Runtime {
         Ok(img.clone())
     }
 
+    /// Fetches `name` from its registry unless the node has it already.
+    pub fn pull(&self, name: &str, opts: &crate::registry::Options) -> Result<Image> {
+        if let Some(img) = self.find_image(name) {
+            return Ok(img);
+        }
+        let dir = self.dir.join("pulls").join(new_id()?);
+        let result = crate::registry::pull(name, &dir, opts)
+            .map_err(Error::Io)
+            .and_then(|()| self.import(&dir, name));
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
     /// By reference, or by id with or without `sha256:`.
     pub fn find_image(&self, name: &str) -> Option<Image> {
         let images = self.images.lock().unwrap();

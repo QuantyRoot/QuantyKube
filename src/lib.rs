@@ -8,6 +8,7 @@ pub mod cripb;
 pub mod etcd;
 pub mod etcdpb;
 pub mod image;
+pub mod registry;
 pub mod runtime;
 pub mod store;
 pub mod user;

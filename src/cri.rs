@@ -15,11 +15,12 @@ const DEADLINE_EXCEEDED: u32 = 4;
 
 pub struct Cri {
     rt: Arc<Runtime>,
+    registries: crate::registry::Options,
 }
 
 impl Cri {
-    pub fn new(rt: Arc<Runtime>) -> Arc<Cri> {
-        Arc::new(Cri { rt })
+    pub fn new(rt: Arc<Runtime>, registries: crate::registry::Options) -> Arc<Cri> {
+        Arc::new(Cri { rt, registries })
     }
 }
 
@@ -690,16 +691,18 @@ impl Cri {
                 .encode()
             }
             ("runtime.v1.ImageService", "PullImage") => {
-                let name = req!(PullImageRequest).image.unwrap_or_default().image;
-                // an image already on the node is what a pull would give,
-                // so a pull of it succeeds; anything else needs a registry
-                // client, which needs TLS
-                let img = rt.find_image(&name).ok_or_else(|| {
-                    Status::new(
+                let r = req!(PullImageRequest);
+                let name = r.image.unwrap_or_default().image;
+                let auth = r.auth.unwrap_or_default();
+                if auth != cripb::AuthConfig::default() {
+                    return Err(Status::new(
                         code::UNIMPLEMENTED,
-                        format!("{name} is not on this node, and pulling is not supported yet"),
-                    )
-                })?;
+                        "registry credentials are not supported yet",
+                    ));
+                }
+                let img = rt
+                    .pull(&name, &self.registries)
+                    .map_err(|e| Status::new(code::UNKNOWN, format!("pulling {name}: {e}")))?;
                 PullImageResponse { image_ref: img.id }.encode()
             }
             ("runtime.v1.ImageService", "RemoveImage") => {
