@@ -55,7 +55,7 @@ until_ok "store and runtime sockets" test -S "$work/store.sock" -a -S "$work/cri
     --flannel-backend none --disable-network-policy --disable-kube-proxy \
     --disable traefik,servicelb,metrics-server,local-storage,coredns \
     --disable-cloud-controller --disable-helm-controller \
-    --kubelet-arg cgroup-driver=cgroupfs ${K3S_ARGS:-} >"$work/k3s.log" 2>&1 &
+    ${K3S_ARGS:-} >"$work/k3s.log" 2>&1 &
 pids+=($!)
 export KUBECONFIG=$work/kubeconfig
 k() { "$K3S" kubectl "$@"; }

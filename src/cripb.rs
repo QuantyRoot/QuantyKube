@@ -338,6 +338,7 @@ proto_enum!(Signal {
 });
 
 empty_message!(
+    RuntimeConfigRequest,
     ReopenContainerLogResponse,
     UpdateContainerResourcesResponse,
     StopPodSandboxResponse,
@@ -1217,6 +1218,51 @@ impl Message for PodSandboxStateValue {
         each_field(buf, |n, v| {
             if n == 1 {
                 self.state = int32(v, n)?.into();
+            }
+            Ok(())
+        })
+    }
+}
+
+proto_enum!(CgroupDriver {
+    Systemd = 0,
+    Cgroupfs = 1
+});
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinuxRuntimeConfiguration {
+    pub cgroup_driver: CgroupDriver,
+}
+
+impl Message for LinuxRuntimeConfiguration {
+    fn write(&self, out: &mut Vec<u8>) {
+        put_enum(out, 1, self.cgroup_driver.into());
+    }
+
+    fn merge(&mut self, buf: &[u8]) -> Result<(), DecodeError> {
+        each_field(buf, |n, v| {
+            if n == 1 {
+                self.cgroup_driver = int32(v, n)?.into();
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeConfigResponse {
+    pub linux: Option<LinuxRuntimeConfiguration>,
+}
+
+impl Message for RuntimeConfigResponse {
+    fn write(&self, out: &mut Vec<u8>) {
+        put_opt(out, 1, &self.linux);
+    }
+
+    fn merge(&mut self, buf: &[u8]) -> Result<(), DecodeError> {
+        each_field(buf, |n, v| {
+            if n == 1 {
+                merge_opt(&mut self.linux, v.bytes(n)?)?;
             }
             Ok(())
         })
@@ -4373,6 +4419,12 @@ mod tests {
         };
         assert_eq!(msg.encode(), want);
         assert_eq!(UpdateContainerResourcesRequest::decode(&want).unwrap(), msg);
+        let config = RuntimeConfigResponse {
+            linux: Some(LinuxRuntimeConfiguration {
+                cgroup_driver: CgroupDriver::Cgroupfs,
+            }),
+        };
+        assert_eq!(config.encode(), [0x0a, 0x02, 0x08, 0x01]);
     }
 
     fn parses_completely(buf: &[u8]) -> bool {

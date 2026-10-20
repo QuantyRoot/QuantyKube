@@ -590,6 +590,14 @@ impl Cri {
         Ok(match (service, method) {
             ("runtime.v1.RuntimeService", "Version") => self.version().encode(),
             ("runtime.v1.RuntimeService", "Status") => self.status().encode(),
+            // the only driver this runtime has (ADR-020); a kubelet that
+            // asks needs no --cgroup-driver flag
+            ("runtime.v1.RuntimeService", "RuntimeConfig") => RuntimeConfigResponse {
+                linux: Some(LinuxRuntimeConfiguration {
+                    cgroup_driver: CgroupDriver::Cgroupfs,
+                }),
+            }
+            .encode(),
             ("runtime.v1.RuntimeService", "RunPodSandbox") => {
                 let r = req!(RunPodSandboxRequest);
                 if !r.runtime_handler.is_empty() {

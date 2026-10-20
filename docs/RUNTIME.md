@@ -68,7 +68,7 @@ built:
 | Group | Methods | Built |
 | --- | --- | --- |
 | Lifecycle | Version, Status, RunPodSandbox, StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox, CreateContainer, StartContainer, StopContainer, RemoveContainer, ListContainers, ContainerStatus | all |
-| Lifecycle | RuntimeConfig | no; the kubelet falls back to its own `--cgroup-driver` |
+| Lifecycle | RuntimeConfig | built: cgroupfs |
 | Kubelet needs these to stay healthy | ContainerStats, ListContainerStats, PodSandboxStats, ListPodSandboxStats, ReopenContainerLog, UpdateContainerResources | all |
 | Kubelet needs these to stay healthy | GetContainerEvents | no; only the evented PLEG, off by default, uses it |
 | `kubectl exec`, `attach`, `port-forward` | ExecSync | built |

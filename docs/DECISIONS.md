@@ -607,8 +607,12 @@ instead of paths and needs a D-Bus client to ask systemd for them; a
 slice name is refused. On a host without cgroup v2, a container with
 limits is refused rather than run without them.
 
-**The cost:** the kubelet must run with `--cgroup-driver=cgroupfs`,
-which most distributions no longer default to. A pod's own cgroup and
+RuntimeConfig tells the kubelet so, and a kubelet that asks, as current
+ones do, needs no flag.
+
+**The cost:** a kubelet that does not ask must run with
+`--cgroup-driver=cgroupfs`, which most distributions no longer default
+to. A pod's own cgroup and
 its pids limit are the kubelet's, and stats for a pod are the sum of its
 containers, without network.
 
