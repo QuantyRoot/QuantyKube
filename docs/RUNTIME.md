@@ -23,10 +23,11 @@ written before most of the code.
   socket: version and status, pods and containers from creation to
   removal, their logs in the format the kubelet reads, and images
   imported with `quantykube import` (ADR-017, ADR-018).
-  `scripts/cri.sh` takes a pod through its life with `crictl`. What the
-  Volumes are bind mounted (ADR-019). What the kubelet needs beyond
-  that, in order: CNI, users other than root, ExecSync, pulling. Limits
-  and stats come from cgroup v2 (ADR-020).
+  `scripts/cri.sh` takes a pod through its life with `crictl`. Volumes
+  are bind mounted (ADR-019), limits and stats come from cgroup v2
+  (ADR-020), and ExecSync joins a running container (ADR-021). What the
+  kubelet needs beyond that, in order: CNI, users other than root,
+  pulling, streaming exec.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
