@@ -47,6 +47,7 @@ c images | grep -q 'test/busybox' || fail "image not listed"
 cat >"$work/pod.json" <<JSON
 {"metadata": {"name": "web", "namespace": "default", "uid": "1"},
  "hostname": "web-0", "log_directory": "$work/logs",
+ "dns_config": {"servers": ["10.0.0.10"], "searches": ["svc.test"]},
  "linux": {"security_context": {"namespace_options": {"pid": 1}}}}
 JSON
 cat >"$work/ctr.json" <<'JSON'
@@ -76,6 +77,8 @@ if [ -n "${CNI_BIN:-}" ]; then
     case $ip in 10.88.77.*) ;; *) fail "pod address: $ip" ;; esac
     c exec -s "$ctr" ping -c1 -W2 10.88.77.1 >/dev/null || fail "no route out of the pod"
 fi
+[ "$(c exec -s "$ctr" cat /etc/hostname /etc/resolv.conf)" = \
+    "$(printf 'web-0\nsearch svc.test\nnameserver 10.0.0.10')" ] || fail "pod files"
 start=$(date +%s)
 ! c exec -s --timeout 1 "$ctr" sleep 30 >/dev/null || fail "exec timeout"
 [ $(($(date +%s) - start)) -lt 5 ] || fail "exec outlived its timeout"

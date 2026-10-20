@@ -142,9 +142,23 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
         .as_ref()
         .map(|l| l.cgroup_parent.clone())
         .unwrap_or_default();
+    let resolv_conf = config.dns_config.map(|d| {
+        let mut out = String::new();
+        if !d.searches.is_empty() {
+            out += &format!("search {}\n", d.searches.join(" "));
+        }
+        for s in &d.servers {
+            out += &format!("nameserver {s}\n");
+        }
+        if !d.options.is_empty() {
+            out += &format!("options {}\n", d.options.join(" "));
+        }
+        out
+    });
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
         cgroup_parent,
+        resolv_conf: resolv_conf.unwrap_or_default(),
         name: meta.name,
         namespace: meta.namespace,
         uid: meta.uid,

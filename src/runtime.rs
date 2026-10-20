@@ -48,6 +48,8 @@ pub struct PodSpec {
     pub log_directory: String,
     /// The pod's cgroup, a cgroupfs path the kubelet has created.
     pub cgroup_parent: String,
+    /// The pod's `/etc/resolv.conf`; the image's own is kept if empty.
+    pub resolv_conf: String,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
 }
@@ -442,6 +444,12 @@ impl Runtime {
             },
             None => None,
         };
+        // every container of the pod sees these two files, as under
+        // containerd; /etc/hosts the kubelet mounts itself
+        fs::write(dir.join("hostname"), format!("{hostname}\n"))?;
+        if !spec.resolv_conf.is_empty() {
+            fs::write(dir.join("resolv.conf"), &spec.resolv_conf)?;
+        }
         if !spec.log_directory.is_empty() {
             fs::create_dir_all(&spec.log_directory)?;
         }
@@ -626,6 +634,19 @@ impl Runtime {
             .user(u.uid, u.gid, &u.groups)
             .readonly(c.spec.readonly_rootfs)
             .cgroup_namespace(cgroup::available());
+        let pod_dir = self.dir.join("pods").join(&c.pod_id);
+        for file in ["hostname", "resolv.conf"] {
+            let target = format!("/etc/{file}");
+            if pod_dir.join(file).exists()
+                && !c.spec.mounts.iter().any(|m| m.container_path == target)
+            {
+                spawn = spawn.bind(
+                    &pod_dir.join(file),
+                    target.as_bytes(),
+                    c.spec.readonly_rootfs,
+                )?;
+            }
+        }
         for m in &c.spec.mounts {
             spawn = spawn
                 .bind(&m.host_path, m.container_path.as_bytes(), m.readonly)
