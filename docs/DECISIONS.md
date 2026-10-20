@@ -13,6 +13,7 @@ through and add a new entry, never silently edit history.
 - [ADR-006](#adr-006-one-storage-interface-quantydb-behind-it-first) One storage interface, QuantyDB behind it first
 - [ADR-007](#adr-007-apache-20-and-money-from-what-surrounds-the-code) Apache 2.0, and money from what surrounds the code
 - [ADR-008](#adr-008-raft-comes-later-and-starts-with-a-simulator) Raft comes later, and starts with a simulator
+- [ADR-009](#adr-009-kubectl-apply-installs-an-operator-that-swaps-and-undoes) kubectl apply installs an operator that swaps and undoes
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -211,3 +212,60 @@ written against it.
 **The cost:** the first thing many companies will ask about, a highly
 available store, is answered on 17 November with a plan and not with a
 running system, and the talk has to say so.
+
+## ADR-009: kubectl apply installs an operator that swaps and undoes
+
+Moving an existing cluster onto QuantyKube is one command,
+`kubectl apply` of a published manifest. It installs an operator that
+does the rest: replacing the store, replacing the node runtime, draining
+nodes on the way, and undoing all of it in an emergency.
+
+**The shape.** The manifest contains two things. A controller that plans
+and drives the change, and a node agent that runs on every node as a
+privileged DaemonSet with access to the host, because changing a node's
+runtime means changing files and services on the node itself. What the
+person wants is written as a custom resource in the same manifest, so
+`kubectl get` shows the progress of the change like any other object.
+This is an established pattern: Kata Containers installs its runtime on
+nodes the same way.
+
+**Replacing the runtime, per node, one node at a time:** cordon, drain
+with respect for disruption budgets, install the runtime next to the old
+one, point the kubelet at it, restart the kubelet, prove the node with a
+test pod, uncordon. Any failed step stops the rollout and puts that node
+back.
+
+**Replacing the store:** snapshot etcd, copy every key at one revision
+into QuantyKube, pause writes briefly, point the API server at QuantyKube,
+prove it with `/readyz` and a read back, and keep etcd's data untouched
+for the rollback window. Whether QuantyKube keeps etcd's revision numbers,
+so that no client has to list again, or forces a relist, is decided when
+this is built.
+
+**Undo must work when everything else is broken.** The old runtime and
+the old store stay installed until the person removes them. The node
+agent keeps a journal on each node's disk and can reverse its own steps
+without the API server, because the API server is one of the things that
+might be broken.
+
+**Interactive setup** is not something `kubectl apply` can do, since it
+only sends a file. The wizard is a kubectl plugin, `kubectl quanty`, that
+asks its questions and writes the custom resource. Applying the manifest
+by hand works without it.
+
+**What it depends on, which is why it comes after 17 November:**
+
+- The operator talks to the API server, which inside a cluster only
+  speaks HTTPS. QuantyCore's TLS client is a hard prerequisite.
+- The node runtime has to exist first (ADR-005).
+- It only works where the person controls the control plane machines.
+  On managed services such as EKS, GKE or AKS the provider runs etcd, so
+  only the runtime part can apply there, and only on nodes the person
+  manages.
+
+**The cost:** this is the most dangerous code in the project. It runs as
+root on every node of a cluster somebody depends on, and a security
+review at any serious company will start there, so it must be small,
+auditable and completely removable. It also has to be tested against the
+ways real clusters differ: kubeadm, k3s, RKE2 and the distributions in
+between each place the kubelet's configuration somewhere else.
