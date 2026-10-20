@@ -4,4 +4,5 @@
 pub mod etcd;
 pub mod etcdpb;
 pub mod image;
+pub mod runtime;
 pub mod store;

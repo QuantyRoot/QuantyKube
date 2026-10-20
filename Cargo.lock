@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "quantycore"
 version = "0.0.0"
-source = "git+https://github.com/QuantyRoot/QuantyCore?rev=8290559fd5bb3f382e16e3883a890fe9568ca549#8290559fd5bb3f382e16e3883a890fe9568ca549"
+source = "git+https://github.com/QuantyRoot/QuantyCore?rev=0442003223cacad9e64f985dbebeb91a8df0f3d8#0442003223cacad9e64f985dbebeb91a8df0f3d8"
 
 [[package]]
 name = "quantydb-core"

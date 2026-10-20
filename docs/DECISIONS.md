@@ -21,6 +21,7 @@ through and add a new entry, never silently edit history.
 - [ADR-014](#adr-014-history-lives-in-the-change-log-snapshots-only-briefly) History lives in the change log, snapshots only briefly
 - [ADR-015](#adr-015-two-malloc-arenas-for-the-server) Two malloc arenas for the server
 - [ADR-016](#adr-016-layers-are-unpacked-with-every-path-resolved-inside-the-root) Layers are unpacked with every path resolved inside the root
+- [ADR-017](#adr-017-a-pod-is-three-bind-mounted-namespaces-and-runtime-state-is-not-kept) A pod is three bind mounted namespaces, and runtime state is not kept
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -493,4 +494,43 @@ identical, file for file, to what GNU tar unpacks, and all three run in
 
 **The cost:** a lookup per path component per entry, and modification
 times are set on files but not on directories, which no runtime reads.
+
+## ADR-017: A pod is three bind mounted namespaces, and runtime state is not kept
+
+`src/runtime.rs` is the core of the node runtime: images, pods and
+containers in the shape the CRI asks for, without the gRPC around them.
+
+**A pod sandbox holds no process.** containerd keeps a pause container
+in every pod so that the pod's network, IPC and UTS namespaces outlive
+its containers. Here a short lived child creates them and sets the pod's
+hostname, the runtime bind mounts the three namespace files into the
+pod's directory, and the child exits; containers join them with
+`setns`. Releasing the pod unmounts them. CRI-O can do the same and
+notes the same limit: a pod that shares one PID namespace needs a
+process, which is not supported yet.
+
+**Each container gets an overlay** over the image's unpacked root, so
+the image is never written to, and its output goes through a pipe into
+the CRI log format the kubelet reads, split into partial lines past
+16 KiB as containerd splits them.
+
+**Images are imported, not pulled,** from a manifest and its blobs on
+disk, every blob checked against its SHA-256 before anything is
+unpacked and the image visible under its final name only once complete.
+Pulling needs HTTPS and waits for QuantyCore's TLS.
+
+**State is kept in memory.** After a restart the runtime has forgotten
+its pods and the kubelet recreates them, as it does after a reboot.
+
+**The cost:** a runtime restart kills nothing but orphans running
+containers and their mounts until the node reboots; making state
+durable is required before this runs anywhere real. And a pod with a
+shared PID namespace is refused.
+
+A test builds an image from this machine's own binaries with real
+digests and takes a pod through its whole life as root, in CI too: two
+containers share the pod's network but not the host's, logs arrive in
+the CRI format, a shell that ignores SIGTERM is killed after the grace
+period with 137, and nothing stays mounted after removal. A tampered
+layer is refused.
 

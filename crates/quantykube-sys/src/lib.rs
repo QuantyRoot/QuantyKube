@@ -33,6 +33,9 @@ extern "C" {
     fn __errno_location() -> *mut c_int;
     fn _exit(code: c_int) -> !;
     fn mallopt(param: c_int, value: c_int) -> c_int;
+    fn setns(fd: c_int, nstype: c_int) -> c_int;
+    fn dup2(old: c_int, new: c_int) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
 }
 
 const SYS_CLONE: c_long = 56;
@@ -266,6 +269,10 @@ fn seccomp_program() -> Vec<SockFilter> {
 /// child would wait for it forever.
 pub struct Spawn {
     root: CString,
+    overlay: Option<CString>,
+    join: Vec<(std::fs::File, c_int)>,
+    stdio: Option<(std::fs::File, std::fs::File, std::fs::File)>,
+    cwd: Option<CString>,
     hostname: Option<CString>,
     readonly: bool,
     caps: u64,
@@ -281,7 +288,8 @@ pub struct Spawn {
 /// program usually exits with, below the 128 + signal range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    Release = 100,
+    Release = 98,
+    Namespaces = 99,
     MakePrivate = 101,
     BindRoot = 102,
     EnterRoot = 103,
@@ -304,6 +312,7 @@ impl Step {
         use Step::*;
         [
             Release,
+            Namespaces,
             MakePrivate,
             BindRoot,
             EnterRoot,
@@ -381,6 +390,10 @@ impl Spawn {
         env_ptrs.push(std::ptr::null());
         Ok(Spawn {
             root: cstr(root)?,
+            overlay: None,
+            join: Vec::new(),
+            stdio: None,
+            cwd: None,
             hostname: None,
             readonly: false,
             caps: DEFAULT_CAPS,
@@ -391,6 +404,58 @@ impl Spawn {
             _env: env,
             env_ptrs,
         })
+    }
+
+    /// Mounts an overlay on the root first: `lower` read only, writes go
+    /// to `upper`. Overlayfs needs `work` on the same filesystem as
+    /// `upper`.
+    pub fn overlay(mut self, lower: &[u8], upper: &[u8], work: &[u8]) -> io::Result<Self> {
+        for p in [lower, upper, work] {
+            if p.iter().any(|&b| b == b',' || b == b':') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "overlay paths may not contain ',' or ':'",
+                ));
+            }
+        }
+        let mut opts = b"lowerdir=".to_vec();
+        opts.extend_from_slice(lower);
+        opts.extend_from_slice(b",upperdir=");
+        opts.extend_from_slice(upper);
+        opts.extend_from_slice(b",workdir=");
+        opts.extend_from_slice(work);
+        self.overlay = Some(cstr(&opts)?);
+        Ok(self)
+    }
+
+    /// Joins the namespaces held at these paths (see [`hold_namespaces`])
+    /// instead of creating network, IPC and UTS namespaces of its own.
+    pub fn join(mut self, held: &std::path::Path) -> io::Result<Self> {
+        for (name, kind) in [
+            ("net", CLONE_NEWNET),
+            ("ipc", CLONE_NEWIPC),
+            ("uts", CLONE_NEWUTS),
+        ] {
+            let f = std::fs::File::open(held.join(name))?;
+            self.join.push((f, kind as c_int));
+        }
+        Ok(self)
+    }
+
+    /// Standard input, output and error of the command.
+    pub fn stdio(
+        mut self,
+        stdin: std::fs::File,
+        stdout: std::fs::File,
+        stderr: std::fs::File,
+    ) -> Self {
+        self.stdio = Some((stdin, stdout, stderr));
+        self
+    }
+
+    pub fn cwd(mut self, dir: &[u8]) -> io::Result<Self> {
+        self.cwd = Some(cstr(dir)?);
+        Ok(self)
     }
 
     pub fn hostname(mut self, name: &[u8]) -> io::Result<Self> {
@@ -417,8 +482,12 @@ impl Spawn {
         if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let flags =
-            CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | SIGCHLD;
+        let own = if self.join.is_empty() {
+            CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET
+        } else {
+            0
+        };
+        let flags = CLONE_NEWNS | CLONE_NEWPID | own | SIGCHLD;
         // SAFETY: a raw clone without CLONE_VM is a fork into the given
         // namespaces. The child runs only `child`, which makes syscalls on
         // memory prepared above and ends in execve or _exit.
@@ -458,11 +527,35 @@ impl Spawn {
             if read(wait, (&mut byte as *mut u8).cast(), 1) != 1 {
                 fail(Step::Release);
             }
+            use std::os::fd::AsRawFd;
+            for (f, kind) in &self.join {
+                if setns(f.as_raw_fd(), *kind) != 0 {
+                    fail(Step::Namespaces);
+                }
+            }
+            if let Some((i, o, e)) = &self.stdio {
+                if dup2(i.as_raw_fd(), 0) < 0
+                    || dup2(o.as_raw_fd(), 1) < 0
+                    || dup2(e.as_raw_fd(), 2) < 0
+                {
+                    fail(Step::Namespaces);
+                }
+            }
             if mount(null, c"/".as_ptr(), null, MS_REC | MS_PRIVATE, nodata) != 0 {
                 fail(Step::MakePrivate);
             }
             let root = self.root.as_ptr();
-            if mount(root, root, null, MS_BIND | MS_REC, nodata) != 0 {
+            let bound = match &self.overlay {
+                Some(opts) => mount(
+                    c"overlay".as_ptr(),
+                    root,
+                    c"overlay".as_ptr(),
+                    0,
+                    opts.as_ptr().cast(),
+                ),
+                None => mount(root, root, null, MS_BIND | MS_REC, nodata),
+            };
+            if bound != 0 {
                 fail(Step::BindRoot);
             }
             if chdir(root) != 0 {
@@ -543,6 +636,11 @@ impl Spawn {
                 ) != 0
             {
                 fail(Step::ReadOnly);
+            }
+            if let Some(dir) = &self.cwd {
+                if chdir(dir.as_ptr()) != 0 {
+                    fail(Step::EnterRoot);
+                }
             }
             self.drop_capabilities();
             // last: the filter refuses mount and pivot_root, used above
@@ -653,6 +751,105 @@ impl Spawn {
     }
 }
 
+/// Creates network, IPC and UTS namespaces and keeps them alive without a
+/// process, as files `net`, `ipc` and `uts` in `dir`: a short lived child
+/// makes them, the parent bind mounts them, the child exits. This is a
+/// pod sandbox without the pause container (docs/RUNTIME.md).
+pub fn hold_namespaces(dir: &std::path::Path, hostname: &[u8]) -> io::Result<()> {
+    let name = cstr(hostname)?;
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds is a valid two element array.
+    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | SIGCHLD;
+    // SAFETY: as in Spawn::start; the child only sets its hostname and
+    // blocks on the pipe, then exits.
+    let pid = unsafe { syscall(SYS_CLONE, flags, 0usize, 0usize, 0usize, 0usize) };
+    if pid == 0 {
+        unsafe {
+            let ok = sethostname(name.as_ptr(), name.as_bytes().len()) == 0;
+            let mut b = 0u8;
+            read(fds[0], (&mut b as *mut u8).cast(), 1);
+            _exit(if ok { 0 } else { 1 });
+        }
+    }
+    unsafe { close(fds[0]) };
+    if pid < 0 {
+        unsafe { close(fds[1]) };
+        return Err(io::Error::last_os_error());
+    }
+    let mut result = Ok(());
+    for ns in ["uts", "ipc", "net"] {
+        let target = dir.join(ns);
+        let made = std::fs::File::create(&target).and_then(|_| {
+            let src = cstr(format!("/proc/{pid}/ns/{ns}").as_bytes())?;
+            let dst = cstr(target.as_os_str().as_encoded_bytes())?;
+            // SAFETY: both are valid C strings; a bind mount of an nsfs
+            // file keeps the namespace alive after its last process.
+            let r = unsafe {
+                mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    std::ptr::null(),
+                    MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if r == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+        if let Err(e) = made {
+            result = Err(e);
+            break;
+        }
+    }
+    let byte = 1u8;
+    unsafe {
+        write(fds[1], (&byte as *const u8).cast(), 1);
+        close(fds[1]);
+    }
+    match (wait(pid as i32)?, result) {
+        (_, Err(e)) => {
+            let _ = release_namespaces(dir);
+            Err(e)
+        }
+        (Exit::Code(0), Ok(())) => Ok(()),
+        (other, Ok(())) => {
+            let _ = release_namespaces(dir);
+            Err(io::Error::other(format!(
+                "namespace holder: {}",
+                describe(other)
+            )))
+        }
+    }
+}
+
+/// Undoes [`hold_namespaces`]; the namespaces end once no process is in
+/// them.
+pub fn release_namespaces(dir: &std::path::Path) -> io::Result<()> {
+    for ns in ["net", "ipc", "uts"] {
+        let p = dir.join(ns);
+        let c = cstr(p.as_os_str().as_encoded_bytes())?;
+        // SAFETY: a valid C string; an absent mount is reported, not unsafe.
+        unsafe { umount2(c.as_ptr(), MNT_DETACH) };
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(())
+}
+
+pub fn signal(pid: i32, sig: i32) -> io::Result<()> {
+    // SAFETY: kill takes two integers.
+    if unsafe { kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// How a child ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -709,6 +906,7 @@ mod tests {
     #[test]
     fn statuses_name_the_failed_step() {
         assert_eq!(Step::from_status(104), Some(Step::PivotRoot));
+        assert_eq!(Step::from_status(99), Some(Step::Namespaces));
         assert_eq!(Step::from_status(0), None);
         assert_eq!(describe(Exit::Code(115)), "setup failed at Exec");
     }
