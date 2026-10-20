@@ -23,13 +23,15 @@ written before most of the code.
 - `quantykube runtime` serves RuntimeService and ImageService on a Unix
   socket: version and status, pods and containers from creation to
   removal, their logs in the format the kubelet reads, and images
-  imported with `quantykube import` (ADR-017, ADR-018).
-  `scripts/cri.sh` takes a pod through its life with `crictl`. Volumes
-  are bind mounted (ADR-019), limits and stats come from cgroup v2
-  (ADR-020), ExecSync joins a running container (ADR-021), and pods get
-  their network from CNI plugins (ADR-022), and containers run as the
-  user asked for (ADR-023). What the kubelet needs beyond that, in
-  order: pulling, streaming exec, port mappings, durable state.
+  imported with `quantykube import` or pulled (ADR-017, ADR-018,
+  ADR-025). `scripts/cri.sh` takes a pod through its life with
+  `crictl`, `scripts/cluster.sh` a k3s node. Volumes are bind mounted
+  (ADR-019), limits and stats come from cgroup v2 (ADR-020), ExecSync
+  joins a running container (ADR-021), pods get their network from CNI
+  plugins (ADR-022), and containers run as the user asked for
+  (ADR-023). What the kubelet needs beyond that, in order: HTTPS
+  registries (TLS), registry credentials, streaming exec, port
+  mappings, pods that survive a runtime restart.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
