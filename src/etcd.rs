@@ -485,7 +485,7 @@ impl<B: Backend> Etcd<B> {
         }
     }
 
-    fn watch(&self, requests: Receiver<Vec<u8>>, mut out: Responder) {
+    fn watch(&self, requests: Receiver<Vec<u8>>, out: &mut dyn WatchOut) {
         let (tx, rx) = mpsc::channel::<Inbox>();
         let forward = tx.clone();
         std::thread::spawn(move || {
@@ -500,6 +500,7 @@ impl<B: Backend> Etcd<B> {
             etcd: self,
             tx,
             local: HashMap::new(),
+            by_hub: HashMap::new(),
             next_local: 0,
             deferred: Vec::new(),
         };
@@ -509,7 +510,7 @@ impl<B: Backend> Etcd<B> {
                 None => match rx.recv_timeout(PROGRESS_EVERY) {
                     Ok(i) => i,
                     Err(RecvTimeoutError::Timeout) => {
-                        if !w.periodic_progress(&mut out) {
+                        if !w.periodic_progress(out) {
                             break;
                         }
                         continue;
@@ -519,10 +520,10 @@ impl<B: Backend> Etcd<B> {
             };
             let alive = match item {
                 Inbox::Request(r) => match WatchRequest::decode(&r) {
-                    Ok(req) => w.request(req, &rx, &mut out),
+                    Ok(req) => w.request(req, &rx, out),
                     Err(_) => false,
                 },
-                Inbox::Events(local, rev, events) => w.deliver(local, rev, events, &mut out),
+                Inbox::Events(hub_id, rev, events) => w.deliver(hub_id, rev, events, out),
                 Inbox::Done => false,
             };
             if !alive {
@@ -548,9 +549,22 @@ fn decode_pair(v: &[u8]) -> Option<(i64, i64)> {
     Some((a as i64, b as i64))
 }
 
+/// Where a watch stream's responses go: the gRPC call, or a test.
+trait WatchOut {
+    /// False once the client is gone.
+    fn send(&mut self, msg: &[u8]) -> bool;
+}
+
+impl WatchOut for Responder {
+    fn send(&mut self, msg: &[u8]) -> bool {
+        Responder::send(self, msg)
+    }
+}
+
 enum Inbox {
     Request(Vec<u8>),
-    Events(i64, i64, Vec<Event>),
+    /// Events for the hub subscription with this id, at a revision.
+    Events(u64, i64, Vec<Event>),
     Done,
 }
 
@@ -563,21 +577,26 @@ struct WatchStream<'a, B: Backend> {
     etcd: &'a Etcd<B>,
     tx: Sender<Inbox>,
     local: HashMap<i64, Sub>,
+    /// Which watch a hub subscription belongs to. Events are routed by
+    /// subscription, so events queued for a canceled watch never reach
+    /// a later one, whatever its id.
+    by_hub: HashMap<u64, i64>,
     next_local: i64,
     deferred: Vec<Inbox>,
 }
 
 impl<B: Backend> WatchStream<'_, B> {
-    fn send(&self, out: &mut Responder, resp: WatchResponse) -> bool {
+    fn send(&self, out: &mut dyn WatchOut, resp: WatchResponse) -> bool {
         out.send(&resp.encode())
     }
 
-    fn request(&mut self, req: WatchRequest, rx: &Receiver<Inbox>, out: &mut Responder) -> bool {
+    fn request(&mut self, req: WatchRequest, rx: &Receiver<Inbox>, out: &mut dyn WatchOut) -> bool {
         match req.request_union {
             Some(WatchRequestUnion::Create(c)) => self.create(c, out),
             Some(WatchRequestUnion::Cancel(c)) => {
                 if let Some(sub) = self.local.remove(&c.watch_id) {
                     self.etcd.hub.remove(sub.hub_id);
+                    self.by_hub.remove(&sub.hub_id);
                 }
                 self.send(
                     out,
@@ -596,8 +615,8 @@ impl<B: Backend> WatchStream<'_, B> {
                 let mut later = Vec::new();
                 while let Ok(item) = rx.try_recv() {
                     match item {
-                        Inbox::Events(id, r, ev) => {
-                            if !self.deliver(id, r, ev, out) {
+                        Inbox::Events(hub_id, r, ev) => {
+                            if !self.deliver(hub_id, r, ev, out) {
                                 return false;
                             }
                         }
@@ -619,14 +638,16 @@ impl<B: Backend> WatchStream<'_, B> {
         }
     }
 
-    fn create(&mut self, c: WatchCreateRequest, out: &mut Responder) -> bool {
+    fn create(&mut self, c: WatchCreateRequest, out: &mut dyn WatchOut) -> bool {
         let id = if c.watch_id != 0 {
             c.watch_id
         } else {
+            // as etcd: counted up per stream and never handed out twice
             while self.local.contains_key(&self.next_local) {
                 self.next_local += 1;
             }
-            self.next_local
+            self.next_local += 1;
+            self.next_local - 1
         };
         if self.local.contains_key(&id) {
             return self.send(
@@ -671,7 +692,12 @@ impl<B: Backend> WatchStream<'_, B> {
             no_delete: c.filters.contains(&FilterType::NoDelete),
             prev_kv: c.prev_kv,
         };
-        let (hub_id, head) = self.etcd.hub.add(filter.clone(), id, self.tx.clone());
+        // a start in the future is waited for: nothing before it is sent
+        let (hub_id, head) = self
+            .etcd
+            .hub
+            .add(filter.clone(), c.start_revision, self.tx.clone());
+        self.by_hub.insert(hub_id, id);
         self.local.insert(
             id,
             Sub {
@@ -733,10 +759,10 @@ impl<B: Backend> WatchStream<'_, B> {
             )
     }
 
-    fn deliver(&self, id: i64, rev: i64, events: Vec<Event>, out: &mut Responder) -> bool {
-        if !self.local.contains_key(&id) {
+    fn deliver(&self, hub_id: u64, rev: i64, events: Vec<Event>, out: &mut dyn WatchOut) -> bool {
+        let Some(&id) = self.by_hub.get(&hub_id) else {
             return true;
-        }
+        };
         self.send(
             out,
             WatchResponse {
@@ -748,7 +774,7 @@ impl<B: Backend> WatchStream<'_, B> {
         )
     }
 
-    fn periodic_progress(&self, out: &mut Responder) -> bool {
+    fn periodic_progress(&self, out: &mut dyn WatchOut) -> bool {
         let rev = self.etcd.hub.last_rev();
         for (id, sub) in &self.local {
             if sub.progress_notify
@@ -806,18 +832,28 @@ struct Hub {
     state: Mutex<HubState>,
 }
 
+struct HubSub {
+    filter: Filter,
+    /// Revisions below this are not sent: they were replayed already, or
+    /// come before the revision the watch asked to start at.
+    from: i64,
+    tx: Sender<Inbox>,
+}
+
 struct HubState {
     last_rev: i64,
     next_id: u64,
-    subs: HashMap<u64, (Filter, i64, Sender<Inbox>)>,
+    subs: HashMap<u64, HubSub>,
 }
 
 impl Hub {
-    fn add(&self, f: Filter, watch_id: i64, tx: Sender<Inbox>) -> (u64, i64) {
+    /// Subscribes from `from` on, and returns the subscription's id and
+    /// the last revision published, after which events will arrive.
+    fn add(&self, filter: Filter, from: i64, tx: Sender<Inbox>) -> (u64, i64) {
         let mut s = self.state.lock().unwrap();
         s.next_id += 1;
         let id = s.next_id;
-        s.subs.insert(id, (f, watch_id, tx));
+        s.subs.insert(id, HubSub { filter, from, tx });
         (id, s.last_rev)
     }
 
@@ -831,9 +867,12 @@ impl Hub {
 
     fn publish(&self, rev: i64, changes: &[Change]) {
         let mut s = self.state.lock().unwrap();
-        s.subs.retain(|_, (f, watch_id, tx)| {
-            let events: Vec<Event> = changes.iter().filter_map(|c| f.event(c)).collect();
-            events.is_empty() || tx.send(Inbox::Events(*watch_id, rev, events)).is_ok()
+        s.subs.retain(|id, sub| {
+            if rev < sub.from {
+                return true;
+            }
+            let events: Vec<Event> = changes.iter().filter_map(|c| sub.filter.event(c)).collect();
+            events.is_empty() || sub.tx.send(Inbox::Events(*id, rev, events)).is_ok()
         });
         s.last_rev = rev;
     }
@@ -991,7 +1030,7 @@ impl<B: Backend> Service for Etcd<B> {
 
     fn stream(&self, method: &str, requests: Receiver<Vec<u8>>, mut out: Responder) {
         match method {
-            "/etcdserverpb.Watch/Watch" => self.watch(requests, out),
+            "/etcdserverpb.Watch/Watch" => self.watch(requests, &mut out),
             "/etcdserverpb.Lease/LeaseKeepAlive" => {
                 for r in requests {
                     let Ok(req) = LeaseKeepAliveRequest::decode(&r) else {
@@ -1368,5 +1407,139 @@ mod tests {
         let read = r.kvs[0].mod_revision;
         assert_eq!(r.header.unwrap().revision, read);
         assert!(e.store.head() > read, "no write landed during the read");
+    }
+
+    /// A watch stream run as the gRPC server would run it, with its
+    /// responses collected.
+    struct WatchClient {
+        requests: Option<mpsc::Sender<Vec<u8>>>,
+        got: Arc<Mutex<Vec<WatchResponse>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    struct Collect(Arc<Mutex<Vec<WatchResponse>>>);
+
+    impl WatchOut for Collect {
+        fn send(&mut self, msg: &[u8]) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push(WatchResponse::decode(msg).unwrap());
+            true
+        }
+    }
+
+    impl WatchClient {
+        fn open<B: Backend>(e: &Arc<Etcd<B>>) -> Self {
+            let (tx, rx) = mpsc::channel();
+            let got = Arc::new(Mutex::new(Vec::new()));
+            let (e, mut out) = (e.clone(), Collect(got.clone()));
+            let thread = std::thread::spawn(move || e.watch(rx, &mut out));
+            WatchClient {
+                requests: Some(tx),
+                got,
+                thread: Some(thread),
+            }
+        }
+
+        fn send(&self, r: WatchRequestUnion) {
+            let req = WatchRequest {
+                request_union: Some(r),
+            };
+            self.requests.as_ref().unwrap().send(req.encode()).unwrap();
+        }
+
+        fn create(&self, key: &str, end: &str, start: i64) {
+            self.send(WatchRequestUnion::Create(WatchCreateRequest {
+                key: key.into(),
+                range_end: end.into(),
+                start_revision: start,
+                ..Default::default()
+            }));
+        }
+
+        /// Waits until `done` holds for what arrived, or fails the test.
+        fn until(&self, what: &str, done: impl Fn(&[WatchResponse]) -> bool) -> Vec<WatchResponse> {
+            for _ in 0..500 {
+                let got = self.got.lock().unwrap().clone();
+                if done(&got) {
+                    return got;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "timed out waiting for {what}: {:?}",
+                self.got.lock().unwrap()
+            );
+        }
+    }
+
+    impl Drop for WatchClient {
+        fn drop(&mut self) {
+            self.requests.take();
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn revisions(got: &[WatchResponse]) -> Vec<i64> {
+        got.iter()
+            .flat_map(|r| &r.events)
+            .map(|e| e.kv.as_ref().unwrap().mod_revision)
+            .collect()
+    }
+
+    // etcd waits for a start revision in the future and sends nothing
+    // before it; the API server's watch cache relies on never seeing an
+    // event older than the revision it asked for
+    #[test]
+    fn a_watch_sends_nothing_before_its_start_revision() {
+        let e = etcd();
+        put(&e, "/w/a", "v", 0);
+        let head = e.store.head();
+        let w = WatchClient::open(&e);
+        w.create("/w/", "/w0", head + 3);
+        w.until("created", |g| g.iter().any(|r| r.created));
+        for i in 0..4 {
+            put(&e, "/w/a", &i.to_string(), 0);
+        }
+        let got = w.until("two events", |g| revisions(g).len() >= 2);
+        std::thread::sleep(Duration::from_millis(100));
+        let mut all = revisions(&w.got.lock().unwrap());
+        all.sort();
+        assert_eq!(all, [head + 3, head + 4], "{got:?}");
+    }
+
+    // clientv3 multiplexes many watches on one stream and cancels them
+    // all the time: an id handed out twice can carry events for the
+    // canceled watch's keys to the new one
+    #[test]
+    fn watch_ids_are_never_reused_on_a_stream() {
+        let e = etcd();
+        let w = WatchClient::open(&e);
+        w.create("/a", "", 0);
+        w.until("first", |g| g.iter().filter(|r| r.created).count() == 1);
+        w.send(WatchRequestUnion::Cancel(WatchCancelRequest {
+            watch_id: 0,
+        }));
+        w.until("canceled", |g| g.iter().any(|r| r.canceled));
+        w.create("/b", "", 0);
+        let got = w.until("second", |g| g.iter().filter(|r| r.created).count() == 2);
+        let ids: Vec<i64> = got
+            .iter()
+            .filter(|r| r.created)
+            .map(|r| r.watch_id)
+            .collect();
+        assert_eq!(ids, [0, 1]);
+        put(&e, "/a", "v", 0);
+        put(&e, "/b", "v", 0);
+        let got = w.until("event", |g| !revisions(g).is_empty());
+        let keys: Vec<&[u8]> = got
+            .iter()
+            .flat_map(|r| &r.events)
+            .map(|e| e.kv.as_ref().unwrap().key.as_slice())
+            .collect();
+        assert_eq!(keys, [b"/b".as_slice()]);
     }
 }
