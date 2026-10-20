@@ -14,6 +14,8 @@ through and add a new entry, never silently edit history.
 - [ADR-007](#adr-007-apache-20-and-money-from-what-surrounds-the-code) Apache 2.0, and money from what surrounds the code
 - [ADR-008](#adr-008-raft-comes-later-and-starts-with-a-simulator) Raft comes later, and starts with a simulator
 - [ADR-009](#adr-009-kubectl-apply-installs-an-operator-that-swaps-and-undoes) kubectl apply installs an operator that swaps and undoes
+- [ADR-010](#adr-010-a-revision-is-a-commit-and-the-change-log-keeps-both-sides) A revision is a commit, and the change log keeps both sides
+- [ADR-011](#adr-011-history-is-kept-by-time-whatever-the-api-server-compacts) History is kept by time, whatever the API server compacts
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -269,3 +271,54 @@ review at any serious company will start there, so it must be small,
 auditable and completely removable. It also has to be tested against the
 ways real clusters differ: kubeadm, k3s, RKE2 and the distributions in
 between each place the kubelet's configuration somewhere else.
+
+## ADR-010: A revision is a commit, and the change log keeps both sides
+
+Every etcd write is one QuantyDB commit, and its commit id is the etcd
+revision. A request that changes nothing, such as a transaction whose
+compare fails, commits nothing and takes no revision. Revision 1 is the
+empty store, committed when the file is created, so that every revision a
+client has seen can be read back.
+
+Live keys, the change log and the store's own bookkeeping share one tree,
+told apart by a one byte prefix. Each log entry holds the new record and
+the previous one. Watches replay from the log, and storing both sides
+there is what makes a replay a single scan: rebuilding the previous value
+from snapshots would walk QuantyDB's commit chain once per event, because
+finding an old commit walks back from the head.
+
+Writes are serialized, and each commit waits for two fsyncs before it
+answers. There is no group commit yet. QuantyDB's server batches
+statements into one commit (its ADR-028) and the same can be done here;
+it waits for a measurement that says the API server is waiting on it.
+
+**The cost:** revisions are not dense. Compaction, history pruning and
+lease bookkeeping are commits too and take revision numbers that no key
+carries. etcd does not do this, but no client found so far depends on
+consecutive revisions. The log also doubles what an update writes, since
+the old value is stored a second time.
+
+## ADR-011: History is kept by time, whatever the API server compacts
+
+The API server compacts etcd every five minutes, and etcd then throws the
+older versions away. QuantyKube honors compaction toward etcd clients
+exactly: a read or a watch below the compacted revision fails with etcd's
+own error, so nothing in Kubernetes sees different behavior. What is
+physically kept is decided separately, by `--retain`, one hour by default.
+Within that window every commit and every log entry stays, and
+`quantykube history` and `quantykube get --rev` or `--ago` read them,
+compacted or not. Piping such a value into `etcdctl put` brings a deleted
+object back, which the end to end test does with a ConfigMap.
+
+Once a minute the server drops what is older than the window: log entries
+first, in a commit, then QuantyDB's collector frees the pages. It never
+drops a revision at or after the compaction point, whatever the window,
+because etcd clients may still read those.
+
+**The cost:** disk. Copy on write means every commit writes new pages for
+the path it touched, and keeping an hour of commits keeps all of those
+pages. The benchmarks will say how much that is under a real API server
+before the default is defended in public. The history commands open the
+file without the writer lock; if a collection reuses pages under a long
+read, the page checksums turn that into an error, not wrong data.
+

@@ -106,4 +106,9 @@ ready
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
 k delete configmap e2e >/dev/null
 expect 'Error from server (NotFound): configmaps "e2e" not found' last k get configmap e2e
+
+key=/registry/configmaps/default/e2e
+rev=$("$QK" history --data "$work/db" "$key" | awk '$4 == "update" {print $1}')
+"$QK" get --data "$work/db" --rev "$rev" "$key" 2>/dev/null | e put "$key" >/dev/null
+expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
 echo "kubernetes: ok"

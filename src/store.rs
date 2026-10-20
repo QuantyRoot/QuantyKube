@@ -142,6 +142,20 @@ impl Quanty<FileStorage> {
             Self::start(Db::create_file(path)?)
         }
     }
+
+    /// For reading beside a running server. Without the writer lock a
+    /// collection in the server can reuse pages under a long read; the
+    /// page checksums turn that into an error, never into wrong data.
+    pub fn open_read_only(path: &std::path::Path) -> Result<Self> {
+        let db = Db::open_file_unlocked(path)?;
+        let head = db.head_commit() as i64;
+        Ok(Quanty {
+            db: RwLock::new(db),
+            writer: Mutex::new(()),
+            head: head.into(),
+            compacted: 0.into(),
+        })
+    }
 }
 
 impl Quanty<MemStorage> {
@@ -150,7 +164,110 @@ impl Quanty<MemStorage> {
     }
 }
 
+/// One entry of a key's history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub rev: i64,
+    pub unix_ms: i64,
+    pub change: Change,
+}
+
 impl<S: Storage + 'static> Quanty<S> {
+    /// Reads at any retained revision, compacted or not: the history that
+    /// etcd clients may no longer ask for is still here (ADR-010).
+    pub fn read_retained(
+        &self,
+        rev: i64,
+        f: &mut dyn FnMut(&dyn View) -> Result<()>,
+    ) -> Result<()> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let snap = db.snapshot_at(rev as u64)?;
+        f(&Reader { get: &snap })
+    }
+
+    /// The newest revision committed at or before `unix_ms`.
+    pub fn revision_at(&self, unix_ms: i64) -> Result<i64> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        Ok(db.snapshot_at_time(unix_ms.max(0) as u64)?.commit_id() as i64)
+    }
+
+    /// Every retained change to keys in `[start, end)`, oldest first;
+    /// `end` None means the single key `start`.
+    pub fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let times: std::collections::HashMap<u64, u64> = db
+            .log()?
+            .into_iter()
+            .map(|c| (c.commit_id, c.unix_ts_ms))
+            .collect();
+        let snap = db.snapshot();
+        let mut out = Vec::new();
+        for item in snap.scan(Some(&[LOG]), Some(&[LOG + 1]))? {
+            let (k, v) = item?;
+            let change = decode_change(&v)?;
+            let key = change.kv.key.as_slice();
+            let hit = match end {
+                None => key == start,
+                Some(e) => key >= start && key < e,
+            };
+            if hit {
+                let rev = u64::from_be_bytes(k[1..9].try_into().unwrap());
+                out.push(HistoryEntry {
+                    rev: rev as i64,
+                    unix_ms: times.get(&rev).copied().unwrap_or(0) as i64,
+                    change,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drops history older than `keep_ms`, but never a revision etcd
+    /// clients may still read, that is anything from the compaction
+    /// revision on. Returns how many commits were collected.
+    pub fn enforce_retention(&self, keep_ms: i64, now_ms: i64) -> Result<usize> {
+        let _w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let (keep, floor, total) = {
+            let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+            let log = db.log()?;
+            let cutoff = now_ms - keep_ms;
+            // keep the newest commit older than the cutoff too: it is the
+            // state at the cutoff itself
+            let by_time = log
+                .iter()
+                .position(|c| (c.unix_ts_ms as i64) < cutoff)
+                .map_or(log.len(), |i| i + 1);
+            let by_etcd = (self.head() - self.compacted() + 1).max(1) as usize;
+            let keep = by_time.max(by_etcd).min(log.len());
+            (keep, log[keep - 1].commit_id as i64, log.len())
+        };
+        if keep >= total {
+            return Ok(0);
+        }
+        let pruned = {
+            let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+            let mut tx = db.begin();
+            let old: Vec<Vec<u8>> = tx
+                .scan(Some(&[LOG]), Some(&log_key(floor, 0)))?
+                .map(|r| r.map(|(k, _)| k))
+                .collect::<std::result::Result<_, _>>()?;
+            for k in &old {
+                tx.delete(k)?;
+            }
+            if old.is_empty() {
+                false
+            } else {
+                let committed = tx.commit()? as i64;
+                self.head
+                    .store(committed, std::sync::atomic::Ordering::Release);
+                true
+            }
+        };
+        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let report = db.gc(keep + usize::from(pruned))?;
+        Ok(report.pruned_commits as usize)
+    }
+
     fn start(db: Db<S>) -> Result<Self> {
         if db.head_commit() == 0 {
             let mut tx = db.begin();
@@ -560,6 +677,14 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
 }
 
 #[cfg(test)]
+fn tests_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -628,6 +753,28 @@ mod tests {
         assert_eq!(seen[1].1.kind, Kind::Delete);
         assert_eq!(seen[1].1.kv.mod_rev, del);
         assert_eq!(seen[1].1.prev.as_ref().unwrap().value, b"2");
+    }
+
+    #[test]
+    fn retention_keeps_what_etcd_clients_may_read_and_drops_the_rest() {
+        let s = Quanty::in_memory().unwrap();
+        for v in [b"1", b"2", b"3", b"4"] {
+            put(&s, b"/k", v);
+        }
+        assert_eq!(s.history(b"/k", None).unwrap().len(), 4);
+        s.compact(4).unwrap();
+        let later = super::tests_now() + 1000;
+        assert!(s.enforce_retention(0, later).unwrap() > 0);
+        let kept: Vec<i64> = s
+            .history(b"/k", None)
+            .unwrap()
+            .iter()
+            .map(|h| h.rev)
+            .collect();
+        assert_eq!(kept, [4, 5]);
+        assert!(s.read_retained(2, &mut |_| Ok(())).is_err());
+        assert_eq!(get(&s, 4, b"/k").unwrap().value, b"3");
+        assert_eq!(get(&s, 0, b"/k").unwrap().value, b"4");
     }
 
     #[test]
