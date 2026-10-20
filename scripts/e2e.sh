@@ -18,6 +18,7 @@ cleanup() {
 trap cleanup EXIT
 
 start() {
+    rm -f "$sock"
     "$QK" serve --data "$work/db" --socket "$sock" 2>>"$work/qk.log" &
     qk=$!
     pids+=("$qk")
@@ -71,6 +72,7 @@ expect "compacted revision $rev" e compaction "$rev"
 expect "Error: etcdserver: mvcc: required revision has been compacted" last e get /a --rev=2
 
 kill -9 "$qk"
+wait "$qk" 2>/dev/null || true
 start
 expect $'/b\ncreated' e get /b
 echo "etcdctl: ok"
@@ -98,6 +100,7 @@ k create configmap e2e --from-literal=v=1 >/dev/null
 k patch configmap e2e -p '{"data":{"v":"2"}}' >/dev/null
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
 kill -9 "$qk"
+wait "$qk" 2>/dev/null || true
 start
 ready
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
