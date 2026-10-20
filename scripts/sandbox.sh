@@ -43,7 +43,7 @@ echo "sandbox: ok"
 [ -n "${RUNC:-}" ] || exit 0
 bundle=$work/bundle
 mkdir -p "$bundle"
-ln -s "$root" "$bundle/rootfs"
+cp -a "$root" "$bundle/rootfs"
 (cd "$bundle" && "$RUNC" spec)
 python3 -I - "$bundle/config.json" <<'PY'
 import json, sys
@@ -59,7 +59,9 @@ import statistics, subprocess, sys, time
 qk, root, runc, bundle = sys.argv[1:]
 def timed(cmd):
     t = time.perf_counter()
-    subprocess.run(cmd, check=True, capture_output=True)
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        sys.exit(f"{cmd[0]} failed: {r.stderr.decode(errors='replace')}")
     return (time.perf_counter() - t) * 1000
 runs = 50
 ours = [timed([qk, "sandbox", "--rootfs", root, "--readonly", "--", "/bin/true"]) for _ in range(runs)]

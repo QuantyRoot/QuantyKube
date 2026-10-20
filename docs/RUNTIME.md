@@ -3,7 +3,23 @@
 ADR-005 says what "sandbox" means here: the program the kubelet drives
 through the Container Runtime Interface on every node, which is
 containerd or CRI-O in most clusters today. This file is the design,
-written before the code. None of it exists yet.
+written before most of the code.
+
+## What exists
+
+- `quantykube unpack` applies real image layers to a directory, safely
+  (ADR-016).
+- `quantykube sandbox` starts a command in new mount, PID, UTS, IPC and
+  network namespaces with that directory as its root, read only if asked
+  (ADR-013). alpine, busybox and nginx run in it.
+
+`scripts/sandbox.sh` times it against runc on the same root filesystem.
+On the development machine: a median of 2.7 ms against runc's 30 ms to
+run `/bin/true`. That is a floor, not a result. runc also creates a
+cgroup, drops capabilities, installs a seccomp filter, builds `/dev` and
+masks paths under `/proc`, and the sandbox does none of that yet. The
+comparison that counts is the one at the end of this file, with the same
+work done on both sides.
 
 ## What the kubelet calls
 
