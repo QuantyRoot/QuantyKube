@@ -61,6 +61,8 @@ const MS_PRIVATE: c_ulong = 1 << 18;
 const MS_STRICTATIME: c_ulong = 1 << 24;
 const MNT_DETACH: c_int = 2;
 
+const PR_SET_SECCOMP: c_int = 22;
+const SECCOMP_MODE_FILTER: c_ulong = 2;
 const PR_CAPBSET_DROP: c_int = 24;
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -125,6 +127,139 @@ const READ_ONLY: [&std::ffi::CStr; 5] = [
     c"/proc/sysrq-trigger",
 ];
 
+/// Syscalls refused with EPERM, the ones Docker's default profile refuses
+/// that lead out of a container or into the kernel: modules, kexec,
+/// reboot, mounts and namespaces, tracing other processes, BPF, keyrings,
+/// the clock, swap, NUMA policy and raw I/O ports. Docker's profile is an
+/// allowlist of about 350 calls; this is the part of it that matters for
+/// escaping, as a denylist, until the allowlist is worth its size.
+pub const DENIED: [(&str, u32); 47] = [
+    ("acct", 163),
+    ("add_key", 248),
+    ("bpf", 321),
+    ("clock_adjtime", 305),
+    ("clock_settime", 227),
+    ("create_module", 174),
+    ("delete_module", 176),
+    ("finit_module", 313),
+    ("get_kernel_syms", 177),
+    ("get_mempolicy", 239),
+    ("init_module", 175),
+    ("ioperm", 173),
+    ("iopl", 172),
+    ("kcmp", 312),
+    ("kexec_file_load", 320),
+    ("kexec_load", 246),
+    ("keyctl", 250),
+    ("lookup_dcookie", 212),
+    ("mbind", 237),
+    ("mount", 165),
+    ("move_mount", 429),
+    ("fsopen", 430),
+    ("fsconfig", 431),
+    ("fsmount", 432),
+    ("fspick", 433),
+    ("open_tree", 428),
+    ("move_pages", 279),
+    ("name_to_handle_at", 303),
+    ("nfsservctl", 180),
+    ("open_by_handle_at", 304),
+    ("perf_event_open", 298),
+    ("pivot_root", 155),
+    ("process_vm_readv", 310),
+    ("process_vm_writev", 311),
+    ("ptrace", 101),
+    ("query_module", 178),
+    ("quotactl", 179),
+    ("reboot", 169),
+    ("request_key", 249),
+    ("set_mempolicy", 238),
+    ("setns", 308),
+    ("settimeofday", 164),
+    ("swapon", 167),
+    ("swapoff", 168),
+    ("syslog", 103),
+    ("umount2", 166),
+    ("unshare", 272),
+];
+
+const SYS_CLONE_NR: u32 = 56;
+const SYS_CLONE3_NR: u32 = 435;
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const X32_BIT: u32 = 0x4000_0000;
+const NAMESPACE_FLAGS: u32 = 0x7e02_0080;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
+}
+
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JEQ_K: u16 = 0x15;
+const BPF_JSET_K: u16 = 0x45;
+const BPF_RET_K: u16 = 0x06;
+const RET_ALLOW: u32 = 0x7fff_0000;
+const RET_KILL_PROCESS: u32 = 0x8000_0000;
+const RET_ERRNO: u32 = 0x0005_0000;
+const EPERM: u32 = 1;
+const ENOSYS: u32 = 38;
+
+fn stmt(code: u16, k: u32) -> SockFilter {
+    SockFilter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
+    SockFilter { code, jt, jf, k }
+}
+
+/// The seccomp program: the wrong architecture or the x32 ABI kills,
+/// clone with namespace flags and the denied calls get EPERM, clone3
+/// gets ENOSYS so libc falls back to clone, where the flags can be seen
+/// (clone3 passes them in memory a filter cannot read), and the rest is
+/// allowed. Offsets in seccomp_data: nr at 0, arch at 4, args from 16.
+fn seccomp_program() -> Vec<SockFilter> {
+    let mut p = vec![
+        stmt(BPF_LD_W_ABS, 4),
+        jump(BPF_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        stmt(BPF_RET_K, RET_KILL_PROCESS),
+        stmt(BPF_LD_W_ABS, 0),
+        jump(BPF_JSET_K, X32_BIT, 0, 1),
+        stmt(BPF_RET_K, RET_KILL_PROCESS),
+        jump(BPF_JEQ_K, SYS_CLONE3_NR, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO | ENOSYS),
+        jump(BPF_JEQ_K, SYS_CLONE_NR, 0, 3),
+        stmt(BPF_LD_W_ABS, 16),
+        jump(BPF_JSET_K, NAMESPACE_FLAGS, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO | EPERM),
+    ];
+    // the clone branch reloaded the accumulator, so the denylist starts
+    // with the syscall number again
+    p.push(stmt(BPF_LD_W_ABS, 0));
+    let n = DENIED.len();
+    for (i, (_, nr)) in DENIED.iter().enumerate() {
+        // jump over the remaining checks and the allow to the EPERM return
+        p.push(jump(BPF_JEQ_K, *nr, (n - i) as u8, 0));
+    }
+    p.push(stmt(BPF_RET_K, RET_ALLOW));
+    p.push(stmt(BPF_RET_K, RET_ERRNO | EPERM));
+    p
+}
+
 /// Everything the child needs, prepared before the clone. Between clone
 /// and exec the child may not allocate: another thread of the parent may
 /// have held the allocator's lock at the moment of the clone, and the
@@ -134,6 +269,7 @@ pub struct Spawn {
     hostname: Option<CString>,
     readonly: bool,
     caps: u64,
+    seccomp: Vec<SockFilter>,
     path: CString,
     _argv: Vec<CString>,
     argv_ptrs: Vec<*const c_char>,
@@ -159,7 +295,8 @@ pub enum Step {
     Hostname = 111,
     ReadOnly = 112,
     Capabilities = 113,
-    Exec = 114,
+    Seccomp = 114,
+    Exec = 115,
 }
 
 impl Step {
@@ -180,6 +317,7 @@ impl Step {
             Hostname,
             ReadOnly,
             Capabilities,
+            Seccomp,
             Exec,
         ]
         .into_iter()
@@ -246,6 +384,7 @@ impl Spawn {
             hostname: None,
             readonly: false,
             caps: DEFAULT_CAPS,
+            seccomp: seccomp_program(),
             path: cstr(first)?,
             _argv: argv,
             argv_ptrs,
@@ -406,6 +545,21 @@ impl Spawn {
                 fail(Step::ReadOnly);
             }
             self.drop_capabilities();
+            // last: the filter refuses mount and pivot_root, used above
+            let prog = SockFprog {
+                len: self.seccomp.len() as u16,
+                filter: self.seccomp.as_ptr(),
+            };
+            if prctl(
+                PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER,
+                &prog as *const SockFprog as c_ulong,
+                0,
+                0,
+            ) != 0
+            {
+                fail(Step::Seccomp);
+            }
             execve(
                 self.path.as_ptr(),
                 self.argv_ptrs.as_ptr(),
@@ -556,7 +710,40 @@ mod tests {
     fn statuses_name_the_failed_step() {
         assert_eq!(Step::from_status(104), Some(Step::PivotRoot));
         assert_eq!(Step::from_status(0), None);
-        assert_eq!(describe(Exit::Code(114)), "setup failed at Exec");
+        assert_eq!(describe(Exit::Code(115)), "setup failed at Exec");
+    }
+
+    #[test]
+    fn denied_syscall_numbers_match_the_kernel_headers() {
+        let Ok(h) = std::fs::read_to_string("/usr/include/x86_64-linux-gnu/asm/unistd_64.h") else {
+            eprintln!("no kernel headers, not checked");
+            return;
+        };
+        for (name, nr) in DENIED
+            .iter()
+            .chain(&[("clone", SYS_CLONE_NR), ("clone3", SYS_CLONE3_NR)])
+        {
+            let line = format!("#define __NR_{name} {nr}");
+            assert!(h.lines().any(|l| l.trim() == line), "{name} is not {nr}");
+        }
+    }
+
+    #[test]
+    fn every_seccomp_jump_lands_inside_the_program() {
+        let p = seccomp_program();
+        assert!(p.len() < 4096, "the kernel's limit");
+        for (i, ins) in p.iter().enumerate() {
+            if ins.code == BPF_JEQ_K || ins.code == BPF_JSET_K {
+                for off in [ins.jt, ins.jf] {
+                    assert!(
+                        i + 1 + (off as usize) < p.len(),
+                        "jump at {i} leaves the program"
+                    );
+                }
+            }
+        }
+        assert_eq!(p[p.len() - 1], stmt(BPF_RET_K, RET_ERRNO | EPERM));
+        assert_eq!(p[p.len() - 2], stmt(BPF_RET_K, RET_ALLOW));
     }
 
     #[test]

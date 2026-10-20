@@ -392,10 +392,13 @@ that lock would never be released. Failures are reported as the child's
 exit status, one number per setup step.
 
 `quantykube sandbox` exposes it for measuring against runc, with what
-runc's default configuration does except seccomp (docs/RUNTIME.md). The
+runc's default configuration does (docs/RUNTIME.md), the seccomp filter
+built by hand as BPF: wrong architecture and the x32 ABI kill, clone
+with namespace flags and 47 dangerous calls get EPERM, and clone3 gets
+ENOSYS so libc falls back to clone, whose flags a filter can see. The
 child waits on a pipe until the parent has put it into its cgroup, so
 none of its own code runs outside the limits. It is not a runtime yet:
-no CRI, no seccomp, no image store.
+no CRI and no image store.
 
 **The cost:** a crate of code the compiler cannot check, written against
 one libc and one architecture, x86_64 Linux, until a second one is needed.

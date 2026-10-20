@@ -10,31 +10,34 @@ written before most of the code.
 - `quantykube unpack` applies real image layers to a directory, safely
   (ADR-016).
 - `quantykube sandbox` starts a command the way runc's default
-  configuration does, except for seccomp: new mount, PID, UTS, IPC and
-  network namespaces; the root pivoted, read only if asked; a fresh
-  `/dev` with the six standard devices, `devpts` and `/dev/shm`; `/sys`
-  read only; the paths runc masks or makes read only under `/proc` and
-  `/sys`; Docker's fourteen default capabilities in every set, the rest
-  dropped from the bounding set, and `no_new_privs`; and, with
-  `--cgroup`, a cgroup v2 with memory and pid limits that the process is
-  in before any of its own code runs (ADR-013). alpine, busybox and nginx
-  run in it.
+  configuration does: new mount, PID, UTS, IPC and network namespaces;
+  the root pivoted, read only if asked; a fresh `/dev` with the six
+  standard devices, `devpts` and `/dev/shm`; `/sys` read only; the paths
+  runc masks or makes read only under `/proc` and `/sys`; Docker's
+  fourteen default capabilities in every set, the rest dropped from the
+  bounding set; `no_new_privs`; a seccomp filter; and, with `--cgroup`, a
+  cgroup v2 with memory and pid limits that the process is in before any
+  of its own code runs (ADR-013). alpine, busybox and nginx run in it.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
-development machine, two runs of 50 starts of `/bin/true`, quiet machine:
+development machine, two runs of 50 starts of `/bin/true` each, quiet
+machine, runc v1.3.2 with the configuration `runc spec` writes:
 
 | | median | p90 |
 | --- | --- | --- |
-| `quantykube sandbox` | 3.5 to 4.0 ms | 3.9 to 4.9 ms |
-| `runc run` | 23.7 to 25.1 ms | 35.0 to 35.4 ms |
+| `quantykube sandbox` | 3.6 to 3.7 ms | 5.0 to 5.1 ms |
+| `runc run` | 20.4 to 21.0 ms | 28.5 to 30.2 ms |
 
 What the gap is made of, as far as is known: runc is a Go binary that
 starts, re-executes itself to set up namespaces in C, and talks to its
-child over a socket; the sandbox clones once. runc still does more:
-seccomp, cgroup setup on every run, and AppArmor or SELinux labels where
-the host has them. Until the sandbox does those too, this is a lower
-bound on what can be won, not a result.
+child over a socket; the sandbox clones once. Two differences remain on
+the sandbox's side and are why this is not yet a claim. Its seccomp
+filter is a denylist of the 47 calls Docker refuses that lead out of a
+container or into the kernel, where Docker's profile is an allowlist of
+about 350 and so also refuses what nobody has thought of yet. And runc
+applies AppArmor or SELinux labels where the host has them, which this
+machine does not.
 
 ## What the kubelet calls
 
