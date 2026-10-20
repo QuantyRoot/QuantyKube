@@ -20,6 +20,7 @@ through and add a new entry, never silently edit history.
 - [ADR-013](#adr-013-the-runtimes-syscalls-sit-behind-one-unsafe-crate) The runtime's syscalls sit behind one unsafe crate
 - [ADR-014](#adr-014-history-lives-in-the-change-log-snapshots-only-briefly) History lives in the change log, snapshots only briefly
 - [ADR-015](#adr-015-two-malloc-arenas-for-the-server) Two malloc arenas for the server
+- [ADR-016](#adr-016-layers-are-unpacked-with-every-path-resolved-inside-the-root) Layers are unpacked with every path resolved inside the root
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -452,4 +453,37 @@ glibc at two arenas through `mallopt` at startup, from the syscall crate
 **The cost:** some contention inside malloc under heavy parallel load,
 which the benchmarks will show if it matters, and a dependency on glibc's
 behavior that a musl build would not share.
+
+## ADR-016: Layers are unpacked with every path resolved inside the root
+
+`src/image.rs` applies OCI image layers to a directory, with QuantyCore's
+streaming gzip and tar readers underneath (its ADR-007). A layer is
+input from a registry, and the classic way to break out of a container
+is a layer that escapes the directory it is unpacked into.
+
+`..` in a path is the easy half, refused outright. The hard half is
+symlinks: a lower layer creates `a -> /etc`, a higher one writes
+`a/passwd`, and an unpacker that lets the kernel follow the link writes
+the host's file. Refusing to write through symlinks is not an option,
+because real images depend on it: on any distribution with a merged
+`/usr`, `/lib` is a symlink and later layers write through it. So every
+parent component is resolved by this code, inside the root: an absolute
+target starts over at the root, `..` stops at it, and more than 40 links
+is an error, the kernel's own limit. Only the last component is created
+by a syscall, never followed. A test builds exactly that attack with GNU
+tar and fails if a single file lands outside; it was shown to fail when
+resolution was handed back to the kernel.
+
+Whiteouts follow the OCI image spec: `.wh.name` removes `name` from the
+layers below, and `.wh..wh..opq` empties a directory of what lower
+layers put there but not of what the same layer already wrote. Device
+nodes are skipped: the runtime builds `/dev` itself.
+
+Checked against real images, alpine, busybox and nginx with eight
+layers, all fetched with verified digests: the unpacked alpine is
+identical, file for file, to what GNU tar unpacks, and all three run in
+`quantykube sandbox`.
+
+**The cost:** a lookup per path component per entry, and modification
+times are set on files but not on directories, which no runtime reads.
 

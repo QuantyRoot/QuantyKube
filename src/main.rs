@@ -9,29 +9,30 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:
-  quantykube serve   --data <file> --socket <path> [--retain <duration>]
-                     [--snapshots <duration>]
+  quantykube serve   --data <file> --socket <path>
+                     [--retain <duration>] [--snapshots <duration>]
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
-
---retain keeps history, 1h by default. --snapshots keeps QuantyDB's
-snapshots, 1m by default; older revisions are rebuilt from the history,
-which costs a little more per read and much less disk (ADR-014).
-
-The socket defaults to $QUANTYKUBE_SOCKET, then /run/quantykube.sock.
-Linked or copied as kubectl-quanty on the PATH, this is also the kubectl
-plugin `kubectl quanty`, and keys may be given as kind/name or
-kind/namespace/name, such as configmap/default/important.
+  quantykube unpack  --to <dir> <layer.tar.gz>...
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly] -- <command>...
 
-sandbox starts one command in its own namespaces with <dir> as its root,
-waits for it and exits with its status. It is the first piece of the node
-runtime (docs/RUNTIME.md), here to be measured, not used.
+serve is the store. --retain keeps history, 1h by default; --snapshots
+keeps QuantyDB snapshots, 1m by default, and older revisions are rebuilt
+from the history (ADR-014). Durations look like 90s, 15m, 2h or 7d.
 
-Durations look like 90s, 15m, 2h or 7d. get writes the stored value as it
-was to stdout. restore writes it back, or deletes the key if it did not
-exist then, as a new revision that every watch sees.";
+history, get and restore read that history through the server's socket,
+$QUANTYKUBE_SOCKET or /run/quantykube.sock unless --socket says otherwise.
+get writes a value as it was to stdout; restore writes it back, or deletes
+the key if it did not exist then, as a new revision every watch sees.
+Linked or copied as kubectl-quanty on the PATH, this is also the kubectl
+plugin `kubectl quanty`, and keys may then be given as kind/namespace/name,
+such as configmap/default/important.
+
+unpack and sandbox are the first pieces of the node runtime
+(docs/RUNTIME.md), here to be measured, not used: unpack applies image
+layers in order, whiteouts included; sandbox runs one command in its own
+namespaces with <dir> as its root and exits with its status.";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +48,7 @@ fn main() {
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("sandbox") => sandbox(&args[1..]),
+        Some("unpack") => unpack(&args[1..]),
         Some("--version") => {
             println!("quantykube {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -113,6 +115,39 @@ fn registry_key(a: &str) -> String {
     format!("/registry/{plural}/{rest}")
 }
 
+fn unpack(args: &[String]) -> Result<(), String> {
+    let to = PathBuf::from(required(args, "--to")?);
+    std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let mut skip = false;
+    let mut total = quantykube::image::Stats::default();
+    let started = std::time::Instant::now();
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a.starts_with("--") {
+            skip = true;
+            continue;
+        }
+        let f = std::fs::File::open(a).map_err(|e| format!("{a}: {e}"))?;
+        let s = quantykube::image::unpack_layer(std::io::BufReader::new(f), &to)
+            .map_err(|e| format!("{a}: {e}"))?;
+        total.entries += s.entries;
+        total.bytes += s.bytes;
+        total.whiteouts += s.whiteouts;
+        total.skipped += s.skipped;
+    }
+    eprintln!(
+        "quantykube: {} entries, {} bytes, {} whiteouts, {} device nodes skipped, {:.0} ms",
+        total.entries,
+        total.bytes,
+        total.whiteouts,
+        total.skipped,
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
 fn sandbox(args: &[String]) -> Result<(), String> {
     let split = args
         .iter()
@@ -121,8 +156,32 @@ fn sandbox(args: &[String]) -> Result<(), String> {
     let (opts, cmd) = (&args[..split], &args[split + 1..]);
     let root = required(opts, "--rootfs")?;
     let root = std::fs::canonicalize(root).map_err(|e| format!("{root}: {e}"))?;
-    let argv: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
-    let env: [&[u8]; 1] = [b"PATH=/usr/local/bin:/usr/bin:/bin"];
+    // execve does not search PATH, and the search must look in the image,
+    // not on this machine
+    let program = match cmd.first() {
+        Some(c) if !c.contains('/') => [
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+        ]
+        .iter()
+        .map(|d| format!("{d}/{c}"))
+        .find(|p| std::fs::symlink_metadata(root.join(&p[1..])).is_ok())
+        .unwrap_or_else(|| c.clone()),
+        Some(c) => c.clone(),
+        None => return Err(format!("missing command\n{USAGE}")),
+    };
+    let mut argv: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+    argv[0] = program.as_bytes();
+    // the PATH Docker and containerd use when the image config sets none
+    let env: [&[u8]; 1] = [b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+    // images need not ship the directories the runtime mounts over
+    for dir in ["proc", "dev", "sys", "tmp"] {
+        let _ = std::fs::create_dir(root.join(dir));
+    }
     let mut spawn = quantykube_sys::Spawn::new(root.as_os_str().as_encoded_bytes(), &argv, &env)
         .map_err(|e| e.to_string())?
         .readonly(opts.iter().any(|a| a == "--readonly"));
