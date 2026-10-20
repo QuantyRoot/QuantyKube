@@ -50,6 +50,8 @@ struct Sim {
     /// How far each node has applied since it last started.
     applied_to: Vec<u64>,
     pending: Vec<(usize, u64, u64, Vec<u8>)>,
+    /// Commands a follower passed on, by the node that took them.
+    forwarded: BTreeMap<Vec<u8>, usize>,
     acked: Vec<(u64, u64, Vec<u8>)>,
     next_value: u64,
     bug: Bug,
@@ -95,6 +97,7 @@ impl Sim {
             applied: BTreeMap::new(),
             applied_to: vec![0; n],
             pending: Vec::new(),
+            forwarded: BTreeMap::new(),
             acked: Vec::new(),
             next_value: 0,
             bug,
@@ -283,6 +286,10 @@ impl Sim {
                     self.applied.insert(e.index, (e.term, e.data.clone()));
                 }
             }
+            if self.forwarded.get(&e.data) == Some(&i) {
+                self.forwarded.remove(&e.data);
+                self.acked.push((e.index, e.term, e.data.clone()));
+            }
             if let Some(k) = self.pending.iter().position(|p| p.0 == i && p.1 == e.index) {
                 let (_, index, term, data) = self.pending.remove(k);
                 if term == e.term && data == e.data {
@@ -311,6 +318,7 @@ impl Sim {
         self.nodes[i] = None;
         self.unsynced[i] = None;
         self.pending.retain(|p| p.0 != i);
+        self.forwarded.retain(|_, n| *n != i);
     }
 
     fn step(&mut self, propose: bool, faults: bool) -> Result<(), String> {
@@ -448,8 +456,10 @@ impl Sim {
                 })
                 .collect();
             let i = match leaders.len() {
-                0 => (self.random() % n as u64) as usize,
-                k => leaders[(self.random() % k as u64) as usize],
+                k if k > 0 && !self.random().is_multiple_of(3) => {
+                    leaders[(self.random() % k as u64) as usize]
+                }
+                _ => (self.random() % n as u64) as usize,
             };
             self.next_value += 1;
             let data = self.next_value.to_be_bytes().to_vec();
@@ -457,8 +467,11 @@ impl Sim {
                 .as_mut()
                 .filter(|_| self.paused_until[i] <= now)
             {
-                if let Some((index, term)) = node.propose(data.clone()) {
-                    self.pending.push((i, index, term, data));
+                match node.propose(data.clone()) {
+                    Some((index, term)) => self.pending.push((i, index, term, data)),
+                    None => {
+                        self.forwarded.insert(data, i);
+                    }
                 }
             }
             self.ready(i)?;

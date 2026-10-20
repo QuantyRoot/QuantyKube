@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod codec;
 #[cfg(test)]
 mod sim;
 
@@ -83,6 +84,11 @@ pub enum Body {
     Snapshot {
         index: u64,
         term: u64,
+    },
+    /// A command a follower received, for its leader to append. The
+    /// follower learns of it by applying it like any other entry.
+    Propose {
+        data: Vec<u8>,
     },
 }
 
@@ -603,13 +609,22 @@ impl Node {
 
     /// Appends `data` if this node leads, and returns the index and term
     /// it was given; it is committed once an entry with that index and
-    /// term is in `committed`, and lost if another one is.
+    /// term is in `committed`, and lost if another one is. A follower
+    /// passes it to its leader and returns None; the host recognizes the
+    /// command when it applies it, and gives up on it after a while.
     pub fn propose(&mut self, data: Vec<u8>) -> Option<(u64, u64)> {
-        if self.role != Role::Leader {
-            return None;
+        match (self.role, self.leader) {
+            (Role::Leader, _) => {
+                let i = self.append(data);
+                Some((i, self.term))
+            }
+            (_, Some(leader)) => {
+                let term = self.term;
+                self.send(leader, term, Body::Propose { data });
+                None
+            }
+            _ => None,
         }
-        let i = self.append(data);
-        Some((i, self.term))
     }
 
     fn replicate(&mut self, to: NodeId) {
@@ -790,6 +805,11 @@ impl Node {
                 self.leader = Some(m.from);
                 self.reset_timeout();
                 self.install(m.from, index, term);
+            }
+            Body::Propose { data } => {
+                if self.role == Role::Leader {
+                    self.append(data);
+                }
             }
             Body::ReadIndex { req } => {
                 if self.role == Role::Leader {
