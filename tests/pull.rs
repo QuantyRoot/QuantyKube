@@ -180,6 +180,16 @@ fn an_image_is_pulled_and_imported() {
     let err = rt.import(&base.join("layout2"), &image).unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
 
+    // a blob longer than the manifest says is cut off, not stored
+    let mut long = layer.clone();
+    long.extend_from_slice(&[0; 4096]);
+    routes.lock().unwrap().insert(
+        format!("/v2/test/box/blobs/{}", digest(&layer)),
+        ("application/octet-stream".into(), long),
+    );
+    let err = registry::pull(&image, &base.join("long"), &opts, Some(&creds)).unwrap_err();
+    assert!(err.to_string().contains("were named"), "{err}");
+
     // and so is a manifest other than the one the index names
     routes.lock().unwrap().insert(
         format!("/v2/test/box/manifests/{}", digest(manifest.as_bytes())),

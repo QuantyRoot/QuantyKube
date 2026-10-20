@@ -354,20 +354,23 @@ pub fn pull(
                 .to_string();
             continue;
         }
-        let mut digests: Vec<String> = Vec::new();
-        if let Some(d) = v.pointer("/config/digest").and_then(Value::as_str) {
-            digests.push(d.to_string());
+        // the manifest is verified by now, so its sizes bound what a
+        // registry can make this write to disk
+        let mut blobs_wanted: Vec<(String, u64)> = Vec::new();
+        let descriptors = v.get("config").into_iter().chain(
+            v.get("layers")
+                .and_then(Value::as_array)
+                .unwrap_or_default(),
+        );
+        for desc in descriptors {
+            let d = desc.get("digest").and_then(Value::as_str).unwrap_or("");
+            let size = desc
+                .get("size")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid(format!("{d} without a size")))?;
+            blobs_wanted.push((d.to_string(), size));
         }
-        for l in v
-            .get("layers")
-            .and_then(Value::as_array)
-            .unwrap_or_default()
-        {
-            if let Some(d) = l.get("digest").and_then(Value::as_str) {
-                digests.push(d.to_string());
-            }
-        }
-        for d in digests {
+        for (d, size) in blobs_wanted {
             let hexd = d
                 .strip_prefix("sha256:")
                 .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -376,7 +379,10 @@ pub fn pull(
             let url = at(&base, format!("/v2/{}/blobs/{d}", r.repository));
             client.get(url, None, &mut |rd| {
                 let mut f = fs::File::create(&path)?;
-                io::copy(rd, &mut f)?;
+                let n = io::copy(&mut rd.take(size + 1), &mut f)?;
+                if n != size {
+                    return Err(invalid(format!("{d}: {n} bytes where {size} were named")));
+                }
                 f.sync_all()
             })?;
         }
