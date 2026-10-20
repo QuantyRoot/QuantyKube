@@ -37,6 +37,7 @@ through and add a new entry, never silently edit history.
 - [ADR-030](#adr-030-a-failed-commit-stops-the-store) A failed commit stops the store
 - [ADR-031](#adr-031-over-a-network-the-store-speaks-tls-and-wants-a-client-certificate) Over a network the store speaks TLS and wants a client certificate
 - [ADR-032](#adr-032-raft-is-a-state-machine-without-io-tested-by-a-simulator-that-finds-planted-bugs) Raft is a state machine without I/O, tested by a simulator that finds planted bugs
+- [ADR-033](#adr-033-store-nodes-talk-over-tls-in-frames-not-grpc-with-certificates-from-a-peer-ca) Store nodes talk over TLS in frames, not gRPC, with certificates from a peer CA
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1021,3 +1022,35 @@ when the cluster starts, so a node is replaced by restarting all of
 them with the new list; a leader sends the next batch only once the
 last is acknowledged, so a follower far behind catches up one round
 trip per batch.
+
+## ADR-033: Store nodes talk over TLS in frames, not gRPC, with certificates from a peer CA
+
+Raft messages between store nodes go over one TLS connection to each
+peer, as protobuf messages each prefixed with its length
+(`src/raft/transport.rs`), on a port of their own. Both ends show a
+certificate, and the peers' certificates come from a CA of their own,
+the peer CA, as etcd separates its peer certificates from its client
+certificates.
+
+gRPC was the obvious choice and was rejected for now: QuantyCore's
+gRPC client makes one unary call per connection, and Raft wants a
+stream that stays open with messages flowing both ways. Frames on a
+TLS connection are a few dozen lines and give exactly that. If
+QuantyCore gets a streaming client, the frames can become a gRPC
+stream without the protocol noticing.
+
+A sender drops what is queued for a peer while the peer cannot be
+reached, and a full queue drops too: Raft sends again, and a stale
+message reaching a peer that came back is worse than none.
+
+A follower that gets a write from a client passes the command to its
+leader inside Raft, as etcd does, and answers the client when it has
+applied the command itself; a node answers reads after a ReadIndex
+from its leader. Every node applies the same commands in the same
+order, so every node computes the same answer.
+
+**The cost:** a separate peer CA is one more thing to set up, and a
+client certificate from it is a key to the cluster's log, not only to
+its data. Anyone with a client certificate from the client CA must not
+also hold one from the peer CA. Using one CA for both, which small
+setups will want, makes every etcd client able to speak Raft.

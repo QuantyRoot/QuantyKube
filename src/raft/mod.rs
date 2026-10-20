@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod codec;
 #[cfg(test)]
 mod sim;
+pub mod transport;
 
 pub type NodeId = u64;
 
