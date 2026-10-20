@@ -49,12 +49,17 @@ Without all of these there is no demonstration.
    single node; only the workers are many, and the talk says so.
 10. `etcdctl get`, `put` and `watch` work against QuantyKube for the keys
     the API server writes, for showing the raw store on stage.
+11. Added on 20 October, once the runtime ran a k3s node in CI: in the
+    cluster of item 9, one worker runs its pods on `quantykube runtime`
+    and the other on containerd, the same deployment on both, and pod
+    start time and memory per node are compared there, on cgroup v2
+    (BENCHMARKS.md has the first numbers and why they are not final).
 
 ## Not part of this date
 
-TLS, more than one store node, Raft (ADR-008), any code of the node
-runtime (ADR-005; the talk shows its design and the measurements from
-item 8), installing into an existing cluster with one command,
+TLS, more than one store node, Raft (ADR-008), the parts of the node
+runtime still missing (docs/RUNTIME.md; pulls over HTTPS need TLS),
+installing into an existing cluster with one command,
 authentication and authorization on the etcd API, and any RPC the API
 server does not call.
 
