@@ -50,6 +50,7 @@ pub struct PodSpec {
     pub cgroup_parent: String,
     /// The pod's `/etc/resolv.conf`; the image's own is kept if empty.
     pub resolv_conf: String,
+    pub ports: Vec<cni::Port>,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
 }
@@ -369,7 +370,8 @@ impl Runtime {
             if let (Some(cni), Ok(text)) = (&self.cni, fs::read_to_string(dir.join("network.json")))
             {
                 let result = json::parse(&text).ok();
-                let _ = cni.del(&id, &dir.join("ns").join("net"), result.as_ref());
+                let ports = read_ports(&dir);
+                let _ = cni.del(&id, &dir.join("ns").join("net"), result.as_ref(), &ports);
             }
             let _ = sys::release_namespaces(&dir.join("ns"));
             let _ = fs::remove_dir_all(&dir);
@@ -543,10 +545,10 @@ impl Runtime {
         };
         sys::hold_namespaces(&dir.join("ns"), hostname.as_bytes())?;
         let network = match &self.cni {
-            Some(cni) => match cni.add(&id, &dir.join("ns").join("net")) {
+            Some(cni) => match cni.add(&id, &dir.join("ns").join("net"), &spec.ports) {
                 Ok(result) => Some(result),
                 Err(e) => {
-                    let _ = cni.del(&id, &dir.join("ns").join("net"), None);
+                    let _ = cni.del(&id, &dir.join("ns").join("net"), None, &spec.ports);
                     let _ = sys::release_namespaces(&dir.join("ns"));
                     let _ = fs::remove_dir_all(&dir);
                     return Err(e.into());
@@ -562,6 +564,17 @@ impl Runtime {
         }
         if let Some(result) = &network {
             fs::write(dir.join("network.json"), result.to_string())?;
+            let ports: Vec<String> = spec
+                .ports
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{} {} {} {}",
+                        p.protocol, p.container_port, p.host_port, p.host_ip
+                    )
+                })
+                .collect();
+            fs::write(dir.join("ports"), ports.join("\n"))?;
         }
         if !spec.log_directory.is_empty() {
             fs::create_dir_all(&spec.log_directory)?;
@@ -609,7 +622,7 @@ impl Runtime {
         let ns = self.dir.join("pods").join(id).join("ns");
         if pod.state == PodState::Ready {
             if let Some(cni) = &self.cni {
-                cni.del(id, &ns.join("net"), pod.network.as_ref())?;
+                cni.del(id, &ns.join("net"), pod.network.as_ref(), &pod.spec.ports)?;
             }
         }
         sys::release_namespaces(&ns)?;
@@ -1047,6 +1060,23 @@ impl Runtime {
         self.containers.lock().unwrap().remove(id);
         Ok(())
     }
+}
+
+/// The port mappings a pod was set up with, for taking it down again.
+fn read_ports(pod_dir: &Path) -> Vec<cni::Port> {
+    fs::read_to_string(pod_dir.join("ports"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            Some(cni::Port {
+                protocol: f.first()?.to_string(),
+                container_port: f.get(1)?.parse().ok()?,
+                host_port: f.get(2)?.parse().ok()?,
+                host_ip: f.get(3).unwrap_or(&"").to_string(),
+            })
+        })
+        .collect()
 }
 
 /// When the process started, in clock ticks since boot: with the pid, it

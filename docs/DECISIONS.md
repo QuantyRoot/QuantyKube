@@ -651,8 +651,9 @@ how the kubelet learns that the network add-on has been installed.
 
 **The cost:** the configuration is read once at start, where containerd
 watches the directory; a network installed later needs a restart of the
-runtime. CNI's CHECK and GC commands, and plugin capabilities such as
-port mappings and bandwidth, are not passed yet.
+runtime. CNI's CHECK and GC commands are not run, and of the plugin
+capabilities only port mappings are passed, to plugins such as
+`portmap` that declare them, which is how a pod's `hostPort` works.
 
 ## ADR-023: Users resolve inside the image, and non-root means no capabilities
 

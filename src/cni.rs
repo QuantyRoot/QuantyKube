@@ -8,6 +8,34 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// A host port forwarded to the pod, for plugins that declare the
+/// `portMappings` capability, such as `portmap`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Port {
+    pub protocol: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub host_ip: String,
+}
+
+fn ports_json(ports: &[Port]) -> Value {
+    Value::Array(
+        ports
+            .iter()
+            .map(|p| {
+                let mut o = Object::default();
+                o.insert("hostPort", Value::from(p.host_port as u64));
+                o.insert("containerPort", Value::from(p.container_port as u64));
+                o.insert("protocol", Value::from(p.protocol.as_str()));
+                if !p.host_ip.is_empty() {
+                    o.insert("hostIP", Value::from(p.host_ip.as_str()));
+                }
+                Value::Object(o)
+            })
+            .collect(),
+    )
+}
+
 pub struct Cni {
     name: String,
     version: String,
@@ -64,20 +92,26 @@ impl Cni {
     }
 
     /// Attaches the pod and returns the last plugin's result.
-    pub fn add(&self, id: &str, netns: &Path) -> io::Result<Value> {
+    pub fn add(&self, id: &str, netns: &Path, ports: &[Port]) -> io::Result<Value> {
         let mut prev: Option<Value> = None;
         for p in &self.plugins {
-            prev = Some(self.exec("ADD", p, id, netns, prev.as_ref())?);
+            prev = Some(self.exec("ADD", p, id, netns, prev.as_ref(), ports)?);
         }
         prev.ok_or_else(|| invalid("no plugins".into()))
     }
 
     /// Detaches the pod, plugins in reverse order. Each plugin runs even
     /// if one before it failed; the first error is returned.
-    pub fn del(&self, id: &str, netns: &Path, result: Option<&Value>) -> io::Result<()> {
+    pub fn del(
+        &self,
+        id: &str,
+        netns: &Path,
+        result: Option<&Value>,
+        ports: &[Port],
+    ) -> io::Result<()> {
         let mut first = Ok(());
         for p in self.plugins.iter().rev() {
-            if let Err(e) = self.exec("DEL", p, id, netns, result) {
+            if let Err(e) = self.exec("DEL", p, id, netns, result, ports) {
                 if first.is_ok() {
                     first = Err(e);
                 }
@@ -93,6 +127,7 @@ impl Cni {
         id: &str,
         netns: &Path,
         prev: Option<&Value>,
+        ports: &[Port],
     ) -> io::Result<Value> {
         let kind = plugin
             .get("type")
@@ -102,6 +137,16 @@ impl Cni {
         let mut conf = plugin.clone();
         conf.insert("name", Value::from(self.name.as_str()));
         conf.insert("cniVersion", Value::from(self.version.as_str()));
+        let wants_ports = plugin
+            .get("capabilities")
+            .and_then(|c| c.get("portMappings"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if wants_ports && !ports.is_empty() {
+            let mut rc = Object::default();
+            rc.insert("portMappings", ports_json(ports));
+            conf.insert("runtimeConfig", Value::Object(rc));
+        }
         if let Some(prev) = prev {
             conf.insert("prevResult", prev.clone());
         }

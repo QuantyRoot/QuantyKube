@@ -30,8 +30,8 @@ written before most of the code.
   joins a running container (ADR-021), pods get their network from CNI
   plugins (ADR-022), and containers run as the user asked for
   (ADR-023). What the kubelet needs beyond that, in order: HTTPS
-  registries (TLS), registry credentials, streaming exec, port
-  mappings, pods that survive a runtime restart.
+  registries (TLS), streaming exec, pods that survive a runtime
+  restart.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the

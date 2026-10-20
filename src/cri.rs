@@ -156,9 +156,34 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
         }
         out
     });
+    let mut ports = Vec::new();
+    for p in config.port_mappings.iter().filter(|p| p.host_port > 0) {
+        let port = |v: i32| {
+            u16::try_from(v)
+                .map_err(|_| Status::new(code::INVALID_ARGUMENT, format!("bad port {v}")))
+        };
+        ports.push(crate::cni::Port {
+            protocol: match p.protocol {
+                cripb::Protocol::Tcp => "tcp",
+                cripb::Protocol::Udp => "udp",
+                cripb::Protocol::Sctp => "sctp",
+                cripb::Protocol::Other(n) => {
+                    return Err(Status::new(
+                        code::INVALID_ARGUMENT,
+                        format!("unknown protocol {n}"),
+                    ))
+                }
+            }
+            .into(),
+            container_port: port(p.container_port)?,
+            host_port: port(p.host_port)?,
+            host_ip: p.host_ip.clone(),
+        });
+    }
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
         cgroup_parent,
+        ports,
         resolv_conf: resolv_conf.unwrap_or_default(),
         name: meta.name,
         namespace: meta.namespace,

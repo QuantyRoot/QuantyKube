@@ -26,7 +26,8 @@ if [ -n "${CNI_BIN:-}" ]; then
     cat >"$work/net.d/10-test.conflist" <<JSON
 {"cniVersion": "1.0.0", "name": "test", "plugins": [{"type": "bridge",
  "bridge": "qktest0", "isGateway": true, "ipam": {"type": "host-local",
- "ranges": [[{"subnet": "10.88.77.0/24"}]], "dataDir": "$work/ipam"}}]}
+ "ranges": [[{"subnet": "10.88.77.0/24"}]], "dataDir": "$work/ipam"}},
+ {"type": "portmap", "capabilities": {"portMappings": true}}]}
 JSON
 fi
 "$QK" runtime --root "$work/root" --socket "$work/cri.sock" \
@@ -48,11 +49,12 @@ cat >"$work/pod.json" <<JSON
 {"metadata": {"name": "web", "namespace": "default", "uid": "1"},
  "hostname": "web-0", "log_directory": "$work/logs",
  "dns_config": {"servers": ["10.0.0.10"], "searches": ["svc.test"]},
+ "port_mappings": [{"container_port": 8080, "host_port": 18080}],
  "linux": {"security_context": {"namespace_options": {"pid": 1}}}}
 JSON
 cat >"$work/ctr.json" <<'JSON'
 {"metadata": {"name": "hello"}, "image": {"image": "test/busybox:1"},
- "command": ["sh", "-c", "echo $(hostname) $GREETING; echo kept > /data/f; while true; do sleep 1; done"],
+ "command": ["sh", "-c", "echo $(hostname) $GREETING; echo kept > /data/f; httpd -p 8080 -h /etc; while true; do sleep 1; done"],
  "mounts": [{"container_path": "/data", "host_path": "VOLUME"}],
  "envs": [{"key": "GREETING", "value": "hi"}], "log_path": "hello.log"}
 JSON
@@ -76,6 +78,9 @@ if [ -n "${CNI_BIN:-}" ]; then
     ip=$(c inspectp -o go-template --template '{{.status.network.ip}}' "$pod")
     case $ip in 10.88.77.*) ;; *) fail "pod address: $ip" ;; esac
     c exec -s "$ctr" ping -c1 -W2 10.88.77.1 >/dev/null || fail "no route out of the pod"
+    # the portmap plugin got the mapping: it forwards the host port
+    iptables -t nat -S 2>/dev/null | grep -q -- "--dport 18080 -j DNAT --to-destination $ip:8080" ||
+        fail "no forwarding for host port 18080"
 fi
 [ "$(c exec -s "$ctr" cat /etc/hostname /etc/resolv.conf)" = \
     "$(printf 'web-0\nsearch svc.test\nnameserver 10.0.0.10')" ] || fail "pod files"
@@ -91,6 +96,7 @@ c rm "$ctr" >/dev/null && c stopp "$pod" >/dev/null && c rmp "$pod" >/dev/null |
 [ -z "$(c pods -q)" ] || fail "pod left behind"
 if [ -n "${CNI_BIN:-}" ]; then
     ! ls "$work/ipam/test" | grep -q '^10\.' || fail "address not released"
+    ! iptables -t nat -S 2>/dev/null | grep -q -- "--dport 18080" || fail "host port still forwarded"
 fi
 ! grep -q "$work" /proc/self/mounts || fail "mount left behind"
 
