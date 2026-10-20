@@ -84,7 +84,12 @@ spec:
     resources: {limits: {memory: 64Mi, cpu: 100m}}
     livenessProbe:
       exec: {command: [test, -e, /tmp/alive]}
-      periodSeconds: 2
+      periodSeconds: 1
+      failureThreshold: 1
+    # Ready only once an exec through the runtime has succeeded
+    readinessProbe:
+      exec: {command: [test, -e, /tmp/alive]}
+      periodSeconds: 1
   - name: caps
     # pulled by the runtime itself, over HTTPS
     image: mirror.gcr.io/library/busybox:1.36
@@ -95,13 +100,14 @@ spec:
   volumes: [{name: config, configMap: {name: greeting}}]
 YAML
 until_ok "pod running" sh -c "'$K3S' kubectl get pod hello -o jsonpath='{.status.phase}' | grep -qx Running"
+until_ok "pod ready" "$K3S" kubectl wait --for=condition=Ready pod/hello --timeout=5s
 until_ok "pod logs" sh -c "'$K3S' kubectl logs hello -c hello | grep -qx 'hello from a ConfigMap'"
 [ "$(k logs hello -c hello | tail -1)" = 1000 ] || fail "runAsUser: $(k logs hello -c hello)"
 [ "$(k logs hello -c caps)" = "$(printf 'CapEff:\t0000000000000400')" ] ||
     fail "capabilities: $(k logs hello -c caps)"
 ip=$(k get pod hello -o jsonpath='{.status.podIP}')
 case $ip in 10.42.0.*) ;; *) fail "pod address: $ip" ;; esac
-sleep 6
+sleep 4
 [ "$(k get pod hello -o jsonpath='{.status.containerStatuses[?(@.name=="hello")].restartCount}')" = 0 ] ||
     fail "the liveness probe failed"
 # for the record, not a check
