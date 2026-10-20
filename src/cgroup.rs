@@ -15,6 +15,8 @@ pub struct Limits {
     pub cpu_quota: i64,
     pub cpu_shares: i64,
     pub memory: i64,
+    /// Memory and swap together, as cgroup v1 counted them.
+    pub memory_swap: i64,
     pub cpuset_cpus: String,
     pub cpuset_mems: String,
     /// Page size as the kubelet names it, such as "2MB", and the limit.
@@ -92,6 +94,12 @@ pub fn create(dir: &Path, limits: &Limits) -> io::Result<()> {
     }
     if limits.memory > 0 {
         write(dir, "memory.max", &limits.memory.to_string())?;
+    }
+    // without this a memory limit on a host with swap is a limit on
+    // what stays in RAM, and the container swaps instead of being killed
+    if limits.memory_swap > 0 && dir.join("memory.swap.max").exists() {
+        let swap = limits.memory_swap.saturating_sub(limits.memory).max(0);
+        write(dir, "memory.swap.max", &swap.to_string())?;
     }
     if limits.cpu_quota > 0 {
         let period = if limits.cpu_period > 0 {

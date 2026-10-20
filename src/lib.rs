@@ -2,6 +2,7 @@
 //! API server uses, on the QuantyDB engine.
 
 pub mod cgroup;
+pub mod cni;
 pub mod cri;
 pub mod cripb;
 pub mod etcd;

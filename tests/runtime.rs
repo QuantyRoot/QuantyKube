@@ -131,7 +131,7 @@ fn a_pod_from_import_to_removal() {
 
     let mut first = spec(
         "first",
-        &["echo out; echo err >&2; hostname; echo $FOO $FROM_IMAGE; pwd; ls -l /proc/self/ns/net"],
+        &["echo out; echo err >&2; hostname; echo $FOO $FROM_IMAGE; pwd; ls -l /proc/self/ns/net; cat /sys/class/net/lo/flags"],
     );
     first.env = vec![("FOO".into(), "bar".into())];
     first.working_dir = "/etc".into();
@@ -168,6 +168,7 @@ fn a_pod_from_import_to_removal() {
     assert!(text.contains(&("stdout", "web-0")));
     assert!(text.contains(&("stdout", "bar yes")));
     assert!(text.contains(&("stdout", "/etc")));
+    assert!(text.contains(&("stdout", "0x9")), "lo is up");
     let net = |log: &str| -> String {
         log.lines()
             .find(|l| l.contains("net:["))
@@ -353,6 +354,7 @@ fn limits_hold_and_an_oom_kill_is_reported() {
     );
     c.limits = quantykube::cgroup::Limits {
         memory: 32 << 20,
+        memory_swap: 32 << 20,
         cpu_quota: 50_000,
         cpu_period: 100_000,
         ..Default::default()

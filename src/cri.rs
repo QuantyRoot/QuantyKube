@@ -177,6 +177,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
             cpu_quota: r.cpu_quota,
             cpu_shares: r.cpu_shares,
             memory: r.memory_limit_in_bytes,
+            memory_swap: r.memory_swap_limit_in_bytes,
             cpuset_cpus: r.cpuset_cpus.clone(),
             cpuset_mems: r.cpuset_mems.clone(),
             hugepages: r
@@ -261,14 +262,15 @@ impl Cri {
             status: Some(cripb::RuntimeStatus {
                 conditions: vec![
                     condition("RuntimeReady", true, "", ""),
-                    // no CNI plugins are run yet, so pods have no network
-                    // beyond their own loopback
-                    condition(
-                        "NetworkReady",
-                        false,
-                        "NetworkPluginNotReady",
-                        "CNI is not supported yet",
-                    ),
+                    match self.rt.network() {
+                        Some(_) => condition("NetworkReady", true, "", ""),
+                        None => condition(
+                            "NetworkReady",
+                            false,
+                            "NetworkPluginNotReady",
+                            "no CNI configuration",
+                        ),
+                    },
                 ],
             }),
             runtime_handlers: vec![cripb::RuntimeHandler::default()],
@@ -284,6 +286,10 @@ impl Cri {
                 metadata: Some(pod_metadata(&p.spec)),
                 state: pod_state(p.state),
                 created_at: p.created_ns,
+                network: Some(cripb::PodSandboxNetworkStatus {
+                    ip: p.ip.clone(),
+                    ..Default::default()
+                }),
                 labels: map(&p.spec.labels),
                 annotations: map(&p.spec.annotations),
                 ..Default::default()

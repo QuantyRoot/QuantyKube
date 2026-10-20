@@ -100,7 +100,10 @@ jobs:
           for d in $(grep -o 'sha256:[0-9a-f]\{64\}' "$img/manifest.json"); do
             curl -fsSL -o "$img/blobs/${d#sha256:}" "$reg/blobs/$d"
           done
-      - run: sudo env CRICTL="$RUNNER_TEMP/crictl" IMAGE="$RUNNER_TEMP/busybox" scripts/cri.sh
+          curl -fsSLo cni.tgz https://github.com/containernetworking/plugins/releases/download/v1.8.0/cni-plugins-linux-amd64-v1.8.0.tgz
+          echo "ab3bda535f9d90766cccc90d3dddb5482003dd744d7f22bcf98186bf8eea8be6  cni.tgz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/cni" && tar -xzf cni.tgz -C "$RUNNER_TEMP/cni"
+      - run: sudo env CRICTL="$RUNNER_TEMP/crictl" IMAGE="$RUNNER_TEMP/busybox" CNI_BIN="$RUNNER_TEMP/cni" scripts/cri.sh
 
   msrv:
     name: test on MSRV (1.89)

@@ -26,6 +26,7 @@ through and add a new entry, never silently edit history.
 - [ADR-019](#adr-019-volumes-are-attached-after-the-pivot) Volumes are attached after the pivot
 - [ADR-020](#adr-020-cgroups-follow-the-cgroupfs-driver) cgroups follow the cgroupfs driver
 - [ADR-021](#adr-021-exec-joins-the-container-through-a-second-fork) Exec joins the container through a second fork
+- [ADR-022](#adr-022-pod-networks-come-from-cni-plugins) Pod networks come from CNI plugins
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -620,4 +621,27 @@ read and dropped, so a chatty command can neither block nor fill memory.
 **The cost:** two processes per exec, where runc's `nsenter` uses the
 same two. Streaming exec, attach and port forwarding need an HTTP server
 of their own and are not built.
+
+## ADR-022: Pod networks come from CNI plugins
+
+Every Kubernetes network, Flannel, Calico, Cilium and the rest, is
+installed as a CNI configuration in `/etc/cni/net.d` and plugin binaries
+in `/opt/cni/bin`, and every runtime runs them the same way: the pod's
+network namespace and the command in the environment, the configuration
+on stdin, the result on stdout. This runtime does the same with the
+first configuration by name, adds a pod after creating its namespaces
+and deletes it when the pod stops, in reverse plugin order, with the
+result of the add. A pod whose network cannot be set up is not created.
+
+Each pod's loopback is brought up by the runtime itself when the
+namespace is made, so containers of a pod reach each other on
+`127.0.0.1` with or without a CNI network.
+
+Status reports NetworkReady only once a configuration exists, which is
+how the kubelet learns that the network add-on has been installed.
+
+**The cost:** the configuration is read once at start, where containerd
+watches the directory; a network installed later needs a restart of the
+runtime. CNI's CHECK and GC commands, and plugin capabilities such as
+port mappings and bandwidth, are not passed yet.
 

@@ -40,6 +40,8 @@ extern "C" {
     fn unshare(flags: c_int) -> c_int;
     fn fchdir(fd: c_int) -> c_int;
     fn chroot(path: *const c_char) -> c_int;
+    fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
 const SYS_CLONE: c_long = 56;
@@ -79,6 +81,9 @@ const MS_STRICTATIME: c_ulong = 1 << 24;
 const MNT_DETACH: c_int = 2;
 
 const PR_SET_PDEATHSIG: c_int = 1;
+const SIOCGIFFLAGS: c_ulong = 0x8913;
+const SIOCSIFFLAGS: c_ulong = 0x8914;
+const IFF_UP: i16 = 1;
 const PR_SET_SECCOMP: c_int = 22;
 const SECCOMP_MODE_FILTER: c_ulong = 2;
 const PR_CAPBSET_DROP: c_int = 24;
@@ -1033,6 +1038,26 @@ impl Spawn {
 /// process, as files `net`, `ipc` and `uts` in `dir`: a short lived child
 /// makes them, the parent bind mounts them, the child exits. This is a
 /// pod sandbox without the pause container (docs/RUNTIME.md).
+/// Brings up `lo` in the caller's network namespace, which a new one
+/// starts without: a pod's containers talk to each other over it.
+unsafe fn loopback_up() -> bool {
+    // struct ifreq: the name, then the flags as a short
+    let mut req = [0u8; 40];
+    req[..2].copy_from_slice(b"lo");
+    let fd = socket(2, 2 | O_CLOEXEC, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut ok = ioctl(fd, SIOCGIFFLAGS, req.as_mut_ptr()) == 0;
+    if ok {
+        let flags = i16::from_ne_bytes([req[16], req[17]]) | IFF_UP;
+        req[16..18].copy_from_slice(&flags.to_ne_bytes());
+        ok = ioctl(fd, SIOCSIFFLAGS, req.as_mut_ptr()) == 0;
+    }
+    close(fd);
+    ok
+}
+
 pub fn hold_namespaces(dir: &std::path::Path, hostname: &[u8]) -> io::Result<()> {
     let name = cstr(hostname)?;
     let mut fds = [0 as c_int; 2];
@@ -1046,7 +1071,7 @@ pub fn hold_namespaces(dir: &std::path::Path, hostname: &[u8]) -> io::Result<()>
     let pid = unsafe { syscall(SYS_CLONE, flags, 0usize, 0usize, 0usize, 0usize) };
     if pid == 0 {
         unsafe {
-            let ok = sethostname(name.as_ptr(), name.as_bytes().len()) == 0;
+            let ok = sethostname(name.as_ptr(), name.as_bytes().len()) == 0 && loopback_up();
             let mut b = 0u8;
             read(fds[0], (&mut b as *mut u8).cast(), 1);
             _exit(if ok { 0 } else { 1 });

@@ -7,6 +7,7 @@
 //! also what it does after a node reboot. Persisting state is later work.
 
 use crate::cgroup;
+use crate::cni::{self, Cni};
 use crate::image;
 use quantycore::json::{self, Value};
 use quantykube_sys as sys;
@@ -61,6 +62,9 @@ pub struct Pod {
     pub spec: PodSpec,
     pub state: PodState,
     pub created_ns: i64,
+    /// Empty without a CNI network.
+    pub ip: String,
+    network: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,6 +234,7 @@ pub struct Runtime {
     pods: Mutex<HashMap<String, Pod>>,
     containers: Mutex<HashMap<String, Container>>,
     exited: Condvar,
+    cni: Option<Cni>,
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -259,6 +264,12 @@ fn read_blob(blobs: &Path, digest: &str) -> Result<Vec<u8>> {
 
 impl Runtime {
     pub fn new(dir: &Path) -> Result<Arc<Runtime>> {
+        Runtime::with_network(dir, None)
+    }
+
+    /// Pods get their network from `cni`; without it they have only
+    /// their own loopback.
+    pub fn with_network(dir: &Path, cni: Option<Cni>) -> Result<Arc<Runtime>> {
         for sub in ["images", "pods", "containers"] {
             fs::create_dir_all(dir.join(sub))?;
         }
@@ -268,9 +279,14 @@ impl Runtime {
             pods: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
             exited: Condvar::new(),
+            cni,
         };
         rt.load_images()?;
         Ok(Arc::new(rt))
+    }
+
+    pub fn network(&self) -> Option<&Cni> {
+        self.cni.as_ref()
     }
 
     pub fn dir(&self) -> &Path {
@@ -411,6 +427,18 @@ impl Runtime {
             &spec.hostname
         };
         sys::hold_namespaces(&dir.join("ns"), hostname.as_bytes())?;
+        let network = match &self.cni {
+            Some(cni) => match cni.add(&id, &dir.join("ns").join("net")) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    let _ = cni.del(&id, &dir.join("ns").join("net"), None);
+                    let _ = sys::release_namespaces(&dir.join("ns"));
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(e.into());
+                }
+            },
+            None => None,
+        };
         if !spec.log_directory.is_empty() {
             fs::create_dir_all(&spec.log_directory)?;
         }
@@ -419,6 +447,8 @@ impl Runtime {
             spec,
             state: PodState::Ready,
             created_ns: now_ns(),
+            ip: network.as_ref().and_then(cni::ip).unwrap_or_default(),
+            network,
         };
         self.pods.lock().unwrap().insert(id.clone(), pod);
         Ok(id)
@@ -440,7 +470,7 @@ impl Runtime {
     /// Stops every container of the pod and lets its namespaces go. The
     /// kubelet may call it more than once.
     pub fn stop_pod(&self, id: &str, grace: Duration) -> Result<()> {
-        self.pod(id)?;
+        let pod = self.pod(id)?;
         let members: Vec<String> = self
             .containers
             .lock()
@@ -452,7 +482,13 @@ impl Runtime {
         for c in members {
             self.stop_container(&c, grace)?;
         }
-        sys::release_namespaces(&self.dir.join("pods").join(id).join("ns"))?;
+        let ns = self.dir.join("pods").join(id).join("ns");
+        if pod.state == PodState::Ready {
+            if let Some(cni) = &self.cni {
+                cni.del(id, &ns.join("net"), pod.network.as_ref())?;
+            }
+        }
+        sys::release_namespaces(&ns)?;
         if let Some(p) = self.pods.lock().unwrap().get_mut(id) {
             p.state = PodState::NotReady;
         }

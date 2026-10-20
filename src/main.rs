@@ -18,6 +18,7 @@ const USAGE: &str = "usage:
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
   quantykube runtime --root <dir> --socket <path>
+                     [--cni-conf <dir>] [--cni-bin <dir>]
   quantykube import  --root <dir> <image dir> <reference>
 
 serve is the store. --retain keeps history, 1h by default; --snapshots
@@ -38,7 +39,9 @@ layers in order, whiteouts included; sandbox runs one command in its own
 namespaces with <dir> as its root and exits with its status.
 
 runtime serves the kubelet's Container Runtime Interface on the socket,
-keeping images and container state under --root. It cannot pull yet:
+keeping images and container state under --root. Pods get their network
+from the first CNI configuration in --cni-conf, /etc/cni/net.d by
+default, with plugins from --cni-bin, /opt/cni/bin. It cannot pull yet:
 import puts an image there from a directory holding its manifest.json and
 blobs/, each blob checked against its digest.";
 
@@ -321,7 +324,14 @@ fn private_socket(path: &Path) -> Result<UnixListener, String> {
 fn runtime(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(required(args, "--root")?);
     let socket = PathBuf::from(required(args, "--socket")?);
-    let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
+    let conf = PathBuf::from(value(args, "--cni-conf").unwrap_or("/etc/cni/net.d"));
+    let bin = PathBuf::from(value(args, "--cni-bin").unwrap_or("/opt/cni/bin"));
+    let cni = quantykube::cni::Cni::load(&conf, &bin).map_err(|e| e.to_string())?;
+    match &cni {
+        Some(c) => eprintln!("quantykube: pod network {}", c.name()),
+        None => eprintln!("quantykube: no CNI configuration in {}", conf.display()),
+    }
+    let rt = quantykube::runtime::Runtime::with_network(&root, cni).map_err(|e| e.to_string())?;
     // whoever can connect can run anything as root on the node
     let listener = private_socket(&socket)?;
     eprintln!("quantykube: runtime on unix://{}", socket.display());
