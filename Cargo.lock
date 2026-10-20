@@ -3,5 +3,29 @@
 version = 4
 
 [[package]]
+name = "quantycore"
+version = "0.0.0"
+source = "git+https://github.com/QuantyRoot/QuantyCore?rev=c084f6b15a05256a489d54887c8570e43a639248#c084f6b15a05256a489d54887c8570e43a639248"
+
+[[package]]
+name = "quantydb-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d59d93984a040b5348959a086b9a4e6490ae17c95eca0fcc370d93798f987e"
+dependencies = [
+ "quantydb-sys",
+]
+
+[[package]]
+name = "quantydb-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44357e7a666915c35db6635ed40fbd0fbf3461714db779e4c8a18c69264d4e7b"
+
+[[package]]
 name = "quantykube"
 version = "0.0.0"
+dependencies = [
+ "quantycore",
+ "quantydb-core",
+]

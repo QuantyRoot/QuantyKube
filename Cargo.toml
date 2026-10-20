@@ -10,3 +10,5 @@ publish = false
 
 # Only QuantyRoot crates may appear here. See ADR-003 in docs/DECISIONS.md.
 [dependencies]
+quantycore = { git = "https://github.com/QuantyRoot/QuantyCore", rev = "c084f6b15a05256a489d54887c8570e43a639248" }
+quantydb-core = "0.4.0"

@@ -16,7 +16,9 @@ without clustering. Other etcd clients may call things that do not exist
 here. This is a deliberate choice, recorded in
 [ADR-001](docs/DECISIONS.md), and the same one kine makes.
 
-Nothing is built yet. Everything below is the plan.
+It is early. What is marked built below runs against the real `etcdctl`
+and a real Kubernetes API server in CI (`scripts/e2e.sh`); nothing has run
+in production.
 
 ## The idea
 
@@ -30,9 +32,10 @@ an added feature; it is how the engine reads anything.
 
 | Part | State |
 | --- | --- |
-| etcd v3 subset used by kube-apiserver, Unix socket | planned |
-| Watch | planned |
-| Reading the cluster at a past revision | planned |
+| etcd v3 subset used by kube-apiserver, Unix socket | built |
+| Watch, including replay from a past revision | built |
+| Reading the cluster at a past revision | built, until the API server compacts |
+| Keeping history beyond compaction | planned |
 | TLS (via QuantyCore) | later |
 | Node runtime behind CRI ([ADR-005](docs/DECISIONS.md)) | later |
 | Clustering | not planned for now |
@@ -40,11 +43,15 @@ an added feature; it is how the engine reads anything.
 What the first demonstration has to do is in
 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
 
-## Building
+## Trying it
 
 ```
-cargo test
+cargo build --release
+target/release/quantykube serve --data /var/lib/quantykube/db --socket /run/quantykube.sock
+kube-apiserver --etcd-servers=unix:///run/quantykube.sock ...
 ```
+
+`etcdctl --endpoints=unix:///run/quantykube.sock` works for looking around.
 
 Rust 1.89 or newer.
 
