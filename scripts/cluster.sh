@@ -62,6 +62,7 @@ k() { "$K3S" kubectl "$@"; }
 until_ok "kubeconfig" test -s "$work/kubeconfig"
 until_ok "node ready" sh -c "'$K3S' kubectl get nodes 2>/dev/null | grep -qw Ready"
 
+until_ok "default service account" "$K3S" kubectl get serviceaccount default
 k apply -f - >/dev/null <<'YAML'
 apiVersion: v1
 kind: ConfigMap
