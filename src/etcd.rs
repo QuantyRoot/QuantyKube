@@ -5,9 +5,11 @@ use crate::etcdpb::*;
 use crate::store::{self, Backend, Change, Kind, Record, Tx, View};
 use quantycore::grpc::{code, Responder, Service, Status};
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What `Status` reports. The API server only uses watch progress requests
 /// when the version says the server has them, which 3.6 does.
@@ -23,6 +25,9 @@ pub struct Etcd<B: Backend> {
     hub: Arc<Hub>,
     leases: Mutex<HashMap<i64, Lease>>,
     endpoint: String,
+    /// How often a watch asking for progress notifications gets one;
+    /// shortened by tests.
+    progress_ms: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +140,7 @@ impl<B: Backend> Etcd<B> {
             hub,
             leases: Mutex::new(leases),
             endpoint,
+            progress_ms: AtomicU64::new(PROGRESS_EVERY.as_millis() as u64),
         });
         let weak = Arc::downgrade(&etcd);
         std::thread::spawn(move || {
@@ -502,21 +508,29 @@ impl<B: Backend> Etcd<B> {
             local: HashMap::new(),
             by_hub: HashMap::new(),
             next_local: 0,
-            deferred: Vec::new(),
+            deferred: VecDeque::new(),
+            sent: 0,
         };
+        let every = Duration::from_millis(self.progress_ms.load(Ordering::Relaxed));
+        // on a clock of its own, not on the stream falling silent: a busy
+        // stream must not starve the watches that wait for progress
+        let mut next_progress = Instant::now() + every;
         loop {
-            let item = match w.deferred.pop() {
+            if Instant::now() >= next_progress {
+                next_progress = Instant::now() + every;
+                if !w.periodic_progress(&rx, out) {
+                    break;
+                }
+            }
+            let item = match w.deferred.pop_front() {
                 Some(i) => i,
-                None => match rx.recv_timeout(PROGRESS_EVERY) {
-                    Ok(i) => i,
-                    Err(RecvTimeoutError::Timeout) => {
-                        if !w.periodic_progress(out) {
-                            break;
-                        }
-                        continue;
+                None => {
+                    match rx.recv_timeout(next_progress.saturating_duration_since(Instant::now())) {
+                        Ok(i) => i,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                },
+                }
             };
             let alive = match item {
                 Inbox::Request(r) => match WatchRequest::decode(&r) {
@@ -582,7 +596,10 @@ struct WatchStream<'a, B: Backend> {
     /// a later one, whatever its id.
     by_hub: HashMap<u64, i64>,
     next_local: i64,
-    deferred: Vec<Inbox>,
+    deferred: VecDeque<Inbox>,
+    /// The newest revision this stream has told its client about.
+    /// Nothing it sends later may report an older one.
+    sent: i64,
 }
 
 impl<B: Backend> WatchStream<'_, B> {
@@ -608,32 +625,17 @@ impl<B: Backend> WatchStream<'_, B> {
                     },
                 )
             }
-            Some(WatchRequestUnion::Progress(_)) => {
-                // every event up to `rev` is already queued, because the hub
-                // queues before it advances; deliver them, then report
-                let rev = self.etcd.hub.last_rev();
-                let mut later = Vec::new();
-                while let Ok(item) = rx.try_recv() {
-                    match item {
-                        Inbox::Events(hub_id, r, ev) => {
-                            if !self.deliver(hub_id, r, ev, out) {
-                                return false;
-                            }
-                        }
-                        other => later.push(other),
-                    }
-                }
-                later.reverse();
-                self.deferred.extend(later);
-                self.send(
+            Some(WatchRequestUnion::Progress(_)) => match self.catch_up(rx, out) {
+                Some(rev) => self.send(
                     out,
                     WatchResponse {
                         header: self.etcd.header(rev),
                         watch_id: -1,
                         ..Default::default()
                     },
-                )
-            }
+                ),
+                None => false,
+            },
             None => true,
         }
     }
@@ -698,6 +700,7 @@ impl<B: Backend> WatchStream<'_, B> {
             .hub
             .add(filter.clone(), c.start_revision, self.tx.clone());
         self.by_hub.insert(hub_id, id);
+        self.sent = self.sent.max(head);
         self.local.insert(
             id,
             Sub {
@@ -759,10 +762,37 @@ impl<B: Backend> WatchStream<'_, B> {
             )
     }
 
-    fn deliver(&self, hub_id: u64, rev: i64, events: Vec<Event>, out: &mut dyn WatchOut) -> bool {
+    /// Delivers every event already queued, and returns the revision up
+    /// to which the client now has everything, or None if it is gone.
+    fn catch_up(&mut self, rx: &Receiver<Inbox>, out: &mut dyn WatchOut) -> Option<i64> {
+        // every event up to `rev` is queued by now, since the hub queues
+        // before it advances; events after it may come along, and then the
+        // revision reported must not fall behind them
+        let rev = self.etcd.hub.last_rev();
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                Inbox::Events(hub_id, r, ev) => {
+                    if !self.deliver(hub_id, r, ev, out) {
+                        return None;
+                    }
+                }
+                other => self.deferred.push_back(other),
+            }
+        }
+        Some(rev.max(self.sent))
+    }
+
+    fn deliver(
+        &mut self,
+        hub_id: u64,
+        rev: i64,
+        events: Vec<Event>,
+        out: &mut dyn WatchOut,
+    ) -> bool {
         let Some(&id) = self.by_hub.get(&hub_id) else {
             return true;
         };
+        self.sent = self.sent.max(rev);
         self.send(
             out,
             WatchResponse {
@@ -774,23 +804,29 @@ impl<B: Backend> WatchStream<'_, B> {
         )
     }
 
-    fn periodic_progress(&self, out: &mut dyn WatchOut) -> bool {
-        let rev = self.etcd.hub.last_rev();
-        for (id, sub) in &self.local {
-            if sub.progress_notify
-                && !self.send(
-                    out,
-                    WatchResponse {
-                        header: self.etcd.header(rev),
-                        watch_id: *id,
-                        ..Default::default()
-                    },
-                )
-            {
-                return false;
-            }
+    fn periodic_progress(&mut self, rx: &Receiver<Inbox>, out: &mut dyn WatchOut) -> bool {
+        if !self.local.values().any(|s| s.progress_notify) {
+            return true;
         }
-        true
+        let Some(rev) = self.catch_up(rx, out) else {
+            return false;
+        };
+        let ids: Vec<i64> = self
+            .local
+            .iter()
+            .filter(|(_, s)| s.progress_notify)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter().all(|id| {
+            self.send(
+                out,
+                WatchResponse {
+                    header: self.etcd.header(rev),
+                    watch_id: id,
+                    ..Default::default()
+                },
+            )
+        })
     }
 }
 
@@ -1541,5 +1577,72 @@ mod tests {
             .map(|e| e.kv.as_ref().unwrap().key.as_slice())
             .collect();
         assert_eq!(keys, [b"/b".as_slice()]);
+    }
+
+    // the API server turns progress into bookmarks and moves its cache
+    // to their revision unconditionally: they must come while a stream
+    // is busy, and never report less than what the stream already sent
+    #[test]
+    fn progress_comes_on_a_busy_stream_and_never_goes_back() {
+        let e = etcd();
+        e.progress_ms.store(50, Ordering::Relaxed);
+        let w = WatchClient::open(&e);
+        w.send(WatchRequestUnion::Create(WatchCreateRequest {
+            key: "/quiet".into(),
+            progress_notify: true,
+            ..Default::default()
+        }));
+        w.create("/busy", "", 0);
+        w.until("both created", |g| {
+            g.iter().filter(|r| r.created).count() == 2
+        });
+        let until = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < until {
+            put(&e, "/busy", "v", 0);
+            w.send(WatchRequestUnion::Progress(WatchProgressRequest {}));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // counted before the stream falls silent
+        let got = w.got.lock().unwrap().clone();
+        let quiet = got
+            .iter()
+            .filter(|r| r.watch_id == 0 && !r.created && r.events.is_empty())
+            .count();
+        assert!(quiet >= 2, "{quiet} progress notifications while busy");
+        let revs: Vec<i64> = got
+            .iter()
+            .map(|r| r.header.as_ref().unwrap().revision)
+            .collect();
+        assert!(revs.windows(2).all(|p| p[0] <= p[1]), "{revs:?}");
+    }
+
+    // a write published between reading the hub's revision and draining
+    // the queue: its events go out, so progress must report it
+    #[test]
+    fn progress_covers_events_delivered_while_catching_up() {
+        let e = etcd();
+        let (tx, rx) = mpsc::channel();
+        let mut w = WatchStream {
+            etcd: &e,
+            tx: tx.clone(),
+            local: HashMap::new(),
+            by_hub: HashMap::new(),
+            next_local: 0,
+            deferred: VecDeque::new(),
+            sent: 0,
+        };
+        let head = e.hub.last_rev();
+        w.local.insert(
+            0,
+            Sub {
+                hub_id: 7,
+                progress_notify: false,
+            },
+        );
+        w.by_hub.insert(7, 0);
+        // queued, as the hub does, before it advances its revision
+        tx.send(Inbox::Events(7, head + 1, Vec::new())).unwrap();
+        let mut out = Collect(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(w.catch_up(&rx, &mut out), Some(head + 1));
     }
 }
