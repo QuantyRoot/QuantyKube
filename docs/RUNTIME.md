@@ -35,13 +35,17 @@ written before most of the code.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
-development machine, two runs of 50 starts of `/bin/true` each, quiet
-machine, runc v1.3.2 with the configuration `runc spec` writes:
+development machine, five runs of 50 starts of `/bin/true` each, runc
+v1.3.2 with the configuration `runc spec` writes, the sandbox with
+Docker's seccomp allowlist:
 
 | | median | p90 |
 | --- | --- | --- |
-| `quantykube sandbox` | 3.6 to 3.7 ms | 5.0 to 5.1 ms |
-| `runc run` | 20.4 to 21.0 ms | 28.5 to 30.2 ms |
+| `quantykube sandbox` | 3.6 to 4.2 ms | 4.2 to 5.2 ms |
+| `runc run` | 21.3 to 24.2 ms | 28.2 to 32.7 ms |
+
+Over 300 alternating starts, the allowlist and the denylist it replaced
+measured the same: 3.73 against 3.74 ms median.
 
 What the gap is made of, as far as is known: runc is a Go binary that
 starts, re-executes itself to set up namespaces in C, and talks to its
