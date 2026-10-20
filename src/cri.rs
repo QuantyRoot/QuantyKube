@@ -1,6 +1,7 @@
 //! The kubelet's two gRPC services, RuntimeService and ImageService, on
 //! top of [`Runtime`].
 
+use crate::cgroup;
 use crate::cripb;
 use crate::runtime::{self, ContainerSpec, PodSpec, Runtime};
 use quantycore::grpc::{code, Responder, Service, Status};
@@ -123,8 +124,14 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
             return Err(unsupported("a pod in the host's namespaces"));
         }
     }
+    let cgroup_parent = config
+        .linux
+        .as_ref()
+        .map(|l| l.cgroup_parent.clone())
+        .unwrap_or_default();
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
+        cgroup_parent,
         name: meta.name,
         namespace: meta.namespace,
         uid: meta.uid,
@@ -158,6 +165,25 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         });
     }
     let mut readonly_rootfs = false;
+    let mut limits = cgroup::Limits::default();
+    let mut oom_score_adj = 0;
+    if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
+        limits = cgroup::Limits {
+            cpu_period: r.cpu_period,
+            cpu_quota: r.cpu_quota,
+            cpu_shares: r.cpu_shares,
+            memory: r.memory_limit_in_bytes,
+            cpuset_cpus: r.cpuset_cpus.clone(),
+            cpuset_mems: r.cpuset_mems.clone(),
+            hugepages: r
+                .hugepage_limits
+                .iter()
+                .map(|h| (h.page_size.clone(), h.limit))
+                .collect(),
+            unified: pairs(&r.unified),
+        };
+        oom_score_adj = r.oom_score_adj;
+    }
     if !config.devices.is_empty() || !config.cdi_devices.is_empty() {
         return Err(unsupported("passing devices"));
     }
@@ -204,6 +230,8 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         annotations: pairs(&config.annotations),
         mounts,
         readonly_rootfs,
+        limits,
+        oom_score_adj,
     })
 }
 
@@ -348,6 +376,110 @@ impl Cri {
         })
     }
 
+    fn container_stats(&self, c: &runtime::Container) -> cripb::ContainerStats {
+        let now = now_ns();
+        let u = self.rt.usage(&c.id);
+        let v =
+            |f: fn(&cgroup::Usage) -> u64| u.as_ref().map(|u| cripb::UInt64Value { value: f(u) });
+        cripb::ContainerStats {
+            attributes: Some(cripb::ContainerAttributes {
+                id: c.id.clone(),
+                metadata: container_metadata(&c.spec),
+                labels: map(&c.spec.labels),
+                annotations: map(&c.spec.annotations),
+            }),
+            cpu: u.map(|_| cripb::CpuUsage {
+                timestamp: now,
+                usage_core_nano_seconds: v(|u| u.cpu_ns),
+                ..Default::default()
+            }),
+            memory: u.map(|_| cripb::MemoryUsage {
+                timestamp: now,
+                working_set_bytes: v(|u| u.working_set),
+                usage_bytes: v(|u| u.memory),
+                rss_bytes: v(|u| u.rss),
+                page_faults: v(|u| u.page_faults),
+                major_page_faults: v(|u| u.major_page_faults),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn list_container_stats(
+        &self,
+        filter: Option<cripb::ContainerStatsFilter>,
+    ) -> cripb::ListContainerStatsResponse {
+        let f = filter.unwrap_or_default();
+        let stats = self
+            .rt
+            .containers()
+            .iter()
+            .filter(|c| c.state == runtime::ContainerState::Running)
+            .filter(|c| f.id.is_empty() || c.id.starts_with(&f.id))
+            .filter(|c| f.pod_sandbox_id.is_empty() || c.pod_id.starts_with(&f.pod_sandbox_id))
+            .filter(|c| selected(&c.spec.labels, &f.label_selector))
+            .map(|c| self.container_stats(c))
+            .collect();
+        cripb::ListContainerStatsResponse { stats }
+    }
+
+    /// The sum over the pod's running containers.
+    fn pod_stats(&self, p: &runtime::Pod) -> cripb::PodSandboxStats {
+        let now = now_ns();
+        let containers: Vec<cripb::ContainerStats> = self
+            .rt
+            .containers()
+            .iter()
+            .filter(|c| c.pod_id == p.id && c.state == runtime::ContainerState::Running)
+            .map(|c| self.container_stats(c))
+            .collect();
+        let sum = |f: fn(&cripb::ContainerStats) -> Option<u64>| {
+            Some(cripb::UInt64Value {
+                value: containers.iter().filter_map(f).sum(),
+            })
+        };
+        let cpu = |c: &cripb::ContainerStats| {
+            c.cpu
+                .as_ref()?
+                .usage_core_nano_seconds
+                .as_ref()
+                .map(|v| v.value)
+        };
+        let ws = |c: &cripb::ContainerStats| {
+            c.memory
+                .as_ref()?
+                .working_set_bytes
+                .as_ref()
+                .map(|v| v.value)
+        };
+        let usage =
+            |c: &cripb::ContainerStats| c.memory.as_ref()?.usage_bytes.as_ref().map(|v| v.value);
+        cripb::PodSandboxStats {
+            attributes: Some(cripb::PodSandboxAttributes {
+                id: p.id.clone(),
+                metadata: Some(pod_metadata(&p.spec)),
+                labels: map(&p.spec.labels),
+                annotations: map(&p.spec.annotations),
+            }),
+            linux: Some(cripb::LinuxPodSandboxStats {
+                cpu: Some(cripb::CpuUsage {
+                    timestamp: now,
+                    usage_core_nano_seconds: sum(cpu),
+                    ..Default::default()
+                }),
+                memory: Some(cripb::MemoryUsage {
+                    timestamp: now,
+                    working_set_bytes: sum(ws),
+                    usage_bytes: sum(usage),
+                    ..Default::default()
+                }),
+                containers,
+                ..Default::default()
+            }),
+        }
+    }
+
     fn image_fs_info(&self) -> cripb::ImageFsInfoResponse {
         let used: u64 = self.rt.images().iter().map(|i| i.size).sum();
         let fs = cripb::FilesystemUsage {
@@ -439,6 +571,38 @@ impl Cri {
             ("runtime.v1.RuntimeService", "ContainerStatus") => {
                 let r = req!(ContainerStatusRequest);
                 self.container_status(&r.container_id)?.encode()
+            }
+            ("runtime.v1.RuntimeService", "ContainerStats") => {
+                let r = req!(ContainerStatsRequest);
+                let c = rt.container(&r.container_id).map_err(status)?;
+                ContainerStatsResponse {
+                    stats: Some(self.container_stats(&c)),
+                }
+                .encode()
+            }
+            ("runtime.v1.RuntimeService", "ListContainerStats") => self
+                .list_container_stats(req!(ListContainerStatsRequest).filter)
+                .encode(),
+            ("runtime.v1.RuntimeService", "PodSandboxStats") => {
+                let r = req!(PodSandboxStatsRequest);
+                let p = rt.pod(&r.pod_sandbox_id).map_err(status)?;
+                PodSandboxStatsResponse {
+                    stats: Some(self.pod_stats(&p)),
+                }
+                .encode()
+            }
+            ("runtime.v1.RuntimeService", "ListPodSandboxStats") => {
+                let f = req!(ListPodSandboxStatsRequest).filter.unwrap_or_default();
+                ListPodSandboxStatsResponse {
+                    stats: rt
+                        .pods()
+                        .iter()
+                        .filter(|p| f.id.is_empty() || p.id.starts_with(&f.id))
+                        .filter(|p| selected(&p.spec.labels, &f.label_selector))
+                        .map(|p| self.pod_stats(p))
+                        .collect(),
+                }
+                .encode()
             }
             ("runtime.v1.ImageService", "ListImages") => {
                 let filter = req!(ListImagesRequest)

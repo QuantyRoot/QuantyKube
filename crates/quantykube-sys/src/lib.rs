@@ -37,6 +37,7 @@ extern "C" {
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    fn unshare(flags: c_int) -> c_int;
 }
 
 const SYS_CLONE: c_long = 56;
@@ -57,6 +58,7 @@ const ENOENT: c_int = 2;
 const EEXIST: c_int = 17;
 
 const CLONE_NEWNS: c_ulong = 0x0002_0000;
+const CLONE_NEWCGROUP: c_ulong = 0x0200_0000;
 const CLONE_NEWUTS: c_ulong = 0x0400_0000;
 const CLONE_NEWIPC: c_ulong = 0x0800_0000;
 const CLONE_NEWPID: c_ulong = 0x2000_0000;
@@ -285,6 +287,7 @@ pub struct Spawn {
     cwd: Option<CString>,
     hostname: Option<CString>,
     readonly: bool,
+    cgroupns: bool,
     caps: u64,
     seccomp: Vec<SockFilter>,
     path: CString,
@@ -422,6 +425,7 @@ impl Spawn {
             cwd: None,
             hostname: None,
             readonly: false,
+            cgroupns: false,
             caps: DEFAULT_CAPS,
             seccomp: seccomp_program(),
             path: cstr(first)?,
@@ -535,6 +539,15 @@ impl Spawn {
         self
     }
 
+    /// A cgroup namespace rooted at the cgroup the child is in when it is
+    /// released, and that cgroup mounted read only at /sys/fs/cgroup,
+    /// where runtimes such as Go's and the JVM read their limits. Needs
+    /// cgroup v2.
+    pub fn cgroup_namespace(mut self, yes: bool) -> Self {
+        self.cgroupns = yes;
+        self
+    }
+
     /// The capability set the command keeps; [`DEFAULT_CAPS`] unless set.
     pub fn capabilities(mut self, caps: u64) -> Self {
         self.caps = caps;
@@ -593,6 +606,9 @@ impl Spawn {
             let mut byte = 0u8;
             if read(wait, (&mut byte as *mut u8).cast(), 1) != 1 {
                 fail(Step::Release);
+            }
+            if self.cgroupns && unshare(CLONE_NEWCGROUP as c_int) != 0 {
+                fail(Step::Namespaces);
             }
             use std::os::fd::AsRawFd;
             for (f, kind) in &self.join {
@@ -659,6 +675,17 @@ impl Spawn {
                 hardened | MS_RDONLY,
                 nodata,
             ) != 0
+            {
+                fail(Step::MountSys);
+            }
+            if self.cgroupns
+                && mount(
+                    c"cgroup2".as_ptr(),
+                    c"/sys/fs/cgroup".as_ptr(),
+                    c"cgroup2".as_ptr(),
+                    hardened | MS_RDONLY,
+                    nodata,
+                ) != 0
             {
                 fail(Step::MountSys);
             }

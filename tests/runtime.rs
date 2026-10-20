@@ -327,3 +327,44 @@ fn volumes_are_mounted_inside_the_container() {
     fs::remove_dir_all(&base).unwrap();
     fs::remove_dir_all(ESCAPE).unwrap();
 }
+
+#[test]
+fn limits_hold_and_an_oom_kill_is_reported() {
+    if !is_root() || !quantykube::cgroup::available() {
+        eprintln!("needs root and cgroup v2, skipped");
+        return;
+    }
+    let base = scratch("limits");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "limits".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut c = spec(
+        "hog",
+        &["cat /proc/self/cgroup /sys/fs/cgroup/cpu.max; \
+           a=x; while :; do a=$a$a; done"],
+    );
+    c.limits = quantykube::cgroup::Limits {
+        memory: 32 << 20,
+        cpu_quota: 50_000,
+        cpu_period: 100_000,
+        ..Default::default()
+    };
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    let done = wait_exited(&rt, &id);
+    let log = fs::read_to_string(logs.join("hog.log")).unwrap();
+    assert!(log.contains("stdout F 0::/\n"), "{log}");
+    assert!(log.contains("50000 100000"), "{log}");
+    assert_eq!((done.exit_code, done.reason.as_str()), (137, "OOMKilled"));
+    assert!(!Path::new("/sys/fs/cgroup/quantykube").join(&id).exists());
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}

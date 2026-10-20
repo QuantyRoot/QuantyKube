@@ -6,6 +6,7 @@
 //! runtime forgets its pods; the kubelet then recreates them, which is
 //! also what it does after a node reboot. Persisting state is later work.
 
+use crate::cgroup;
 use crate::image;
 use quantycore::json::{self, Value};
 use quantykube_sys as sys;
@@ -42,6 +43,8 @@ pub struct PodSpec {
     pub attempt: u32,
     pub hostname: String,
     pub log_directory: String,
+    /// The pod's cgroup, a cgroupfs path the kubelet has created.
+    pub cgroup_parent: String,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
 }
@@ -75,6 +78,8 @@ pub struct ContainerSpec {
     pub annotations: Vec<(String, String)>,
     pub mounts: Vec<Mount>,
     pub readonly_rootfs: bool,
+    pub limits: cgroup::Limits,
+    pub oom_score_adj: i64,
 }
 
 /// A host file or directory mounted into the container.
@@ -105,6 +110,7 @@ pub struct Container {
     pub finished_ns: i64,
     pub exit_code: i32,
     pub reason: String,
+    pub cgroup: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -486,6 +492,7 @@ impl Runtime {
             finished_ns: 0,
             exit_code: 0,
             reason: String::new(),
+            cgroup: None,
         };
         self.containers.lock().unwrap().insert(id.clone(), c);
         Ok(id)
@@ -502,6 +509,13 @@ impl Runtime {
 
     pub fn containers(&self) -> Vec<Container> {
         self.containers.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn usage(&self, id: &str) -> Option<cgroup::Usage> {
+        let c = self.container(id).ok()?;
+        (c.state == ContainerState::Running)
+            .then_some(c.cgroup?)
+            .and_then(|dir| cgroup::usage(&dir))
     }
 
     pub fn log_path(&self, c: &Container) -> Option<PathBuf> {
@@ -566,7 +580,8 @@ impl Runtime {
             .join(&self.dir.join("pods").join(&c.pod_id).join("ns"))?
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(cwd.as_bytes())?
-            .readonly(c.spec.readonly_rootfs);
+            .readonly(c.spec.readonly_rootfs)
+            .cgroup_namespace(cgroup::available());
         for m in &c.spec.mounts {
             spawn = spawn
                 .bind(&m.host_path, m.container_path.as_bytes(), m.readonly)
@@ -575,9 +590,45 @@ impl Runtime {
         for d in ["proc", "dev", "sys"] {
             let _ = fs::create_dir(dir.join("upper").join(d));
         }
+        let pod = self.pod(&c.pod_id)?;
+        let cgroup = if cgroup::available() {
+            Some(cgroup::container_dir(&pod.spec.cgroup_parent, id)?)
+        } else if c.spec.limits != cgroup::Limits::default() {
+            return Err(Error::Invalid(
+                "resource limits need the cgroup v2 hierarchy".into(),
+            ));
+        } else {
+            None
+        };
+        if let Some(dir) = &cgroup {
+            cgroup::create(dir, &c.spec.limits)?;
+        }
         let started = spawn.start()?;
         let pid = started.pid;
         drop(spawn);
+        // the child waits for the release, so nothing it runs is ever
+        // outside its cgroup
+        let placed = cgroup
+            .as_deref()
+            .map_or(Ok(()), |dir| cgroup::add(dir, pid))
+            .and_then(|()| {
+                if c.spec.oom_score_adj == 0 {
+                    return Ok(());
+                }
+                fs::write(
+                    format!("/proc/{pid}/oom_score_adj"),
+                    c.spec.oom_score_adj.to_string(),
+                )
+            });
+        if let Err(e) = placed {
+            let _ = sys::signal(pid, 9);
+            drop(started);
+            let _ = sys::wait(pid);
+            if let Some(dir) = &cgroup {
+                cgroup::remove(dir);
+            }
+            return Err(e.into());
+        }
         started.release()?;
         if let Some(path) = self.log_path(&c) {
             if let Some(parent) = path.parent() {
@@ -599,6 +650,7 @@ impl Runtime {
             c.state = ContainerState::Running;
             c.pid = pid;
             c.started_ns = now_ns();
+            c.cgroup = cgroup.clone();
         }
         let rt = Arc::clone(self);
         let id = id.to_string();
@@ -617,6 +669,12 @@ impl Runtime {
                     Ok(sys::Exit::Signal(s)) => (128 + s, "Error".into()),
                     Err(e) => (255, format!("Unknown: {e}")),
                 };
+                if let Some(dir) = &cgroup {
+                    if cgroup::oom_killed(dir) {
+                        c.reason = "OOMKilled".into();
+                    }
+                    cgroup::remove(dir);
+                }
             }
             rt.exited.notify_all();
         });

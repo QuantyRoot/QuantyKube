@@ -24,6 +24,7 @@ through and add a new entry, never silently edit history.
 - [ADR-017](#adr-017-a-pod-is-three-bind-mounted-namespaces-and-runtime-state-is-not-kept) A pod is three bind mounted namespaces, and runtime state is not kept
 - [ADR-018](#adr-018-the-runtime-refuses-what-it-cannot-honour) The runtime refuses what it cannot honour
 - [ADR-019](#adr-019-volumes-are-attached-after-the-pivot) Volumes are attached after the pivot
+- [ADR-020](#adr-020-cgroups-follow-the-cgroupfs-driver) cgroups follow the cgroupfs driver
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -575,3 +576,28 @@ test fails.
 
 **The cost:** Linux 5.2 or newer, for the two calls. Every kernel a
 current Kubernetes supports has them.
+
+## ADR-020: cgroups follow the cgroupfs driver
+
+The kubelet creates a cgroup per pod and sends its path as the pod's
+cgroup parent; the runtime makes one cgroup per container inside it,
+named by the container's id, and writes the limits the kubelet sent:
+`memory.max`, `cpu.max`, `cpu.weight` converted from shares the way the
+kubelet converts them, cpusets, huge pages, and the `unified` files as
+they are. The child is in its cgroup before it runs anything (ADR-013),
+gets a cgroup namespace rooted there, and sees it read only at
+`/sys/fs/cgroup`, where Go and the JVM look for their limits. A
+container the kernel killed for memory is reported as OOMKilled, read
+from `memory.events`. ContainerStats and PodSandboxStats come from the
+same files.
+
+Only the cgroupfs driver is supported. The systemd driver names slices
+instead of paths and needs a D-Bus client to ask systemd for them; a
+slice name is refused. On a host without cgroup v2, a container with
+limits is refused rather than run without them.
+
+**The cost:** the kubelet must run with `--cgroup-driver=cgroupfs`,
+which most distributions no longer default to. A pod's own cgroup and
+its pids limit are the kubelet's, and stats for a pod are the sum of its
+containers, without network.
+
