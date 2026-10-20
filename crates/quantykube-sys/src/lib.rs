@@ -38,6 +38,7 @@ extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn unshare(flags: c_int) -> c_int;
+    fn pause() -> c_int;
     fn fchdir(fd: c_int) -> c_int;
     fn chroot(path: *const c_char) -> c_int;
     fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
@@ -54,6 +55,7 @@ const SYS_SETGROUPS: c_long = 116;
 const SYS_PIVOT_ROOT: c_long = 155;
 const SYS_MKNODAT: c_long = 259;
 const SYS_OPEN_TREE: c_long = 428;
+const SYS_CLOSE_RANGE: c_long = 436;
 const SYS_MOVE_MOUNT: c_long = 429;
 const OPEN_TREE_CLONE: c_uint = 1;
 const AT_RECURSIVE: c_uint = 0x8000;
@@ -609,6 +611,7 @@ pub struct Spawn {
     root: CString,
     overlay: Option<CString>,
     join: Vec<(std::fs::File, c_int)>,
+    join_pid: Option<std::fs::File>,
     binds: Vec<Bind>,
     stdio: Option<(std::fs::File, std::fs::File, std::fs::File)>,
     cwd: Option<CString>,
@@ -771,6 +774,7 @@ impl Spawn {
             root: cstr(root)?,
             overlay: None,
             join: Vec::new(),
+            join_pid: None,
             binds: Vec::new(),
             stdio: None,
             cwd: None,
@@ -893,6 +897,14 @@ impl Spawn {
         Ok(self)
     }
 
+    /// Starts the command in the PID namespace whose first process is
+    /// `holder` (see [`hold_pid_namespace`]), shared with the other
+    /// containers of its pod, instead of in a new one.
+    pub fn join_pid_namespace(mut self, holder: i32) -> io::Result<Self> {
+        self.join_pid = Some(std::fs::File::open(format!("/proc/{holder}/ns/pid"))?);
+        Ok(self)
+    }
+
     /// Standard input, output and error of the command.
     pub fn stdio(
         mut self,
@@ -968,13 +980,46 @@ impl Spawn {
         };
         let flags = if self.enter.is_some() {
             SIGCHLD
+        } else if self.join_pid.is_some() {
+            CLONE_NEWNS | own | SIGCHLD
         } else {
             CLONE_NEWNS | CLONE_NEWPID | own | SIGCHLD
+        };
+        // joining a PID namespace changes where this thread's children go,
+        // not the thread itself, and is undone right after the clone
+        let restore = match &self.join_pid {
+            Some(ns) => {
+                use std::os::fd::AsRawFd;
+                let own_ns = std::fs::File::open("/proc/thread-self/ns/pid")?;
+                // SAFETY: setns on a descriptor this function holds.
+                if unsafe { setns(ns.as_raw_fd(), CLONE_NEWPID as c_int) } != 0 {
+                    let e = io::Error::last_os_error();
+                    unsafe {
+                        close(fds[0]);
+                        close(fds[1]);
+                        close(exec[0]);
+                        close(exec[1]);
+                    }
+                    return Err(e);
+                }
+                Some(own_ns)
+            }
+            None => None,
         };
         // SAFETY: a raw clone without CLONE_VM is a fork into the given
         // namespaces. The child runs only `child`, which makes syscalls on
         // memory prepared above and ends in execve or _exit.
         let pid = unsafe { syscall(SYS_CLONE, flags, 0usize, 0usize, 0usize, 0usize) };
+        if pid != 0 {
+            if let Some(own_ns) = &restore {
+                use std::os::fd::AsRawFd;
+                // SAFETY: as above. Failing here would leave this thread
+                // starting every later child in the pod.
+                if unsafe { setns(own_ns.as_raw_fd(), CLONE_NEWPID as c_int) } != 0 {
+                    panic!("cannot return to the runtime's PID namespace");
+                }
+            }
+        }
         match pid {
             -1 => {
                 let e = io::Error::last_os_error();
@@ -1413,6 +1458,40 @@ impl Spawn {
 /// process, as files `net`, `ipc` and `uts` in `dir`: a short lived child
 /// makes them, the parent bind mounts them, the child exits. This is a
 /// pod sandbox without the pause container (docs/RUNTIME.md).
+/// Starts the first process of a new PID namespace, for a pod whose
+/// containers share one: it reaps whatever is orphaned into it and does
+/// nothing else. The namespace ends when it is killed.
+pub fn hold_pid_namespace() -> io::Result<i32> {
+    // SAFETY: as in Spawn::start; the child only waits and pauses.
+    let pid = unsafe {
+        syscall(
+            SYS_CLONE,
+            CLONE_NEWPID | SIGCHLD,
+            0usize,
+            0usize,
+            0usize,
+            0usize,
+        )
+    };
+    if pid == 0 {
+        unsafe {
+            // it lives as long as the pod: a pipe end of the parent's held
+            // open here would keep that pipe from ever reporting its end
+            syscall(SYS_CLOSE_RANGE, 0, c_uint::MAX, 0);
+            let mut status: c_int = 0;
+            loop {
+                if waitpid(-1, &mut status, 0) < 0 {
+                    pause();
+                }
+            }
+        }
+    }
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid as i32)
+}
+
 /// Brings up `lo` in the caller's network namespace, which a new one
 /// starts without: a pod's containers talk to each other over it.
 unsafe fn loopback_up() -> bool {

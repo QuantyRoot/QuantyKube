@@ -51,6 +51,8 @@ pub struct PodSpec {
     /// The pod's `/etc/resolv.conf`; the image's own is kept if empty.
     pub resolv_conf: String,
     pub ports: Vec<cni::Port>,
+    /// One PID namespace for all containers of the pod.
+    pub share_pid: bool,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
 }
@@ -70,6 +72,8 @@ pub struct Pod {
     /// Empty without a CNI network.
     pub ip: String,
     network: Option<Value>,
+    /// The first process of the pod's shared PID namespace, if it has one.
+    pid_holder: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +372,13 @@ impl Runtime {
             let _ = fs::remove_dir_all(&dir);
         }
         for dir in entries("pods") {
+            if let Ok(text) = fs::read_to_string(dir.join("holder")) {
+                let mut f = text.split_whitespace();
+                let pid: i32 = f.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                if pid > 0 && start_time(pid).as_deref() == f.next() {
+                    let _ = sys::signal(pid, 9);
+                }
+            }
             let id = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -592,10 +603,21 @@ impl Runtime {
                 .collect();
             fs::write(dir.join("ports"), ports.join("\n"))?;
         }
+        let pid_holder = if spec.share_pid {
+            let holder = sys::hold_pid_namespace()?;
+            fs::write(
+                dir.join("holder"),
+                format!("{holder} {}\n", start_time(holder).unwrap_or_default()),
+            )?;
+            Some(holder)
+        } else {
+            None
+        };
         if !spec.log_directory.is_empty() {
             fs::create_dir_all(&spec.log_directory)?;
         }
         let pod = Pod {
+            pid_holder,
             id: id.clone(),
             spec,
             state: PodState::Ready,
@@ -642,6 +664,10 @@ impl Runtime {
             }
         }
         sys::release_namespaces(&ns)?;
+        if let Some(holder) = pod.pid_holder.filter(|_| pod.state == PodState::Ready) {
+            let _ = sys::signal(holder, 9);
+            let _ = sys::wait(holder);
+        }
         if let Some(p) = self.pods.lock().unwrap().get_mut(id) {
             p.state = PodState::NotReady;
         }
@@ -776,6 +802,9 @@ impl Runtime {
             .user(u.uid, u.gid, &u.groups)
             .readonly(c.spec.readonly_rootfs)
             .cgroup_namespace(cgroup::available());
+        if let Some(holder) = self.pod(&c.pod_id)?.pid_holder {
+            spawn = spawn.join_pid_namespace(holder)?;
+        }
         let pod_dir = self.dir.join("pods").join(&c.pod_id);
         for file in ["hostname", "resolv.conf"] {
             let target = format!("/etc/{file}");

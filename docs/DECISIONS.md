@@ -516,8 +516,12 @@ its containers. Here a short lived child creates them and sets the pod's
 hostname, the runtime bind mounts the three namespace files into the
 pod's directory, and the child exits; containers join them with
 `setns`. Releasing the pod unmounts them. CRI-O can do the same and
-notes the same limit: a pod that shares one PID namespace needs a
-process, which is not supported yet.
+notes the same limit: a PID namespace ends with its first process, so a
+pod whose containers share one (`shareProcessNamespace`) gets a holder
+process that only reaps orphans, a fork of the runtime that closes every
+descriptor it inherited. Its containers are cloned into that namespace
+by the thread that starts them, which joins it for the one clone and
+returns.
 
 **Each container gets an overlay** over the image's unpacked root, so
 the image is never written to, and its output goes through a pipe into
@@ -538,8 +542,7 @@ their namespaces and cgroups, and the kubelet starts the pods again.
 **The cost:** every pod on a node restarts when the runtime does, where
 containerd keeps them running through its shims. Keeping them would need
 a process per container that holds its output pipe and its exit status,
-which is what a shim is. And a pod with a shared PID namespace is
-refused.
+which is what a shim is.
 
 A test builds an image from this machine's own binaries with real
 digests and takes a pod through its whole life as root, in CI too: two
@@ -554,15 +557,12 @@ The CRI service (`src/cri.rs`) is in place before most of what the
 kubelet can ask of it. A request this runtime would carry out differently
 from what it says is refused with INVALID_ARGUMENT and the reason, never
 run in part: image volumes and mount propagation, devices, a terminal
-or stdin, a privileged container, a pod on the host's network or with a
-shared PID namespace, any runtime handler but the default.
+or stdin, a privileged container, a pod on the host's network, any
+runtime handler but the default.
 
-A container started without the volume holding its secrets, or with a
-shared PID namespace it did not get, would look like it works and be
-wrong;
-refusing shows exactly where the runtime stands. PullImage succeeds for
-an image already on the node, which is what a pull would give, and
-fails with UNIMPLEMENTED otherwise.
+A container started without the volume holding its secrets would look
+like it works and be wrong; refusing shows exactly where the runtime
+stands.
 
 **The cost:** a pod that needs any of these does not start here until
 the piece is built, and the kubelet reports the reason.

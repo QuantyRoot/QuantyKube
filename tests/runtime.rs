@@ -636,3 +636,51 @@ fn a_rotated_log_is_reopened() {
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn containers_of_a_pod_can_share_one_pid_namespace() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("sharepid");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "shared".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            share_pid: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let sleeper = rt
+        .create_container(&pod, spec("sleeper", &["exec sleep 60"]))
+        .unwrap();
+    rt.start_container(&sleeper).unwrap();
+    let looker = rt
+        .create_container(
+            &pod,
+            spec("looker", &["for p in /proc/[0-9]*; do cat $p/comm; done"]),
+        )
+        .unwrap();
+    rt.start_container(&looker).unwrap();
+    wait_exited(&rt, &looker);
+    let seen = fs::read_to_string(logs.join("looker.log")).unwrap();
+    assert!(seen.contains(" stdout F sleep\n"), "{seen}");
+    let holder: i32 = fs::read_to_string(base.join("state/pods").join(&pod).join("holder"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    rt.remove_pod(&pod).unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{holder}")).exists(),
+        "holder left"
+    );
+    fs::remove_dir_all(&base).unwrap();
+}

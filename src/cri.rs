@@ -131,9 +131,6 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
         if ns.network == cripb::NamespaceMode::Node {
             return Err(unsupported("a pod on the host network"));
         }
-        if ns.pid == cripb::NamespaceMode::Pod {
-            return Err(unsupported("a PID namespace shared by the pod"));
-        }
         if ns.pid == cripb::NamespaceMode::Node || ns.ipc == cripb::NamespaceMode::Node {
             return Err(unsupported("a pod in the host's namespaces"));
         }
@@ -180,8 +177,15 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
             host_ip: p.host_ip.clone(),
         });
     }
+    let share_pid = config
+        .linux
+        .as_ref()
+        .and_then(|l| l.security_context.as_ref())
+        .and_then(|s| s.namespace_options.as_ref())
+        .is_some_and(|ns| ns.pid == cripb::NamespaceMode::Pod);
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
+        share_pid,
         cgroup_parent,
         ports,
         resolv_conf: resolv_conf.unwrap_or_default(),
@@ -828,7 +832,8 @@ mod tests {
         assert!(pod_spec(pod(Pod, Container)).is_ok());
         assert!(pod_spec(PodSandboxConfig::default()).is_ok());
         assert!(pod_spec(pod(Node, Container)).is_err());
-        assert!(pod_spec(pod(Pod, Pod)).is_err());
+        assert!(pod_spec(pod(Pod, Pod)).unwrap().share_pid);
+        assert!(!pod_spec(pod(Pod, Container)).unwrap().share_pid);
 
         let user = |uid: i64| ContainerConfig {
             linux: Some(LinuxContainerConfig {
