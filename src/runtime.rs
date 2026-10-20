@@ -951,6 +951,27 @@ impl Runtime {
         })
     }
 
+    /// Changes the limits of a container in place, as the kubelet does to
+    /// resize a pod.
+    pub fn update_limits(&self, id: &str, limits: cgroup::Limits) -> Result<()> {
+        let c = self.container(id)?;
+        if let Some(dir) = c
+            .cgroup
+            .as_ref()
+            .filter(|_| c.state == ContainerState::Running)
+        {
+            cgroup::apply(dir, &limits)?;
+        } else if c.state == ContainerState::Running {
+            return Err(Error::Invalid(
+                "resource limits need the cgroup v2 hierarchy".into(),
+            ));
+        }
+        if let Some(c) = self.containers.lock().unwrap().get_mut(id) {
+            c.spec.limits = limits;
+        }
+        Ok(())
+    }
+
     /// SIGTERM, then SIGKILL once `grace` has passed.
     pub fn stop_container(&self, id: &str, grace: Duration) -> Result<()> {
         let c = self.container(id)?;

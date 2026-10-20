@@ -599,7 +599,8 @@ gets a cgroup namespace rooted there, and sees it read only at
 `/sys/fs/cgroup`, where Go and the JVM look for their limits. A
 container the kernel killed for memory is reported as OOMKilled, read
 from `memory.events`. ContainerStats and PodSandboxStats come from the
-same files.
+same files, and UpdateContainerResources rewrites them in place, which is
+how the kubelet resizes a running pod.
 
 Only the cgroupfs driver is supported. The systemd driver names slices
 instead of paths and needs a D-Bus client to ask systemd for them; a

@@ -338,6 +338,7 @@ proto_enum!(Signal {
 });
 
 empty_message!(
+    UpdateContainerResourcesResponse,
     StopPodSandboxResponse,
     RemovePodSandboxResponse,
     StartContainerResponse,
@@ -2937,6 +2938,33 @@ impl Message for ContainerStats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateContainerResourcesRequest {
+    pub container_id: String,
+    pub linux: Option<LinuxContainerResources>,
+    pub annotations: Map,
+}
+
+impl Message for UpdateContainerResourcesRequest {
+    fn write(&self, out: &mut Vec<u8>) {
+        put_string(out, 1, &self.container_id);
+        put_opt(out, 2, &self.linux);
+        put_map(out, 4, &self.annotations);
+    }
+
+    fn merge(&mut self, buf: &[u8]) -> Result<(), DecodeError> {
+        each_field(buf, |n, v| {
+            match n {
+                1 => self.container_id = string(v, n)?,
+                2 => merge_opt(&mut self.linux, v.bytes(n)?)?,
+                4 => merge_map(&mut self.annotations, v, n)?,
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerStatsRequest {
     pub container_id: String,
 }
@@ -4300,6 +4328,30 @@ mod tests {
         golden(&list_containers(), LIST_CONTAINERS);
         golden(&pod_sandbox_status(), POD_SANDBOX_STATUS);
         golden(&status(), STATUS);
+    }
+
+    #[test]
+    fn a_resize_matches_the_reference_implementation() {
+        let hex = "0a026331122308a08d0610d0860318800420808080204a110a0b6d656d6f72792e\
+                   686967681202314722060a0161120162";
+        let want: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let msg = UpdateContainerResourcesRequest {
+            container_id: "c1".into(),
+            linux: Some(LinuxContainerResources {
+                cpu_period: 100_000,
+                cpu_quota: 50_000,
+                cpu_shares: 512,
+                memory_limit_in_bytes: 1 << 26,
+                unified: [("memory.high".to_string(), "1G".to_string())].into(),
+                ..Default::default()
+            }),
+            annotations: [("a".to_string(), "b".to_string())].into(),
+        };
+        assert_eq!(msg.encode(), want);
+        assert_eq!(UpdateContainerResourcesRequest::decode(&want).unwrap(), msg);
     }
 
     fn parses_completely(buf: &[u8]) -> bool {

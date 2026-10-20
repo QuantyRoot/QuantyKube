@@ -92,8 +92,24 @@ pub fn create(dir: &Path, limits: &Limits) -> io::Result<()> {
             let _ = fs::write(a.join("cgroup.subtree_control"), format!("+{c}"));
         }
     }
-    if limits.memory > 0 {
-        write(dir, "memory.max", &limits.memory.to_string())?;
+    apply(dir, limits)
+}
+
+/// Writes the limits to an existing cgroup, for a new container or a
+/// resize of a running one.
+pub fn apply(dir: &Path, limits: &Limits) -> io::Result<()> {
+    // an unset limit is written as max, so a resize can lift one
+    let or_max = |v: i64| {
+        if v > 0 {
+            v.to_string()
+        } else {
+            "max".into()
+        }
+    };
+    // where the controller is missing there is nothing to lift
+    let lift = |file: &str, set: bool| set || dir.join(file).exists();
+    if lift("memory.max", limits.memory > 0) {
+        write(dir, "memory.max", &or_max(limits.memory))?;
     }
     // without this a memory limit on a host with swap is a limit on
     // what stays in RAM, and the container swaps instead of being killed
@@ -101,13 +117,17 @@ pub fn create(dir: &Path, limits: &Limits) -> io::Result<()> {
         let swap = limits.memory_swap.saturating_sub(limits.memory).max(0);
         write(dir, "memory.swap.max", &swap.to_string())?;
     }
-    if limits.cpu_quota > 0 {
-        let period = if limits.cpu_period > 0 {
-            limits.cpu_period
-        } else {
-            100_000
-        };
-        write(dir, "cpu.max", &format!("{} {period}", limits.cpu_quota))?;
+    let period = if limits.cpu_period > 0 {
+        limits.cpu_period
+    } else {
+        100_000
+    };
+    if lift("cpu.max", limits.cpu_quota > 0) {
+        write(
+            dir,
+            "cpu.max",
+            &format!("{} {period}", or_max(limits.cpu_quota)),
+        )?;
     }
     if limits.cpu_shares > 0 {
         write(dir, "cpu.weight", &weight(limits.cpu_shares).to_string())?;

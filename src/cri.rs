@@ -171,6 +171,24 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
     })
 }
 
+fn limits_of(r: &cripb::LinuxContainerResources) -> cgroup::Limits {
+    cgroup::Limits {
+        cpu_period: r.cpu_period,
+        cpu_quota: r.cpu_quota,
+        cpu_shares: r.cpu_shares,
+        memory: r.memory_limit_in_bytes,
+        memory_swap: r.memory_swap_limit_in_bytes,
+        cpuset_cpus: r.cpuset_cpus.clone(),
+        cpuset_mems: r.cpuset_mems.clone(),
+        hugepages: r
+            .hugepage_limits
+            .iter()
+            .map(|h| (h.page_size.clone(), h.limit))
+            .collect(),
+        unified: pairs(&r.unified),
+    }
+}
+
 fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Status> {
     let mut mounts = Vec::with_capacity(config.mounts.len());
     for m in config.mounts {
@@ -197,21 +215,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
     let mut limits = cgroup::Limits::default();
     let mut oom_score_adj = 0;
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
-        limits = cgroup::Limits {
-            cpu_period: r.cpu_period,
-            cpu_quota: r.cpu_quota,
-            cpu_shares: r.cpu_shares,
-            memory: r.memory_limit_in_bytes,
-            memory_swap: r.memory_swap_limit_in_bytes,
-            cpuset_cpus: r.cpuset_cpus.clone(),
-            cpuset_mems: r.cpuset_mems.clone(),
-            hugepages: r
-                .hugepage_limits
-                .iter()
-                .map(|h| (h.page_size.clone(), h.limit))
-                .collect(),
-            unified: pairs(&r.unified),
-        };
+        limits = limits_of(r);
         oom_score_adj = r.oom_score_adj;
     }
     if !config.devices.is_empty() || !config.cdi_devices.is_empty() {
@@ -634,6 +638,12 @@ impl Cri {
                     exit_code: out.exit_code,
                 }
                 .encode()
+            }
+            ("runtime.v1.RuntimeService", "UpdateContainerResources") => {
+                let r = req!(UpdateContainerResourcesRequest);
+                let limits = r.linux.as_ref().map(limits_of).unwrap_or_default();
+                rt.update_limits(&r.container_id, limits).map_err(status)?;
+                UpdateContainerResourcesResponse {}.encode()
             }
             ("runtime.v1.RuntimeService", "ContainerStats") => {
                 let r = req!(ContainerStatsRequest);

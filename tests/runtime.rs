@@ -373,6 +373,26 @@ fn limits_hold_and_an_oom_kill_is_reported() {
     assert!(log.contains("50000 100000"), "{log}");
     assert_eq!((done.exit_code, done.reason.as_str()), (137, "OOMKilled"));
     assert!(!Path::new("/sys/fs/cgroup/quantykube").join(&id).exists());
+
+    // a resize lands in the running container's cgroup
+    let mut c = spec("resized", &["sleep 60"]);
+    c.limits.cpu_quota = 50_000;
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    let cpu_max = Path::new("/sys/fs/cgroup/quantykube")
+        .join(&id)
+        .join("cpu.max");
+    assert_eq!(fs::read_to_string(&cpu_max).unwrap(), "50000 100000\n");
+    let mut limits = quantykube::cgroup::Limits {
+        cpu_quota: 20_000,
+        ..Default::default()
+    };
+    rt.update_limits(&id, limits.clone()).unwrap();
+    assert_eq!(fs::read_to_string(&cpu_max).unwrap(), "20000 100000\n");
+    limits.cpu_quota = 0;
+    rt.update_limits(&id, limits).unwrap();
+    assert_eq!(fs::read_to_string(&cpu_max).unwrap(), "max 100000\n");
+    rt.stop_container(&id, Duration::ZERO).unwrap();
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
