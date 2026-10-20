@@ -70,7 +70,7 @@ jobs:
           QUANTY_CRASH_ITERS: "200"
 
   sandbox:
-    name: sandbox and runtime core, and start time against runc
+    name: sandbox, runtime and CRI, and start time against runc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,6 +86,21 @@ jobs:
         run: |
           bin=$(cargo test --release --test runtime --no-run 2>&1 | grep -o 'target/release/deps/runtime-[0-9a-f]*' | head -1)
           sudo "$bin" --nocapture
+      - name: fetch crictl and a busybox image at pinned digests
+        run: |
+          curl -fsSLo crictl.tgz https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz
+          echo "a8ff2a3edb37a98daf3aba7c3b284fe0aa5bff24166d896ab9ef64c8913c9f51  crictl.tgz" | sha256sum -c -
+          tar -xzf crictl.tgz -C "$RUNNER_TEMP"
+          img=$RUNNER_TEMP/busybox
+          mkdir -p "$img/blobs"
+          reg=https://mirror.gcr.io/v2/library/busybox
+          curl -fsSL -H 'Accept: application/vnd.oci.image.manifest.v1+json' -o "$img/manifest.json" \
+            "$reg/manifests/sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+          echo "b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f  $img/manifest.json" | sha256sum -c -
+          for d in $(grep -o 'sha256:[0-9a-f]\{64\}' "$img/manifest.json"); do
+            curl -fsSL -o "$img/blobs/${d#sha256:}" "$reg/blobs/$d"
+          done
+      - run: sudo env CRICTL="$RUNNER_TEMP/crictl" IMAGE="$RUNNER_TEMP/busybox" scripts/cri.sh
 
   msrv:
     name: test on MSRV (1.89)

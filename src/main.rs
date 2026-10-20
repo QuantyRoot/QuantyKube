@@ -17,6 +17,8 @@ const USAGE: &str = "usage:
   quantykube unpack  --to <dir> <layer.tar.gz>...
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
+  quantykube runtime --root <dir> --socket <path>
+  quantykube import  --root <dir> <image dir> <reference>
 
 serve is the store. --retain keeps history, 1h by default; --snapshots
 keeps QuantyDB snapshots, 1m by default, and older revisions are rebuilt
@@ -33,7 +35,12 @@ such as configmap/default/important.
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
 layers in order, whiteouts included; sandbox runs one command in its own
-namespaces with <dir> as its root and exits with its status.";
+namespaces with <dir> as its root and exits with its status.
+
+runtime serves the kubelet's Container Runtime Interface on the socket,
+keeping images and container state under --root. It cannot pull yet:
+import puts an image there from a directory holding its manifest.json and
+blobs/, each blob checked against its digest.";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,6 +57,8 @@ fn main() {
         Some("restore") => restore(&args[1..]),
         Some("sandbox") => sandbox(&args[1..]),
         Some("unpack") => unpack(&args[1..]),
+        Some("runtime") => runtime(&args[1..]),
+        Some("import") => import(&args[1..]),
         Some("--version") => {
             println!("quantykube {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -290,17 +299,52 @@ fn serve(args: &[String]) -> Result<(), String> {
             eprintln!("quantykube: retention: {e}");
         }
     });
-    if socket.exists() {
-        std::fs::remove_file(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-    }
-    let listener = UnixListener::bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-    // the socket's mode is the store's only access control (ADR-004):
     // whoever can connect can read and write every object in the cluster
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("{}: {e}", socket.display()))?;
+    let listener = private_socket(&socket)?;
     eprintln!("quantykube: serving {} on {endpoint}", data.display());
     quantycore::grpc::serve_unix(listener, etcd).map_err(|e| e.to_string())
+}
+
+/// A socket only its owner can connect to: for both servers the mode is
+/// the only access control (ADR-004).
+fn private_socket(path: &Path) -> Result<UnixListener, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let err = |e: std::io::Error| format!("{}: {e}", path.display());
+    if path.exists() {
+        std::fs::remove_file(path).map_err(err)?;
+    }
+    let listener = UnixListener::bind(path).map_err(err)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(err)?;
+    Ok(listener)
+}
+
+fn runtime(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(required(args, "--root")?);
+    let socket = PathBuf::from(required(args, "--socket")?);
+    let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
+    // whoever can connect can run anything as root on the node
+    let listener = private_socket(&socket)?;
+    eprintln!("quantykube: runtime on unix://{}", socket.display());
+    quantycore::grpc::serve_unix(listener, quantykube::cri::Cri::new(rt)).map_err(|e| e.to_string())
+}
+
+fn import(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(required(args, "--root")?);
+    let rest: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| *a != "--root" && (*i == 0 || args[i - 1] != "--root"))
+        .map(|(_, a)| a)
+        .collect();
+    let [from, reference] = rest[..] else {
+        return Err(USAGE.to_string());
+    };
+    let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
+    let img = rt
+        .import(Path::new(from), reference)
+        .map_err(|e| format!("{from}: {e}"))?;
+    println!("{}", img.id);
+    Ok(())
 }
 
 fn history_call(args: &[String], method: &str, req: &[u8]) -> Result<Vec<u8>, String> {

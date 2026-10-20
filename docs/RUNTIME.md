@@ -19,6 +19,14 @@ written before most of the code.
   cgroup v2 with memory and pid limits that the process is in before any
   of its own code runs (ADR-013). alpine, busybox and nginx run in it.
 
+- `quantykube runtime` serves RuntimeService and ImageService on a Unix
+  socket: version and status, pods and containers from creation to
+  removal, their logs in the format the kubelet reads, and images
+  imported with `quantykube import` (ADR-017, ADR-018).
+  `scripts/cri.sh` takes a pod through its life with `crictl`. What the
+  kubelet needs beyond that, in order: volumes, CNI, the cgroup limits
+  it sends, users other than root, ExecSync, pulling, stats.
+
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
 development machine, two runs of 50 starts of `/bin/true` each, quiet

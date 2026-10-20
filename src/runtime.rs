@@ -244,6 +244,10 @@ impl Runtime {
         Ok(Arc::new(rt))
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn load_images(&self) -> Result<()> {
         let mut images = Vec::new();
         for e in fs::read_dir(self.dir.join("images"))? {

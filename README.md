@@ -60,7 +60,7 @@ watches see the object return.
 | Retention: long history in the log, short lived snapshots ([ADR-014](docs/DECISIONS.md)) | built, soak tested |
 | TLS, so the store can be reached over a network | waiting for QuantyCore |
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
-| Node runtime: the CRI service the kubelet talks to | designed |
+| Node runtime: the CRI service, pods and containers with crictl | built, without volumes, CNI, pull or exec |
 | Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
 
 ## Trying it

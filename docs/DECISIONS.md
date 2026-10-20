@@ -22,6 +22,7 @@ through and add a new entry, never silently edit history.
 - [ADR-015](#adr-015-two-malloc-arenas-for-the-server) Two malloc arenas for the server
 - [ADR-016](#adr-016-layers-are-unpacked-with-every-path-resolved-inside-the-root) Layers are unpacked with every path resolved inside the root
 - [ADR-017](#adr-017-a-pod-is-three-bind-mounted-namespaces-and-runtime-state-is-not-kept) A pod is three bind mounted namespaces, and runtime state is not kept
+- [ADR-018](#adr-018-the-runtime-refuses-what-it-cannot-honour) The runtime refuses what it cannot honour
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -533,4 +534,23 @@ containers share the pod's network but not the host's, logs arrive in
 the CRI format, a shell that ignores SIGTERM is killed after the grace
 period with 137, and nothing stays mounted after removal. A tampered
 layer is refused.
+
+## ADR-018: The runtime refuses what it cannot honour
+
+The CRI service (`src/cri.rs`) is in place before most of what the
+kubelet can ask of it. A request this runtime would carry out differently
+from what it says is refused with INVALID_ARGUMENT and the reason, never
+run in part: volume mounts, devices, a terminal or stdin, a privileged
+container, a user other than root, a pod on the host's network or with a
+shared PID namespace, any runtime handler but the default. Status
+reports NetworkReady false, because no CNI plugin is run yet.
+
+A container started without the volume holding its secrets, or as root
+when it asked for another user, would look like it works and be wrong;
+refusing shows exactly where the runtime stands. PullImage succeeds for
+an image already on the node, which is what a pull would give, and
+fails with UNIMPLEMENTED otherwise.
+
+**The cost:** almost no real pod runs yet, since the kubelet mounts at
+least a service account token into nearly every one. Volumes come first.
 
