@@ -58,6 +58,17 @@ jobs:
           sudo env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver \
             KUBECTL=$b/kubectl K3S=$b/k3s scripts/e2e.sh
 
+  crash:
+    name: kill -9 the server under writes (200 kills)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: cargo test --release --test crash -- --nocapture
+        env:
+          QUANTY_CRASH_ITERS: "200"
+
   msrv:
     name: test on MSRV (1.89)
     runs-on: ubuntu-latest
