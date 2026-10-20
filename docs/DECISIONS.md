@@ -11,6 +11,7 @@ through and add a new entry, never silently edit history.
 - [ADR-004](#adr-004-plaintext-over-a-unix-socket-until-quantycore-has-tls) Plaintext over a Unix socket until QuantyCore has TLS
 - [ADR-005](#adr-005-sandbox-means-the-node-runtime-behind-cri) Sandbox means the node runtime behind CRI
 - [ADR-006](#adr-006-one-storage-interface-quantydb-behind-it-first) One storage interface, QuantyDB behind it first
+- [ADR-007](#adr-007-apache-20-and-money-from-what-surrounds-the-code) Apache 2.0, and money from what surrounds the code
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -154,3 +155,30 @@ QuantyDB's design. Behind another backend they are emulated with a log
 table, as kine does, or not offered. The README must say which features
 depend on the backend, so that nobody picks PostgreSQL for availability
 and expects the history to behave the same.
+
+## ADR-007: Apache 2.0, and money from what surrounds the code
+
+QuantyKube is licensed under the Apache License 2.0. Anyone may use,
+change and redistribute it, companies included.
+
+**What was rejected.** Source available licenses such as the Business
+Source License or the Functional Source License do what was first asked
+for: free for everyone, paid for those who compete. They were rejected for
+two reasons. They are not open source under the Open Source Definition,
+which forbids treating commercial use differently, and this project will
+not call itself open source if it is not (ADR-002). And the projects this
+one competes with, kine first among them, are Apache 2.0: a stricter
+license here would give every potential user a reason to stay where they
+are. Recent relicensings in this ecosystem were followed by community
+forks, which is the outcome to avoid.
+
+Apache 2.0 rather than MIT, which QuantyDB uses, because it includes an
+explicit patent license, which the legal departments of the companies
+this is meant for look for, and because it is the license the Kubernetes
+ecosystem expects.
+
+**The cost:** the code itself cannot be sold. Revenue has to come from
+what surrounds it: support, operation, and features built on top that are
+offered separately. Anything that might ever be sold separately must be
+designed as a separate piece from the start, not cut out of the open code
+later.
