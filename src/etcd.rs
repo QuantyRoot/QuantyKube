@@ -163,7 +163,7 @@ impl<B: Backend> Etcd<B> {
         Ok(self.store.write(f)?.map(|(rev, _)| rev))
     }
 
-    fn range(&self, req: &RangeRequest, view: &dyn View, rev: i64) -> store::Result<RangeResponse> {
+    fn range(&self, req: &RangeRequest, view: &dyn View) -> store::Result<RangeResponse> {
         let mut kvs = Vec::new();
         let mut count = 0i64;
         let keep = |r: &Record| {
@@ -222,7 +222,7 @@ impl<B: Backend> Etcd<B> {
             }
         }
         Ok(RangeResponse {
-            header: self.header(rev),
+            header: None,
             more: (kvs.len() as i64) < count && !req.count_only,
             count,
             kvs,
@@ -339,7 +339,7 @@ impl<B: Backend> Etcd<B> {
         for op in ops {
             let r = match &op.request {
                 Some(OpRequest::Range(r)) => {
-                    OpResponse::Range(self.range(r, tx, tx.revision()).map_err(store_error)?)
+                    OpResponse::Range(self.range(r, tx).map_err(store_error)?)
                 }
                 Some(OpRequest::Put(p)) => OpResponse::Put(self.put(tx, p)?),
                 Some(OpRequest::DeleteRange(d)) => OpResponse::DeleteRange(self.delete(tx, d)?),
@@ -861,11 +861,19 @@ impl<B: Backend> Service for Etcd<B> {
             ("etcdserverpb.KV", "Range") => {
                 let req = RangeRequest::decode(body).map_err(bad_request)?;
                 let mut resp = None;
-                self.etcd_read(req.revision, &mut |v| {
-                    resp = Some(self.range(&req, v, self.store.head())?);
+                let at = self.etcd_read(req.revision, &mut |v| {
+                    resp = Some(self.range(&req, v)?);
                     Ok(())
                 })?;
-                Ok(resp.unwrap().encode())
+                let mut resp = resp.unwrap();
+                // as etcd: the revision read for the newest state, the
+                // current head for a read at an older revision
+                resp.header = self.header(if req.revision == 0 {
+                    at
+                } else {
+                    self.store.head()
+                });
+                Ok(resp.encode())
             }
             ("etcdserverpb.KV", "Put") => {
                 let req = PutRequest::decode(body).map_err(bad_request)?;
@@ -1087,7 +1095,7 @@ impl<B: Backend> Etcd<B> {
         &self,
         rev: i64,
         f: &mut dyn FnMut(&dyn View) -> store::Result<()>,
-    ) -> Result<(), Status> {
+    ) -> Result<i64, Status> {
         self.store.read(rev, f).map_err(store_error)
     }
 }
@@ -1273,5 +1281,92 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.code, code::NOT_FOUND);
+    }
+
+    /// A store in which another client's write commits in the middle of
+    /// every read, after the view is taken and before it is used.
+    struct Interleaved(Quanty<quantydb_core::MemStorage>);
+
+    impl Backend for Interleaved {
+        fn head(&self) -> i64 {
+            self.0.head()
+        }
+        fn compacted(&self) -> i64 {
+            self.0.compacted()
+        }
+        fn read(
+            &self,
+            rev: i64,
+            f: &mut dyn FnMut(&dyn View) -> store::Result<()>,
+        ) -> store::Result<i64> {
+            self.0.read(rev, &mut |v| {
+                self.0
+                    .write(&mut |tx| tx.put(b"/other", b"v", 0).map(|_| ()))?;
+                f(v)
+            })
+        }
+        fn write(
+            &self,
+            f: &mut dyn FnMut(&mut dyn Tx) -> store::Result<()>,
+        ) -> store::Result<Option<(i64, Vec<Change>)>> {
+            self.0.write(f)
+        }
+        fn set_publisher(&self, p: store::Publisher) {
+            self.0.set_publisher(p)
+        }
+        fn changes(
+            &self,
+            from: i64,
+            to: i64,
+            f: &mut dyn FnMut(i64, Change) -> bool,
+        ) -> store::Result<()> {
+            self.0.changes(from, to, f)
+        }
+        fn compact(&self, rev: i64) -> store::Result<()> {
+            self.0.compact(rev)
+        }
+        fn size(&self) -> store::Result<(i64, i64)> {
+            self.0.size()
+        }
+        fn read_retained(
+            &self,
+            rev: i64,
+            f: &mut dyn FnMut(&dyn View) -> store::Result<()>,
+        ) -> store::Result<()> {
+            self.0.read_retained(rev, f)
+        }
+        fn revision_at(&self, unix_ms: i64) -> store::Result<i64> {
+            self.0.revision_at(unix_ms)
+        }
+        fn history(
+            &self,
+            start: &[u8],
+            end: Option<&[u8]>,
+        ) -> store::Result<Vec<store::HistoryEntry>> {
+            self.0.history(start, end)
+        }
+    }
+
+    // the API server lists, then watches from the list's revision + 1:
+    // a header ahead of the data loses the events in between for good
+    #[test]
+    fn a_range_reports_the_revision_it_read() {
+        let e = Etcd::new(
+            Arc::new(Interleaved(Quanty::in_memory().unwrap())),
+            "unix:///test".into(),
+        )
+        .unwrap();
+        put(&e, "/k", "v", 0);
+        let r: RangeResponse = call(
+            &e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/k".into(),
+                ..Default::default()
+            },
+        );
+        let read = r.kvs[0].mod_revision;
+        assert_eq!(r.header.unwrap().revision, read);
+        assert!(e.store.head() > read, "no write landed during the read");
     }
 }

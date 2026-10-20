@@ -113,8 +113,9 @@ pub type Publisher = Box<dyn Fn(i64, &[Change]) + Send + Sync>;
 pub trait Backend: Send + Sync + 'static {
     fn head(&self) -> i64;
     fn compacted(&self) -> i64;
-    /// `rev` 0 reads the newest state.
-    fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()>;
+    /// `rev` 0 reads the newest state. Returns the revision read at, which
+    /// for `rev` 0 is the head when the view was taken, not the head now.
+    fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<i64>;
     /// Runs `f` as one atomic write. If it changed a key, it gets the next
     /// revision; once that is durable, the publisher has seen it, in
     /// revision order, and this returns. `f` failing changes nothing.
@@ -823,7 +824,7 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
         self.compacted.load(Ordering::Acquire)
     }
 
-    fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()> {
+    fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<i64> {
         let head = self.head();
         if rev > head {
             return Err(Error::FutureRevision);
@@ -833,7 +834,9 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
         }
         // the newest state is read at the head revision too, so that the
         // data and the revision reported with it always agree
-        self.read_at(if rev == 0 { head } else { rev }, f)
+        let at = if rev == 0 { head } else { rev };
+        self.read_at(at, f)?;
+        Ok(at)
     }
 
     fn write(
