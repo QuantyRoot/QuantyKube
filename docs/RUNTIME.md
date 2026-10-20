@@ -15,9 +15,10 @@ written before most of the code.
   standard devices, `devpts` and `/dev/shm`; `/sys` read only; the paths
   runc masks or makes read only under `/proc` and `/sys`; Docker's
   fourteen default capabilities in every set, the rest dropped from the
-  bounding set; `no_new_privs`; a seccomp filter; and, with `--cgroup`, a
-  cgroup v2 with memory and pid limits that the process is in before any
-  of its own code runs (ADR-013). alpine, busybox and nginx run in it.
+  bounding set; `no_new_privs`; Docker's seccomp allowlist (ADR-024);
+  and, with `--cgroup`, a cgroup v2 with memory and pid limits that the
+  process is in before any of its own code runs (ADR-013). alpine,
+  busybox and nginx run in it.
 
 - `quantykube runtime` serves RuntimeService and ImageService on a Unix
   socket: version and status, pods and containers from creation to
@@ -42,13 +43,12 @@ machine, runc v1.3.2 with the configuration `runc spec` writes:
 
 What the gap is made of, as far as is known: runc is a Go binary that
 starts, re-executes itself to set up namespaces in C, and talks to its
-child over a socket; the sandbox clones once. Two differences remain on
-the sandbox's side and are why this is not yet a claim. Its seccomp
-filter is a denylist of the 47 calls Docker refuses that lead out of a
-container or into the kernel, where Docker's profile is an allowlist of
-about 350 and so also refuses what nobody has thought of yet. And runc
-applies AppArmor or SELinux labels where the host has them, which this
-machine does not.
+child over a socket; the sandbox clones once. One difference remains on
+the sandbox's side and is why this is not yet a claim: runc applies
+AppArmor or SELinux labels where the host has them, which this machine
+does not. The seccomp filter no longer is: it is Docker's allowlist
+(ADR-024), and the configuration `runc spec` writes has no filter at
+all, so what difference there is lies on runc's side.
 
 ## What the kubelet calls
 

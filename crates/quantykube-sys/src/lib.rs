@@ -155,67 +155,339 @@ const READ_ONLY: [&std::ffi::CStr; 5] = [
     c"/proc/sysrq-trigger",
 ];
 
-/// Syscalls refused with EPERM, the ones Docker's default profile refuses
-/// that lead out of a container or into the kernel: modules, kexec,
-/// reboot, mounts and namespaces, tracing other processes, BPF, keyrings,
-/// the clock, swap, NUMA policy and raw I/O ports. Docker's profile is an
-/// allowlist of about 350 calls; this is the part of it that matters for
-/// escaping, as a denylist, until the allowlist is worth its size.
-pub const DENIED: [(&str, u32); 47] = [
-    ("acct", 163),
-    ("add_key", 248),
-    ("bpf", 321),
-    ("clock_adjtime", 305),
-    ("clock_settime", 227),
-    ("create_module", 174),
-    ("delete_module", 176),
-    ("finit_module", 313),
-    ("get_kernel_syms", 177),
-    ("get_mempolicy", 239),
-    ("init_module", 175),
-    ("ioperm", 173),
-    ("iopl", 172),
-    ("kcmp", 312),
-    ("kexec_file_load", 320),
-    ("kexec_load", 246),
-    ("keyctl", 250),
-    ("lookup_dcookie", 212),
-    ("mbind", 237),
-    ("mount", 165),
-    ("move_mount", 429),
-    ("fsopen", 430),
-    ("fsconfig", 431),
-    ("fsmount", 432),
-    ("fspick", 433),
-    ("open_tree", 428),
-    ("move_pages", 279),
+/// The calls a container may make without condition: Docker's default
+/// seccomp profile (moby/profiles, seccomp/default.json as of commit
+/// 6fe7deb1b9fb) on x86_64, for the fourteen default capabilities, by
+/// number. Anything not here is refused with EPERM, as Docker refuses it.
+/// clone, clone3, socket and personality are checked apart, on their
+/// arguments, in [`seccomp_program`].
+pub const ALLOWED: [(&str, u32); 306] = [
+    ("read", 0),
+    ("write", 1),
+    ("open", 2),
+    ("close", 3),
+    ("stat", 4),
+    ("fstat", 5),
+    ("lstat", 6),
+    ("poll", 7),
+    ("lseek", 8),
+    ("mmap", 9),
+    ("mprotect", 10),
+    ("munmap", 11),
+    ("brk", 12),
+    ("rt_sigaction", 13),
+    ("rt_sigprocmask", 14),
+    ("rt_sigreturn", 15),
+    ("ioctl", 16),
+    ("pread64", 17),
+    ("pwrite64", 18),
+    ("readv", 19),
+    ("writev", 20),
+    ("access", 21),
+    ("pipe", 22),
+    ("select", 23),
+    ("sched_yield", 24),
+    ("mremap", 25),
+    ("msync", 26),
+    ("mincore", 27),
+    ("madvise", 28),
+    ("shmget", 29),
+    ("shmat", 30),
+    ("shmctl", 31),
+    ("dup", 32),
+    ("dup2", 33),
+    ("pause", 34),
+    ("nanosleep", 35),
+    ("getitimer", 36),
+    ("alarm", 37),
+    ("setitimer", 38),
+    ("getpid", 39),
+    ("sendfile", 40),
+    ("connect", 42),
+    ("accept", 43),
+    ("sendto", 44),
+    ("recvfrom", 45),
+    ("sendmsg", 46),
+    ("recvmsg", 47),
+    ("shutdown", 48),
+    ("bind", 49),
+    ("listen", 50),
+    ("getsockname", 51),
+    ("getpeername", 52),
+    ("socketpair", 53),
+    ("setsockopt", 54),
+    ("getsockopt", 55),
+    ("fork", 57),
+    ("vfork", 58),
+    ("execve", 59),
+    ("exit", 60),
+    ("wait4", 61),
+    ("kill", 62),
+    ("uname", 63),
+    ("semget", 64),
+    ("semop", 65),
+    ("semctl", 66),
+    ("shmdt", 67),
+    ("msgget", 68),
+    ("msgsnd", 69),
+    ("msgrcv", 70),
+    ("msgctl", 71),
+    ("fcntl", 72),
+    ("flock", 73),
+    ("fsync", 74),
+    ("fdatasync", 75),
+    ("truncate", 76),
+    ("ftruncate", 77),
+    ("getdents", 78),
+    ("getcwd", 79),
+    ("chdir", 80),
+    ("fchdir", 81),
+    ("rename", 82),
+    ("mkdir", 83),
+    ("rmdir", 84),
+    ("creat", 85),
+    ("link", 86),
+    ("unlink", 87),
+    ("symlink", 88),
+    ("readlink", 89),
+    ("chmod", 90),
+    ("fchmod", 91),
+    ("chown", 92),
+    ("fchown", 93),
+    ("lchown", 94),
+    ("umask", 95),
+    ("gettimeofday", 96),
+    ("getrlimit", 97),
+    ("getrusage", 98),
+    ("sysinfo", 99),
+    ("times", 100),
+    ("ptrace", 101),
+    ("getuid", 102),
+    ("getgid", 104),
+    ("setuid", 105),
+    ("setgid", 106),
+    ("geteuid", 107),
+    ("getegid", 108),
+    ("setpgid", 109),
+    ("getppid", 110),
+    ("getpgrp", 111),
+    ("setsid", 112),
+    ("setreuid", 113),
+    ("setregid", 114),
+    ("getgroups", 115),
+    ("setgroups", 116),
+    ("setresuid", 117),
+    ("getresuid", 118),
+    ("setresgid", 119),
+    ("getresgid", 120),
+    ("getpgid", 121),
+    ("setfsuid", 122),
+    ("setfsgid", 123),
+    ("getsid", 124),
+    ("capget", 125),
+    ("capset", 126),
+    ("rt_sigpending", 127),
+    ("rt_sigtimedwait", 128),
+    ("rt_sigqueueinfo", 129),
+    ("rt_sigsuspend", 130),
+    ("sigaltstack", 131),
+    ("utime", 132),
+    ("mknod", 133),
+    ("statfs", 137),
+    ("fstatfs", 138),
+    ("getpriority", 140),
+    ("setpriority", 141),
+    ("sched_setparam", 142),
+    ("sched_getparam", 143),
+    ("sched_setscheduler", 144),
+    ("sched_getscheduler", 145),
+    ("sched_get_priority_max", 146),
+    ("sched_get_priority_min", 147),
+    ("sched_rr_get_interval", 148),
+    ("mlock", 149),
+    ("munlock", 150),
+    ("mlockall", 151),
+    ("munlockall", 152),
+    ("modify_ldt", 154),
+    ("prctl", 157),
+    ("arch_prctl", 158),
+    ("adjtimex", 159),
+    ("setrlimit", 160),
+    ("chroot", 161),
+    ("sync", 162),
+    ("gettid", 186),
+    ("readahead", 187),
+    ("setxattr", 188),
+    ("lsetxattr", 189),
+    ("fsetxattr", 190),
+    ("getxattr", 191),
+    ("lgetxattr", 192),
+    ("fgetxattr", 193),
+    ("listxattr", 194),
+    ("llistxattr", 195),
+    ("flistxattr", 196),
+    ("removexattr", 197),
+    ("lremovexattr", 198),
+    ("fremovexattr", 199),
+    ("tkill", 200),
+    ("time", 201),
+    ("futex", 202),
+    ("sched_setaffinity", 203),
+    ("sched_getaffinity", 204),
+    ("set_thread_area", 205),
+    ("io_setup", 206),
+    ("io_destroy", 207),
+    ("io_getevents", 208),
+    ("io_submit", 209),
+    ("io_cancel", 210),
+    ("get_thread_area", 211),
+    ("epoll_create", 213),
+    ("epoll_ctl_old", 214),
+    ("epoll_wait_old", 215),
+    ("remap_file_pages", 216),
+    ("getdents64", 217),
+    ("set_tid_address", 218),
+    ("restart_syscall", 219),
+    ("semtimedop", 220),
+    ("fadvise64", 221),
+    ("timer_create", 222),
+    ("timer_settime", 223),
+    ("timer_gettime", 224),
+    ("timer_getoverrun", 225),
+    ("timer_delete", 226),
+    ("clock_gettime", 228),
+    ("clock_getres", 229),
+    ("clock_nanosleep", 230),
+    ("exit_group", 231),
+    ("epoll_wait", 232),
+    ("epoll_ctl", 233),
+    ("tgkill", 234),
+    ("utimes", 235),
+    ("mq_open", 240),
+    ("mq_unlink", 241),
+    ("mq_timedsend", 242),
+    ("mq_timedreceive", 243),
+    ("mq_notify", 244),
+    ("mq_getsetattr", 245),
+    ("waitid", 247),
+    ("ioprio_set", 251),
+    ("ioprio_get", 252),
+    ("inotify_init", 253),
+    ("inotify_add_watch", 254),
+    ("inotify_rm_watch", 255),
+    ("openat", 257),
+    ("mkdirat", 258),
+    ("mknodat", 259),
+    ("fchownat", 260),
+    ("futimesat", 261),
+    ("newfstatat", 262),
+    ("unlinkat", 263),
+    ("renameat", 264),
+    ("linkat", 265),
+    ("symlinkat", 266),
+    ("readlinkat", 267),
+    ("fchmodat", 268),
+    ("faccessat", 269),
+    ("pselect6", 270),
+    ("ppoll", 271),
+    ("set_robust_list", 273),
+    ("get_robust_list", 274),
+    ("splice", 275),
+    ("tee", 276),
+    ("sync_file_range", 277),
+    ("vmsplice", 278),
+    ("utimensat", 280),
+    ("epoll_pwait", 281),
+    ("signalfd", 282),
+    ("timerfd_create", 283),
+    ("eventfd", 284),
+    ("fallocate", 285),
+    ("timerfd_settime", 286),
+    ("timerfd_gettime", 287),
+    ("accept4", 288),
+    ("signalfd4", 289),
+    ("eventfd2", 290),
+    ("epoll_create1", 291),
+    ("dup3", 292),
+    ("pipe2", 293),
+    ("inotify_init1", 294),
+    ("preadv", 295),
+    ("pwritev", 296),
+    ("rt_tgsigqueueinfo", 297),
+    ("recvmmsg", 299),
+    ("fanotify_mark", 301),
+    ("prlimit64", 302),
     ("name_to_handle_at", 303),
-    ("nfsservctl", 180),
-    ("open_by_handle_at", 304),
-    ("perf_event_open", 298),
-    ("pivot_root", 155),
+    ("clock_adjtime", 305),
+    ("syncfs", 306),
+    ("sendmmsg", 307),
+    ("getcpu", 309),
     ("process_vm_readv", 310),
     ("process_vm_writev", 311),
-    ("ptrace", 101),
-    ("query_module", 178),
-    ("quotactl", 179),
-    ("reboot", 169),
-    ("request_key", 249),
-    ("set_mempolicy", 238),
-    ("setns", 308),
-    ("settimeofday", 164),
-    ("swapon", 167),
-    ("swapoff", 168),
-    ("syslog", 103),
-    ("umount2", 166),
-    ("unshare", 272),
+    ("sched_setattr", 314),
+    ("sched_getattr", 315),
+    ("renameat2", 316),
+    ("seccomp", 317),
+    ("getrandom", 318),
+    ("memfd_create", 319),
+    ("execveat", 322),
+    ("membarrier", 324),
+    ("mlock2", 325),
+    ("copy_file_range", 326),
+    ("preadv2", 327),
+    ("pwritev2", 328),
+    ("pkey_mprotect", 329),
+    ("pkey_alloc", 330),
+    ("pkey_free", 331),
+    ("statx", 332),
+    ("io_pgetevents", 333),
+    ("rseq", 334),
+    ("uretprobe", 335),
+    ("pidfd_send_signal", 424),
+    ("pidfd_open", 434),
+    ("close_range", 436),
+    ("openat2", 437),
+    ("faccessat2", 439),
+    ("epoll_pwait2", 441),
+    ("landlock_create_ruleset", 444),
+    ("landlock_add_rule", 445),
+    ("landlock_restrict_self", 446),
+    ("memfd_secret", 447),
+    ("process_mrelease", 448),
+    ("futex_waitv", 449),
+    ("cachestat", 451),
+    ("fchmodat2", 452),
+    ("map_shadow_stack", 453),
+    ("futex_wake", 454),
+    ("futex_wait", 455),
+    ("futex_requeue", 456),
+    ("statmount", 457),
+    ("listmount", 458),
+    ("mseal", 462),
+    ("setxattrat", 463),
+    ("getxattrat", 464),
+    ("listxattrat", 465),
+    ("removexattrat", 466),
 ];
 
 const SYS_CLONE_NR: u32 = 56;
 const SYS_CLONE3_NR: u32 = 435;
+const SYS_SOCKET_NR: u32 = 41;
+const SYS_PERSONALITY_NR: u32 = 135;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const X32_BIT: u32 = 0x4000_0000;
 const NAMESPACE_FLAGS: u32 = 0x7e02_0080;
+
+/// The socket families Docker allows. Missing are AF_ALG, AF_VSOCK, the
+/// old radio and LAN protocols (AX.25, IPX, AppleTalk, DECnet and their
+/// kind) and every family added after the profile.
+const SOCKET_FAMILIES: [u32; 32] = [
+    0, 1, 2, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 21, 22, 24, 26, 27, 28, 29, 30, 31, 32, 33, 35,
+    36, 39, 41, 42, 43, 44, 45,
+];
+
+/// Linux, the 32 bit personality, UNAME26, both, and the query.
+const PERSONALITIES: [u32; 5] = [0, 8, 0x2_0000, 0x2_0008, 0xffff_ffff];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +506,8 @@ struct SockFprog {
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JEQ_K: u16 = 0x15;
+const BPF_JGT_K: u16 = 0x25;
+const BPF_JGE_K: u16 = 0x35;
 const BPF_JSET_K: u16 = 0x45;
 const BPF_RET_K: u16 = 0x06;
 const RET_ALLOW: u32 = 0x7fff_0000;
@@ -241,6 +515,8 @@ const RET_KILL_PROCESS: u32 = 0x8000_0000;
 const RET_ERRNO: u32 = 0x0005_0000;
 const EPERM: u32 = 1;
 const ENOSYS: u32 = 38;
+const ARG0_LO: u32 = 16;
+const ARG0_HI: u32 = 20;
 
 fn stmt(code: u16, k: u32) -> SockFilter {
     SockFilter {
@@ -251,15 +527,43 @@ fn stmt(code: u16, k: u32) -> SockFilter {
     }
 }
 
-fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
-    SockFilter { code, jt, jf, k }
+fn jump(code: u16, k: u32, jt: usize, jf: usize) -> SockFilter {
+    let off = |n: usize| u8::try_from(n).expect("a BPF jump is at most 255 forward");
+    SockFilter {
+        code,
+        jt: off(jt),
+        jf: off(jf),
+        k,
+    }
 }
 
-/// The seccomp program: the wrong architecture or the x32 ABI kills,
-/// clone with namespace flags and the denied calls get EPERM, clone3
-/// gets ENOSYS so libc falls back to clone, where the flags can be seen
-/// (clone3 passes them in memory a filter cannot read), and the rest is
-/// allowed. Offsets in seccomp_data: nr at 0, arch at 4, args from 16.
+/// A call allowed only when its first argument, all 64 bits, is one of
+/// `values`. Expects the syscall number in the accumulator and leaves it
+/// there for whatever follows when the number does not match.
+fn first_arg_one_of(nr: u32, values: &[u32]) -> Vec<SockFilter> {
+    let n = values.len();
+    let mut b = vec![
+        stmt(BPF_LD_W_ABS, ARG0_HI),
+        jump(BPF_JEQ_K, 0, 0, n + 1),
+        stmt(BPF_LD_W_ABS, ARG0_LO),
+    ];
+    for (i, v) in values.iter().enumerate() {
+        b.push(jump(BPF_JEQ_K, *v, n - i, 0));
+    }
+    b.push(stmt(BPF_RET_K, RET_ERRNO | EPERM));
+    b.push(stmt(BPF_RET_K, RET_ALLOW));
+    let mut p = vec![jump(BPF_JEQ_K, nr, 0, b.len())];
+    p.append(&mut b);
+    p
+}
+
+/// The seccomp program: the wrong architecture or the x32 ABI kills;
+/// clone3 gets ENOSYS so libc falls back to clone, where the flags can be
+/// seen (clone3 passes them in memory a filter cannot read); clone with
+/// namespace flags, socket with a family Docker refuses and personality
+/// with a value it refuses get EPERM; then [`ALLOWED`], as ranges of
+/// consecutive numbers, and EPERM for the rest. Offsets in seccomp_data:
+/// nr at 0, arch at 4, args from 16.
 fn seccomp_program() -> Vec<SockFilter> {
     let mut p = vec![
         stmt(BPF_LD_W_ABS, 4),
@@ -270,21 +574,30 @@ fn seccomp_program() -> Vec<SockFilter> {
         stmt(BPF_RET_K, RET_KILL_PROCESS),
         jump(BPF_JEQ_K, SYS_CLONE3_NR, 0, 1),
         stmt(BPF_RET_K, RET_ERRNO | ENOSYS),
-        jump(BPF_JEQ_K, SYS_CLONE_NR, 0, 3),
-        stmt(BPF_LD_W_ABS, 16),
+        jump(BPF_JEQ_K, SYS_CLONE_NR, 0, 4),
+        stmt(BPF_LD_W_ABS, ARG0_LO),
         jump(BPF_JSET_K, NAMESPACE_FLAGS, 0, 1),
         stmt(BPF_RET_K, RET_ERRNO | EPERM),
+        stmt(BPF_RET_K, RET_ALLOW),
     ];
-    // the clone branch reloaded the accumulator, so the denylist starts
-    // with the syscall number again
-    p.push(stmt(BPF_LD_W_ABS, 0));
-    let n = DENIED.len();
-    for (i, (_, nr)) in DENIED.iter().enumerate() {
-        // jump over the remaining checks and the allow to the EPERM return
-        p.push(jump(BPF_JEQ_K, *nr, (n - i) as u8, 0));
+    p.extend(first_arg_one_of(SYS_SOCKET_NR, &SOCKET_FAMILIES));
+    p.extend(first_arg_one_of(SYS_PERSONALITY_NR, &PERSONALITIES));
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for (_, nr) in ALLOWED {
+        match ranges.last_mut() {
+            Some((_, hi)) if *hi + 1 == nr => *hi = nr,
+            _ => ranges.push((nr, nr)),
+        }
     }
-    p.push(stmt(BPF_RET_K, RET_ALLOW));
+    // ascending: below a range's start nothing later can match
+    let n = ranges.len();
+    for (i, (lo, hi)) in ranges.into_iter().enumerate() {
+        let left = 2 * (n - i) - 1;
+        p.push(jump(BPF_JGE_K, lo, 0, left));
+        p.push(jump(BPF_JGT_K, hi, 0, left));
+    }
     p.push(stmt(BPF_RET_K, RET_ERRNO | EPERM));
+    p.push(stmt(BPF_RET_K, RET_ALLOW));
     p
 }
 
@@ -1277,36 +1590,113 @@ mod tests {
     }
 
     #[test]
-    fn denied_syscall_numbers_match_the_kernel_headers() {
+    fn syscall_numbers_match_the_kernel_headers() {
         let Ok(h) = std::fs::read_to_string("/usr/include/x86_64-linux-gnu/asm/unistd_64.h") else {
             eprintln!("no kernel headers, not checked");
             return;
         };
-        for (name, nr) in DENIED
-            .iter()
-            .chain(&[("clone", SYS_CLONE_NR), ("clone3", SYS_CLONE3_NR)])
-        {
-            let line = format!("#define __NR_{name} {nr}");
-            assert!(h.lines().any(|l| l.trim() == line), "{name} is not {nr}");
+        let known: Vec<(&str, u32)> = h
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.strip_prefix("#define __NR_")?.split_whitespace();
+                Some((w.next()?, w.next()?.parse().ok()?))
+            })
+            .collect();
+        assert!(known.len() > 300, "headers not parsed");
+        let special = [
+            ("clone", SYS_CLONE_NR),
+            ("clone3", SYS_CLONE3_NR),
+            ("socket", SYS_SOCKET_NR),
+            ("personality", SYS_PERSONALITY_NR),
+        ];
+        for (name, nr) in ALLOWED.iter().chain(&special) {
+            match known.iter().find(|(n, _)| n == name) {
+                Some((_, k)) => assert_eq!(k, nr, "{name}"),
+                // newer than these headers, so its number must be free here
+                None => assert!(known.iter().all(|(_, k)| k != nr), "{name} is not {nr}"),
+            }
         }
     }
 
     #[test]
-    fn every_seccomp_jump_lands_inside_the_program() {
+    fn the_allowlist_is_sorted_and_leaves_the_checked_calls_out() {
+        assert!(ALLOWED.windows(2).all(|w| w[0].1 < w[1].1));
+        for nr in [
+            SYS_CLONE_NR,
+            SYS_CLONE3_NR,
+            SYS_SOCKET_NR,
+            SYS_PERSONALITY_NR,
+        ] {
+            assert!(ALLOWED.iter().all(|(_, n)| *n != nr));
+        }
+        let allowed = |name| ALLOWED.iter().any(|(n, _)| *n == name);
+        for name in ["mount", "bpf", "keyctl", "userfaultfd", "io_uring_setup"] {
+            assert!(!allowed(name), "{name}");
+        }
+        // as in Docker's profile from kernel 4.8, where ptrace can no
+        // longer be used to get around seccomp
+        assert!(allowed("ptrace"));
+    }
+
+    /// Runs the program the way the kernel would, on one seccomp_data.
+    fn run(p: &[SockFilter], arch: u32, nr: u32, arg0: u64) -> u32 {
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_ne_bytes());
+        data[4..8].copy_from_slice(&arch.to_ne_bytes());
+        data[16..24].copy_from_slice(&arg0.to_ne_bytes());
+        let (mut pc, mut a) = (0, 0u32);
+        loop {
+            let ins = p[pc];
+            let taken = match ins.code {
+                BPF_LD_W_ABS => {
+                    let at = ins.k as usize;
+                    a = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                    pc += 1;
+                    continue;
+                }
+                BPF_RET_K => return ins.k,
+                BPF_JEQ_K => a == ins.k,
+                BPF_JGT_K => a > ins.k,
+                BPF_JGE_K => a >= ins.k,
+                BPF_JSET_K => a & ins.k != 0,
+                c => panic!("unexpected instruction {c:#x}"),
+            };
+            pc += 1 + if taken { ins.jt } else { ins.jf } as usize;
+        }
+    }
+
+    #[test]
+    fn the_program_allows_exactly_the_allowlist() {
         let p = seccomp_program();
         assert!(p.len() < 4096, "the kernel's limit");
-        for (i, ins) in p.iter().enumerate() {
-            if ins.code == BPF_JEQ_K || ins.code == BPF_JSET_K {
-                for off in [ins.jt, ins.jf] {
-                    assert!(
-                        i + 1 + (off as usize) < p.len(),
-                        "jump at {i} leaves the program"
-                    );
-                }
-            }
+        let x86 = AUDIT_ARCH_X86_64;
+        let eperm = RET_ERRNO | EPERM;
+        for nr in 0..1024 {
+            let want = match nr {
+                SYS_CLONE3_NR => RET_ERRNO | ENOSYS,
+                // with a first argument of 0: no flags, AF_UNSPEC, Linux
+                SYS_CLONE_NR | SYS_SOCKET_NR | SYS_PERSONALITY_NR => RET_ALLOW,
+                _ if ALLOWED.iter().any(|(_, n)| *n == nr) => RET_ALLOW,
+                _ => eperm,
+            };
+            assert_eq!(run(&p, x86, nr, 0), want, "syscall {nr}");
         }
-        assert_eq!(p[p.len() - 1], stmt(BPF_RET_K, RET_ERRNO | EPERM));
-        assert_eq!(p[p.len() - 2], stmt(BPF_RET_K, RET_ALLOW));
+        assert_eq!(run(&p, 0x4000_0003, 39, 0), RET_KILL_PROCESS, "i386");
+        assert_eq!(run(&p, x86, X32_BIT | 39, 0), RET_KILL_PROCESS, "x32");
+        let clone = |flags| run(&p, x86, SYS_CLONE_NR, flags);
+        assert_eq!(clone(0x003d_0f00), RET_ALLOW, "a thread");
+        assert_eq!(clone(CLONE_NEWNS | SIGCHLD), eperm);
+        assert_eq!(clone(0x80), eperm, "CLONE_NEWTIME");
+        let socket = |family| run(&p, x86, SYS_SOCKET_NR, family);
+        for f in SOCKET_FAMILIES {
+            assert_eq!(socket(f as u64), RET_ALLOW, "family {f}");
+        }
+        for f in [3, 4, 5, 38, 40, 46, 1 << 32 | 2] {
+            assert_eq!(socket(f), eperm, "family {f}");
+        }
+        let personality = |v| run(&p, x86, SYS_PERSONALITY_NR, v);
+        assert_eq!(personality(0xffff_ffff), RET_ALLOW, "the query");
+        assert_eq!(personality(0x0040_0000), eperm, "READ_IMPLIES_EXEC");
     }
 
     #[test]

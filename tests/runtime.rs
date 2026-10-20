@@ -30,18 +30,24 @@ fn digest(data: &[u8]) -> String {
 
 /// An OCI image directory, `manifest.json` plus `blobs/`, with one layer.
 fn build_image(at: &Path) {
+    build_image_with(at, &[]);
+}
+
+/// The same, with more of the host's programs in its /bin.
+fn build_image_with(at: &Path, extra: &[&Path]) {
     let root = at.join("layer");
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::create_dir_all(root.join("etc")).unwrap();
-    for b in [
+    let base = [
         "/bin/sh",
         "/bin/cat",
         "/bin/ls",
         "/bin/sleep",
         "/bin/hostname",
-    ] {
+    ];
+    for b in base.iter().map(Path::new).chain(extra.iter().copied()) {
         let real = fs::canonicalize(b).unwrap();
-        fs::copy(&real, root.join(&b[1..])).unwrap();
+        fs::copy(&real, root.join("bin").join(b.file_name().unwrap())).unwrap();
         let ldd = Command::new("ldd").arg(&real).output().unwrap();
         for lib in String::from_utf8_lossy(&ldd.stdout)
             .split_whitespace()
@@ -502,5 +508,67 @@ fn an_oci_layout_imports_as_the_same_image() {
     let rt = Runtime::new(&base.join("state2")).unwrap();
     let err = rt.import(&layout, "c").unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
+    fs::remove_dir_all(&base).unwrap();
+}
+
+fn in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")?
+        .to_str()?
+        .split(':')
+        .map(|d| Path::new(d).join(name))
+        .find(|p| p.is_file())
+}
+
+#[test]
+fn seccomp_refuses_what_docker_refuses_and_nothing_a_program_needs() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let Some(perl) = in_path("perl") else {
+        eprintln!("no perl to make the refused call, skipped");
+        return;
+    };
+    let ping = ["busybox", "ping"].into_iter().find_map(in_path);
+    let base = scratch("seccomp");
+    let mut extra = vec![perl.as_path()];
+    extra.extend(ping.as_deref());
+    build_image_with(&base.join("image"), &extra);
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "seccomp".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ping = match ping.as_deref().and_then(|p| p.file_name()) {
+        Some(n) if n == "busybox" => "busybox ping -c 1 127.0.0.1 >/dev/null && echo pinged",
+        Some(_) => "ping -c 1 127.0.0.1 >/dev/null && echo pinged",
+        None => {
+            eprintln!("no busybox or ping, the network is not tried");
+            "echo pinged"
+        }
+    };
+    // process_madvise(-1, ...) fails with EBADF where it is allowed, and
+    // neither Docker's profile nor the old denylist let it through
+    let refused = "perl -e 'syscall(440, -1, 0, 0, 0, 0); print 0 + $!, \"\\n\"'";
+    let script = format!("echo data > /f && cat /f; sleep 0.1 && echo slept; {ping}; {refused}");
+    let id = rt
+        .create_container(&pod, spec("seccomp", &[&script]))
+        .unwrap();
+    rt.start_container(&id).unwrap();
+    let done = wait_exited(&rt, &id);
+    let log = fs::read_to_string(logs.join("seccomp.log")).unwrap();
+    let out: Vec<&str> = log
+        .lines()
+        .map(|l| l.splitn(4, ' ').nth(3).unwrap_or(""))
+        .collect();
+    assert_eq!(done.exit_code, 0, "{log}");
+    assert_eq!(out, ["data", "slept", "pinged", "1"], "{log}");
+    rt.remove_pod(&pod).unwrap();
+    rt.remove_image("test/sh:1").unwrap();
     fs::remove_dir_all(&base).unwrap();
 }

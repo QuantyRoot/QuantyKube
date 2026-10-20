@@ -28,6 +28,7 @@ through and add a new entry, never silently edit history.
 - [ADR-021](#adr-021-exec-joins-the-container-through-a-second-fork) Exec joins the container through a second fork
 - [ADR-022](#adr-022-pod-networks-come-from-cni-plugins) Pod networks come from CNI plugins
 - [ADR-023](#adr-023-users-resolve-inside-the-image-and-non-root-means-no-capabilities) Users resolve inside the image, and non-root means no capabilities
+- [ADR-024](#adr-024-the-seccomp-filter-is-dockers-allowlist) The seccomp filter is Docker's allowlist
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -408,6 +409,8 @@ child waits on a pipe until the parent has put it into its cgroup, so
 none of its own code runs outside the limits. It is not a runtime yet:
 no CRI and no image store.
 
+ADR-024 replaced the 47 calls with Docker's allowlist.
+
 **The cost:** a crate of code the compiler cannot check, written against
 one libc and one architecture, x86_64 Linux, until a second one is needed.
 
@@ -672,3 +675,41 @@ right after a start could join a mount namespace still being set up.
 **The cost:** user namespaces are not used, so root in a container is
 root on the host, held in only by capabilities, seccomp and the mounts.
 
+## ADR-024: The seccomp filter is Docker's allowlist
+
+ADR-013's filter refused 47 calls and let the rest through. It now
+allows what Docker's default profile allows and refuses everything else
+with EPERM, as Docker does: a call the kernel gains next year is refused
+until someone decides it is safe, instead of allowed until someone
+notices that it is not.
+
+The list is `seccomp/default.json` in moby/profiles as of commit
+6fe7deb1b9fb, read for x86_64 and the fourteen default capabilities.
+That is 306 calls without condition, `chroot` among them because
+CAP_SYS_CHROOT is kept, and none of the groups for capabilities a
+container does not have. Three more are allowed on their first argument,
+as in the profile: `clone` without namespace flags, `socket` for the 32
+families Docker lists, which leaves out AF_ALG, AF_VSOCK and the old
+radio and LAN protocols, and `personality` for the five values it lists.
+`clone3` still gets ENOSYS. The numbers are written out by hand; a test
+checks them against the kernel headers on the machine, and another runs
+the program over every call number and the arguments that matter.
+
+Five calls the old list refused are allowed now, because Docker allows
+them: `ptrace`, `process_vm_readv` and `process_vm_writev` on kernels
+from 4.8, where ptrace can no longer be used to get around seccomp;
+`clock_adjtime`, which only reads without CAP_SYS_TIME; and
+`name_to_handle_at`, whose handles are of no use while
+`open_by_handle_at` stays refused.
+
+Left out: Docker admits i386 and x32 calls on x86_64, and this filter
+still kills a process that makes either, as ADR-013's did. No argument
+check of the profile is skipped on x86_64, and the clone check is the
+stricter one, since it also refuses CLONE_NEWTIME. Nothing is logged:
+the profile has no SCMP_ACT_LOG rule, and a refused call shows only as
+the EPERM the program gets.
+
+**The cost:** the list follows Docker's by hand, and a program that
+needs a call Docker refuses fails here as it does there; starts are no
+slower (3.73 against 3.74 ms median over 300 alternating starts), since
+the kernel caches its answer for calls allowed whatever their arguments.
