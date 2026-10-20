@@ -464,7 +464,9 @@ impl<S: Storage + 'static> Quanty<S> {
             let db = self.db.read().unwrap_or_else(|e| e.into_inner());
             let mut tx = db.begin();
             let old: Vec<Vec<u8>> = tx
-                .scan(Some(&[LOG]), Some(&log_key(from + 1, 0)))?
+                // the changes at `from` itself stay: a watch may start
+                // at the compaction revision and must get them
+                .scan(Some(&[LOG]), Some(&log_key(from, 0)))?
                 .map(|r| r.map(|(k, _)| k))
                 .collect::<std::result::Result<_, _>>()?;
             for k in &old {
@@ -1242,7 +1244,15 @@ mod tests {
             .iter()
             .map(|h| h.rev)
             .collect();
-        assert_eq!(kept, [5, 6]);
+        assert_eq!(kept, [4, 5, 6]);
+        // a watch from the compaction revision gets that revision's change
+        let mut at_compaction = Vec::new();
+        s.changes(4, 4, &mut |rev, _| {
+            at_compaction.push(rev);
+            true
+        })
+        .unwrap();
+        assert_eq!(at_compaction, [4]);
     }
 
     #[test]

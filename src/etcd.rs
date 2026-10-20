@@ -121,12 +121,14 @@ impl<B: Backend> Etcd<B> {
         // transaction, which commits nothing when nothing changes
         store.write(&mut |tx| {
             tx.meta_scan(b"lease/", &mut |k, v| {
-                if let (Ok(id), Some((ttl, exp))) = (<[u8; 8]>::try_from(&k[6..]), decode_pair(v)) {
+                // as etcd after a restart or a leader change: every lease
+                // gets its full TTL again, since keepalives are not stored
+                if let (Ok(id), Some((ttl, _))) = (<[u8; 8]>::try_from(&k[6..]), decode_pair(v)) {
                     leases.insert(
                         u64::from_be_bytes(id) as i64,
                         Lease {
                             ttl,
-                            expires_ms: exp,
+                            expires_ms: now_ms() + ttl * 1000,
                         },
                     );
                 }
@@ -398,9 +400,14 @@ impl<B: Backend> Etcd<B> {
 
     fn lease_grant(&self, req: &LeaseGrantRequest) -> Result<LeaseGrantResponse, Status> {
         let ttl = req.ttl.max(1);
+        let lease = Lease {
+            ttl,
+            expires_ms: now_ms() + ttl * 1000,
+        };
+        // the id is taken before the write, so two grants never share it
         let id = {
-            let leases = self.leases.lock().unwrap();
-            if req.id != 0 {
+            let mut leases = self.leases.lock().unwrap();
+            let id = if req.id != 0 {
                 if leases.contains_key(&req.id) {
                     return Err(status(code::FAILED_PRECONDITION, "lease already exists"));
                 }
@@ -411,11 +418,9 @@ impl<B: Backend> Etcd<B> {
                     id += 1;
                 }
                 id
-            }
-        };
-        let lease = Lease {
-            ttl,
-            expires_ms: now_ms() + ttl * 1000,
+            };
+            leases.insert(id, lease);
+            id
         };
         let rev = self
             .run_write(
@@ -425,8 +430,10 @@ impl<B: Backend> Etcd<B> {
                 },
                 |_, _| {},
             )
-            .map(|_| self.store.head())?;
-        self.leases.lock().unwrap().insert(id, lease);
+            .map(|_| self.store.head())
+            .inspect_err(|_| {
+                self.leases.lock().unwrap().remove(&id);
+            })?;
         Ok(LeaseGrantResponse {
             header: self.header(rev),
             id,
@@ -491,8 +498,8 @@ impl<B: Backend> Etcd<B> {
             }
             None => 0,
         };
-        // renewal stays in memory: after a restart a lease runs its full
-        // TTL again, which is what etcd does after a leader change too
+        // renewal stays in memory: after a restart every lease runs its
+        // full TTL again (Etcd::new), as with etcd after a leader change
         LeaseKeepAliveResponse {
             header: self.header(self.store.head()),
             id,
@@ -1898,5 +1905,54 @@ mod tests {
         drop(tx);
         t.join().unwrap();
         assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn two_grants_never_get_the_same_lease() {
+        let e = etcd();
+        let grants: Vec<_> = (0..8)
+            .map(|_| {
+                let e = e.clone();
+                std::thread::spawn(move || {
+                    let req = LeaseGrantRequest { id: 42, ttl: 60 };
+                    e.unary("/etcdserverpb.Lease/LeaseGrant", &req.encode())
+                        .is_ok()
+                })
+            })
+            .collect();
+        let ok = grants
+            .into_iter()
+            .map(|g| g.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(ok, 1);
+    }
+
+    // keepalives are not stored, so after a restart a lease that was kept
+    // alive past its first expiry must not be revoked on the spot
+    #[test]
+    fn a_restart_gives_every_lease_its_full_ttl() {
+        let store = Arc::new(Quanty::in_memory().unwrap());
+        let e = Etcd::new(store.clone(), "unix:///test".into()).unwrap();
+        let grant: LeaseGrantResponse = call(
+            &e,
+            "/etcdserverpb.Lease/LeaseGrant",
+            LeaseGrantRequest { id: 0, ttl: 1 },
+        );
+        put(&e, "/held", "v", grant.id);
+        std::thread::sleep(Duration::from_millis(600));
+        e.keep_alive(grant.id);
+        std::thread::sleep(Duration::from_millis(600));
+        let restarted = Etcd::new(store, "unix:///test".into()).unwrap();
+        restarted.expire_leases();
+        let r: RangeResponse = call(
+            &restarted,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/held".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.count, 1);
     }
 }
