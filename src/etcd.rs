@@ -1778,29 +1778,38 @@ mod tests {
         }
     }
 
+    type Go = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+    struct StalledWatch {
+        got: Arc<Mutex<Vec<WatchResponse>>>,
+        go: Go,
+        requests: mpsc::Sender<Vec<u8>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
     fn stalled_watch(
         e: &Arc<Etcd<Quanty<quantydb_core::MemStorage>>>,
         create: WatchCreateRequest,
-    ) -> (
-        Arc<Mutex<Vec<WatchResponse>>>,
-        Arc<(Mutex<bool>, std::sync::Condvar)>,
-        mpsc::Sender<Vec<u8>>,
-        std::thread::JoinHandle<()>,
-    ) {
+    ) -> StalledWatch {
         let got = Arc::new(Mutex::new(Vec::new()));
-        let go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let (tx, rx) = mpsc::channel();
+        let go: Go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (requests, rx) = mpsc::channel();
         let mut out = Stalled {
             got: got.clone(),
             go: go.clone(),
         };
         let e2 = e.clone();
-        let t = std::thread::spawn(move || e2.watch(rx, &mut out));
+        let thread = std::thread::spawn(move || e2.watch(rx, &mut out));
         let req = WatchRequest {
             request_union: Some(WatchRequestUnion::Create(create)),
         };
-        tx.send(req.encode()).unwrap();
-        (got, go, tx, t)
+        requests.send(req.encode()).unwrap();
+        StalledWatch {
+            got,
+            go,
+            requests,
+            thread,
+        }
     }
 
     fn release(go: &(Mutex<bool>, std::sync::Condvar)) {
@@ -1819,7 +1828,12 @@ mod tests {
         for i in 0..30 {
             put(&e, &format!("/r/{i:04}"), "v", 0);
         }
-        let (got, go, tx, t) = stalled_watch(
+        let StalledWatch {
+            got,
+            go,
+            requests: tx,
+            thread: t,
+        } = stalled_watch(
             &e,
             WatchCreateRequest {
                 key: "/r/".into(),
@@ -1853,7 +1867,12 @@ mod tests {
     fn a_watch_that_fell_behind_misses_nothing() {
         let e = etcd();
         e.inbox.store(8, Ordering::Relaxed);
-        let (got, go, tx, t) = stalled_watch(
+        let StalledWatch {
+            got,
+            go,
+            requests: tx,
+            thread: t,
+        } = stalled_watch(
             &e,
             WatchCreateRequest {
                 key: "/k".into(),
