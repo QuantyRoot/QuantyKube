@@ -95,5 +95,10 @@ case $ip in 10.42.0.*) ;; *) fail "pod address: $ip" ;; esac
 sleep 6
 [ "$(k get pod hello -o jsonpath='{.status.containerStatuses[0].restartCount}')" = 0 ] ||
     fail "the liveness probe failed"
+# for the record, not a check
+for p in "${pids[@]}"; do
+    awk -v p="$p" '/^VmRSS/ { printf "%6d KiB  pid %s\n", $2, p }' "/proc/$p/status"
+    tr '\0' ' ' <"/proc/$p/cmdline" | cut -c1-60
+done
 k delete pod hello --wait=true --timeout=60s >/dev/null || fail "delete"
 echo "cluster: ok"
