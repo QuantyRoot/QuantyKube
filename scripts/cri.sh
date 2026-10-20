@@ -10,6 +10,7 @@ QK=$(realpath "${QK:-target/release/quantykube}")
 work=$(mktemp -d)
 cleanup() {
     [ -z "${rt:-}" ] || kill "$rt" 2>/dev/null || true
+    grep -o "$work[^ ]*" /proc/self/mounts | sort -r | xargs -r umount 2>/dev/null || true
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -54,6 +55,13 @@ done
 [ "$(c logs "$ctr")" = "web-0 hi" ] || fail "logs: $(c logs "$ctr")"
 [ "$(cat "$work/volume/f")" = kept ] || fail "volume"
 c ps -q --state running | grep -qx "$ctr" || fail "not running"
+
+# exec joins the container: its environment, and its PID namespace
+got=$(c exec -s "$ctr" sh -c 'echo $GREETING; [ -d /proc/$$ ] && echo own pid') || true
+[ "$got" = "$(printf 'hi\nown pid')" ] || fail "exec: $got"
+start=$(date +%s)
+! c exec -s --timeout 1 "$ctr" sleep 30 >/dev/null || fail "exec timeout"
+[ $(($(date +%s) - start)) -lt 5 ] || fail "exec outlived its timeout"
 
 # a shell as PID 1 ignores SIGTERM, so this takes the SIGKILL
 c stop -t 1 "$ctr" >/dev/null

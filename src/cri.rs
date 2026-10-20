@@ -10,6 +10,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// what the kubelet takes as a probe that timed out
+const DEADLINE_EXCEEDED: u32 = 4;
+
 pub struct Cri {
     rt: Arc<Runtime>,
 }
@@ -28,6 +31,7 @@ fn status(e: runtime::Error) -> Status {
     match e {
         runtime::Error::NotFound(_) => Status::new(code::NOT_FOUND, e.to_string()),
         runtime::Error::Invalid(_) => Status::new(code::INVALID_ARGUMENT, e.to_string()),
+        runtime::Error::Timeout => Status::new(DEADLINE_EXCEEDED, e.to_string()),
         runtime::Error::Io(_) => Status::new(code::INTERNAL, e.to_string()),
     }
 }
@@ -571,6 +575,19 @@ impl Cri {
             ("runtime.v1.RuntimeService", "ContainerStatus") => {
                 let r = req!(ContainerStatusRequest);
                 self.container_status(&r.container_id)?.encode()
+            }
+            ("runtime.v1.RuntimeService", "ExecSync") => {
+                let r = req!(ExecSyncRequest);
+                let timeout = (r.timeout > 0).then(|| Duration::from_secs(r.timeout as u64));
+                let out = rt
+                    .exec_sync(&r.container_id, &r.cmd, timeout)
+                    .map_err(status)?;
+                ExecSyncResponse {
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    exit_code: out.exit_code,
+                }
+                .encode()
             }
             ("runtime.v1.RuntimeService", "ContainerStats") => {
                 let r = req!(ContainerStatsRequest);

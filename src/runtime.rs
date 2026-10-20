@@ -113,10 +113,22 @@ pub struct Container {
     pub cgroup: Option<PathBuf>,
 }
 
+/// What `exec_sync` keeps of each stream; the kubelet itself keeps far
+/// less of a probe's output.
+const EXEC_OUTPUT: u64 = 16 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecResult {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
 #[derive(Debug)]
 pub enum Error {
     NotFound(String),
     Invalid(String),
+    Timeout,
     Io(io::Error),
 }
 
@@ -131,6 +143,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::NotFound(what) => write!(f, "{what} not found"),
             Error::Invalid(why) => f.write_str(why),
+            Error::Timeout => f.write_str("timed out"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }
@@ -553,22 +566,12 @@ impl Runtime {
         if !argv[0].contains('/') {
             argv[0] = resolve_in_path(&lower, &argv[0], &img.config.env, &c.spec.env);
         }
-        let mut env = img.config.env.clone();
-        for (k, v) in &c.spec.env {
-            env.retain(|e| e.split('=').next() != Some(k));
-            env.push(format!("{k}={v}"));
-        }
+        let env = container_env(&img.config.env, &c.spec.env);
         let dir = self.dir.join("containers").join(id);
         let bytes = |p: &Path| p.as_os_str().as_encoded_bytes().to_vec();
         let argv_b: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let env_b: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
-        let cwd = if !c.spec.working_dir.is_empty() {
-            c.spec.working_dir.clone()
-        } else if !img.config.working_dir.is_empty() {
-            img.config.working_dir.clone()
-        } else {
-            "/".into()
-        };
+        let cwd = working_dir(&c, &img);
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
         let mut spawn = sys::Spawn::new(&bytes(&dir.join("rootfs")), &argv_b, &env_b)?
@@ -681,6 +684,90 @@ impl Runtime {
         Ok(())
     }
 
+    /// Runs a command in the running container and returns its output
+    /// and exit code, as liveness probes and `kubectl exec` without a
+    /// terminal do. A command still running at `timeout` is killed.
+    pub fn exec_sync(
+        &self,
+        id: &str,
+        cmd: &[String],
+        timeout: Option<Duration>,
+    ) -> Result<ExecResult> {
+        let c = self.container(id)?;
+        if c.state != ContainerState::Running {
+            return Err(Error::Invalid(format!("container {id} is not running")));
+        }
+        let img = self
+            .find_image(&c.image_id)
+            .ok_or_else(|| Error::NotFound(format!("image {}", c.image_id)))?;
+        let mut argv = cmd.to_vec();
+        if argv.is_empty() {
+            return Err(Error::Invalid("no command".into()));
+        }
+        if !argv[0].contains('/') {
+            let root = PathBuf::from(format!("/proc/{}/root", c.pid));
+            argv[0] = resolve_in_path(&root, &argv[0], &img.config.env, &c.spec.env);
+        }
+        let env = container_env(&img.config.env, &c.spec.env);
+        let argv_b: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
+        let env_b: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
+        let (out_r, out_w) = pipe()?;
+        let (err_r, err_w) = pipe()?;
+        let spawn = sys::Spawn::enter(c.pid, &argv_b, &env_b)?
+            .stdio(File::open("/dev/null")?, out_w, err_w)
+            .cwd(working_dir(&c, &img).as_bytes())?;
+        let started = spawn.start()?;
+        let pid = started.pid;
+        drop(spawn);
+        if let Some(dir) = &c.cgroup {
+            if let Err(e) = cgroup::add(dir, pid) {
+                let _ = sys::signal(pid, 9);
+                drop(started);
+                let _ = sys::wait(pid);
+                return Err(e.into());
+            }
+        }
+        started.release()?;
+        let read = |mut r: File| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = io::Read::read_to_end(&mut (&mut r).take(EXEC_OUTPUT), &mut buf);
+                // keep draining so the command never blocks on a full pipe
+                let _ = io::copy(&mut r, &mut io::sink());
+                buf
+            })
+        };
+        let (out, err) = (read(out_r), read(err_r));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sys::wait(pid));
+        });
+        let exit = match timeout {
+            Some(t) => match rx.recv_timeout(t) {
+                Ok(exit) => Some(exit),
+                Err(_) => {
+                    let _ = sys::signal(pid, 9);
+                    let _ = rx.recv();
+                    None
+                }
+            },
+            None => rx.recv().ok(),
+        };
+        let stdout = out.join().unwrap_or_default();
+        let stderr = err.join().unwrap_or_default();
+        let exit_code = match exit {
+            None => return Err(Error::Timeout),
+            Some(Ok(sys::Exit::Code(n))) => n,
+            Some(Ok(sys::Exit::Signal(s))) => 128 + s,
+            Some(Err(e)) => return Err(e.into()),
+        };
+        Ok(ExecResult {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
     /// SIGTERM, then SIGKILL once `grace` has passed.
     pub fn stop_container(&self, id: &str, grace: Duration) -> Result<()> {
         let c = self.container(id)?;
@@ -725,6 +812,25 @@ impl Runtime {
         fs::remove_dir_all(self.dir.join("containers").join(id))?;
         self.containers.lock().unwrap().remove(id);
         Ok(())
+    }
+}
+
+fn container_env(image: &[String], spec: &[(String, String)]) -> Vec<String> {
+    let mut env = image.to_vec();
+    for (k, v) in spec {
+        env.retain(|e| e.split('=').next() != Some(k));
+        env.push(format!("{k}={v}"));
+    }
+    env
+}
+
+fn working_dir(c: &Container, img: &Image) -> String {
+    if !c.spec.working_dir.is_empty() {
+        c.spec.working_dir.clone()
+    } else if !img.config.working_dir.is_empty() {
+        img.config.working_dir.clone()
+    } else {
+        "/".into()
     }
 }
 

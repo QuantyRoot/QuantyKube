@@ -25,6 +25,7 @@ through and add a new entry, never silently edit history.
 - [ADR-018](#adr-018-the-runtime-refuses-what-it-cannot-honour) The runtime refuses what it cannot honour
 - [ADR-019](#adr-019-volumes-are-attached-after-the-pivot) Volumes are attached after the pivot
 - [ADR-020](#adr-020-cgroups-follow-the-cgroupfs-driver) cgroups follow the cgroupfs driver
+- [ADR-021](#adr-021-exec-joins-the-container-through-a-second-fork) Exec joins the container through a second fork
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -600,4 +601,23 @@ limits is refused rather than run without them.
 which most distributions no longer default to. A pod's own cgroup and
 its pids limit are the kubelet's, and stats for a pod are the sum of its
 containers, without network.
+
+## ADR-021: Exec joins the container through a second fork
+
+ExecSync runs a command inside a running container: every exec probe
+and every `kubectl exec` without a terminal. The command must see what
+the container sees, so it joins the container's namespaces, enters its
+root through `/proc/<pid>/root`, is placed in its cgroup, and gets the
+same capabilities, `no_new_privs` and seccomp filter as the container's
+first process.
+
+Joining a PID namespace moves only the caller's future children into
+it, so the joining process forks once more and waits for the command,
+passing on its exit status. The command dies with it (`PR_SET_PDEATHSIG`),
+which is how a timeout kills both. Output beyond 16 MiB per stream is
+read and dropped, so a chatty command can neither block nor fill memory.
+
+**The cost:** two processes per exec, where runc's `nsenter` uses the
+same two. Streaming exec, attach and port forwarding need an HTTP server
+of their own and are not built.
 

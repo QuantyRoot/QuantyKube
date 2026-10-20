@@ -38,6 +38,8 @@ extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn unshare(flags: c_int) -> c_int;
+    fn fchdir(fd: c_int) -> c_int;
+    fn chroot(path: *const c_char) -> c_int;
 }
 
 const SYS_CLONE: c_long = 56;
@@ -56,6 +58,7 @@ const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const ENOENT: c_int = 2;
 const EEXIST: c_int = 17;
+const EINTR: c_int = 4;
 
 const CLONE_NEWNS: c_ulong = 0x0002_0000;
 const CLONE_NEWCGROUP: c_ulong = 0x0200_0000;
@@ -75,6 +78,7 @@ const MS_PRIVATE: c_ulong = 1 << 18;
 const MS_STRICTATIME: c_ulong = 1 << 24;
 const MNT_DETACH: c_int = 2;
 
+const PR_SET_PDEATHSIG: c_int = 1;
 const PR_SET_SECCOMP: c_int = 22;
 const SECCOMP_MODE_FILTER: c_ulong = 2;
 const PR_CAPBSET_DROP: c_int = 24;
@@ -288,6 +292,7 @@ pub struct Spawn {
     hostname: Option<CString>,
     readonly: bool,
     cgroupns: bool,
+    enter: Option<Enter>,
     caps: u64,
     seccomp: Vec<SockFilter>,
     path: CString,
@@ -308,6 +313,13 @@ struct Bind {
     target: CString,
     is_dir: bool,
     readonly: bool,
+}
+
+/// The namespaces and root of a running container, for a process that
+/// joins it rather than starting a new one.
+struct Enter {
+    namespaces: Vec<(std::fs::File, c_int)>,
+    root: std::fs::File,
 }
 
 /// Where the child failed, reported as its exit status. Above anything a
@@ -426,6 +438,7 @@ impl Spawn {
             hostname: None,
             readonly: false,
             cgroupns: false,
+            enter: None,
             caps: DEFAULT_CAPS,
             seccomp: seccomp_program(),
             path: cstr(first)?,
@@ -434,6 +447,33 @@ impl Spawn {
             _env: env,
             env_ptrs,
         })
+    }
+
+    /// A process that joins the running container whose first process is
+    /// `pid`: its namespaces and root, with the same capabilities and
+    /// seccomp filter a started container gets.
+    pub fn enter(pid: i32, argv: &[&[u8]], env: &[&[u8]]) -> io::Result<Spawn> {
+        let mut spawn = Spawn::new(b"/", argv, env)?;
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        let mut namespaces = Vec::new();
+        // mnt last: after it the host's /proc is out of reach
+        for (name, kind) in [
+            ("ipc", CLONE_NEWIPC),
+            ("uts", CLONE_NEWUTS),
+            ("net", CLONE_NEWNET),
+            ("cgroup", CLONE_NEWCGROUP),
+            ("pid", CLONE_NEWPID),
+            ("mnt", CLONE_NEWNS),
+        ] {
+            match std::fs::File::open(proc.join("ns").join(name)) {
+                Ok(f) => namespaces.push((f, kind as c_int)),
+                Err(e) if name == "cgroup" && e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let root = std::fs::File::open(proc.join("root"))?;
+        spawn.enter = Some(Enter { namespaces, root });
+        Ok(spawn)
     }
 
     /// Mounts an overlay on the root first: `lower` read only, writes go
@@ -567,7 +607,11 @@ impl Spawn {
         } else {
             0
         };
-        let flags = CLONE_NEWNS | CLONE_NEWPID | own | SIGCHLD;
+        let flags = if self.enter.is_some() {
+            SIGCHLD
+        } else {
+            CLONE_NEWNS | CLONE_NEWPID | own | SIGCHLD
+        };
         // SAFETY: a raw clone without CLONE_VM is a fork into the given
         // namespaces. The child runs only `child`, which makes syscalls on
         // memory prepared above and ends in execve or _exit.
@@ -581,6 +625,7 @@ impl Spawn {
                 }
                 Err(e)
             }
+            0 if self.enter.is_some() => self.child_enter(fds[0]),
             0 => self.child(fds[0]),
             pid => {
                 unsafe { close(fds[0]) };
@@ -819,6 +864,84 @@ impl Spawn {
         }
         umask(0o022);
         let _ = nodata;
+    }
+
+    /// Joining a PID namespace only places the children of the caller in
+    /// it, so this child joins and forks once more, then waits and exits
+    /// with the status of the command, 128 and the signal if it was
+    /// killed by one.
+    fn child_enter(&self, wait: c_int) -> ! {
+        use std::os::fd::AsRawFd;
+        let fail = |step: Step| -> ! { unsafe { _exit(step as c_int) } };
+        let enter = self.enter.as_ref().expect("checked by the caller");
+        // SAFETY: as in `child`; every pointer is prepared before the
+        // clone and outlives the calls.
+        unsafe {
+            let mut byte = 0u8;
+            if read(wait, (&mut byte as *mut u8).cast(), 1) != 1 {
+                fail(Step::Release);
+            }
+            if let Some((i, o, e)) = &self.stdio {
+                if dup2(i.as_raw_fd(), 0) < 0
+                    || dup2(o.as_raw_fd(), 1) < 0
+                    || dup2(e.as_raw_fd(), 2) < 0
+                {
+                    fail(Step::Namespaces);
+                }
+            }
+            for (f, kind) in &enter.namespaces {
+                if setns(f.as_raw_fd(), *kind) != 0 {
+                    fail(Step::Namespaces);
+                }
+            }
+            if fchdir(enter.root.as_raw_fd()) != 0 || chroot(c".".as_ptr()) != 0 {
+                fail(Step::EnterRoot);
+            }
+            let pid = syscall(SYS_CLONE, SIGCHLD, 0usize, 0usize, 0usize, 0usize);
+            if pid < 0 {
+                fail(Step::Namespaces);
+            }
+            if pid > 0 {
+                let mut status: c_int = 0;
+                while waitpid(pid as c_int, &mut status, 0) != pid as c_int {
+                    if *__errno_location() != EINTR {
+                        _exit(255);
+                    }
+                }
+                _exit(if status & 0x7f == 0 {
+                    (status >> 8) & 0xff
+                } else {
+                    128 + (status & 0x7f)
+                });
+            }
+            // the waiting parent is what a timeout kills
+            prctl(PR_SET_PDEATHSIG, 9, 0, 0, 0);
+            let dir = self.cwd.as_ref().map_or(c"/".as_ptr(), |d| d.as_ptr());
+            if chdir(dir) != 0 {
+                fail(Step::EnterRoot);
+            }
+            self.drop_capabilities();
+            let prog = SockFprog {
+                len: self.seccomp.len() as u16,
+                filter: self.seccomp.as_ptr(),
+            };
+            if prctl(
+                PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER,
+                &prog as *const SockFprog as c_ulong,
+                0,
+                0,
+            ) != 0
+            {
+                fail(Step::Seccomp);
+            }
+            execve(
+                self.path.as_ptr(),
+                self.argv_ptrs.as_ptr(),
+                self.env_ptrs.as_ptr(),
+            );
+        }
+        fail(Step::Exec)
     }
 
     unsafe fn clone_binds(&self) {

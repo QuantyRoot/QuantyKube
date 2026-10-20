@@ -14,5 +14,5 @@ members = ["crates/quantykube-sys"]
 
 [dependencies]
 quantykube-sys = { path = "crates/quantykube-sys" }
-quantycore = { git = "https://github.com/QuantyRoot/QuantyCore", rev = "0442003223cacad9e64f985dbebeb91a8df0f3d8" }
+quantycore = { git = "https://github.com/QuantyRoot/QuantyCore", rev = "8c9999ca630c309388fb914f32065610fd7e2dbd" }
 quantydb-core = "0.4.0"
