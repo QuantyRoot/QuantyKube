@@ -1,0 +1,11 @@
+[package]
+name = "quantykube"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+description = "A Kubernetes data store with time travel"
+repository = "https://github.com/QuantyRoot/QuantyKube"
+publish = false
+
+# Only QuantyRoot crates may appear here. See ADR-003 in docs/DECISIONS.md.
+[dependencies]
