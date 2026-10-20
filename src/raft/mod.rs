@@ -3,16 +3,18 @@
 //! A [`Node`] is driven by its host: `tick` on a clock, `step` with each
 //! message that arrives, `propose` with a command. It never touches a disk
 //! or a network itself. After each call the host takes a [`Ready`] and
-//! must, in this order: make its `hard_state` and `entries` durable, then
-//! send its `messages`, then apply its `committed` entries. Sending before
+//! must, in this order: install the `snapshot` it names, make its
+//! `hard_state` and `entries` durable, then send its `messages`, then
+//! apply its `committed` entries. Sending before
 //! the disk has them is what loses votes and acknowledged writes, so the
 //! order is the contract.
 //!
 //! What it does: leader election with pre-vote, so a node cut off from the
 //! others cannot force elections when it comes back; check quorum, so a
 //! leader that cannot reach a majority steps down; log replication with
-//! fast backtracking; linearizable reads through ReadIndex. Membership is
-//! fixed at start.
+//! fast backtracking; linearizable reads through ReadIndex; a log the host
+//! compacts once its state holds what the entries said, and snapshots for
+//! followers too far behind for the log. Membership is fixed at start.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +76,21 @@ pub enum Body {
     ReadCheckReply {
         seq: u64,
     },
+    /// The leader's log no longer holds what the follower needs: it is to
+    /// take the leader's state as of `index`. The host carries the state
+    /// itself alongside, and steps this message once it is installed; the
+    /// answer is an `AppendReply`.
+    Snapshot {
+        index: u64,
+        term: u64,
+    },
+}
+
+/// Where the log starts: everything up to `index` is in the host's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotMeta {
+    pub index: u64,
+    pub term: u64,
 }
 
 /// A read the host may serve once it has applied up to `index`: by then
@@ -96,6 +113,9 @@ pub struct Message {
 /// What the host must do after a call, in field order.
 #[derive(Debug, Default)]
 pub struct Ready {
+    /// The snapshot this node took from its leader: the host's state is
+    /// now that one, and its log starts after it.
+    pub snapshot: Option<SnapshotMeta>,
     pub hard_state: Option<HardState>,
     /// Entries to write, replacing whatever the log holds from the first
     /// one's index on.
@@ -154,6 +174,9 @@ pub enum Bug {
     /// Answers reads before it has committed an entry of its own term,
     /// when its commit index may be behind its predecessor's.
     ReadBeforeOwnCommit,
+    /// Puts entries in a snapshot that are not applied yet, so that a
+    /// follower takes in what may never be committed.
+    CompactPastApplied,
 }
 
 struct PendingRead {
@@ -177,8 +200,9 @@ pub struct Node {
     config: Config,
     term: u64,
     vote: Option<NodeId>,
-    /// The whole log; index i is `log[i - 1]`.
+    /// The log after the snapshot; index i is `log[i - snap.index - 1]`.
     log: Vec<Entry>,
+    snap: SnapshotMeta,
     commit: u64,
     applied: u64,
     role: Role,
@@ -205,11 +229,13 @@ pub struct Node {
 impl Node {
     /// A node of `peers` (itself included) starting from what its disk
     /// holds: nothing for a new cluster.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: NodeId,
         peers: &[NodeId],
         config: Config,
         hard: HardState,
+        snap: SnapshotMeta,
         log: Vec<Entry>,
         applied: u64,
         seed: u64,
@@ -221,8 +247,9 @@ impl Node {
             term: hard.term,
             vote: hard.vote,
             log,
-            commit: hard.commit,
-            applied,
+            snap,
+            commit: hard.commit.max(snap.index),
+            applied: applied.max(snap.index),
             role: Role::Follower,
             leader: None,
             elapsed: 0,
@@ -265,18 +292,57 @@ impl Node {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.log.len() as u64
+        self.snap.index + self.log.len() as u64
+    }
+
+    /// The position of `index` in `log`; `index` is after the snapshot.
+    fn at(&self, index: u64) -> usize {
+        (index - self.snap.index - 1) as usize
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
-        match index {
-            0 => Some(0),
-            i => self.log.get(i as usize - 1).map(|e| e.term),
+        if index == self.snap.index {
+            return Some(self.snap.term);
         }
+        if index < self.snap.index {
+            return None;
+        }
+        self.log.get(self.at(index)).map(|e| e.term)
     }
 
     fn last_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
+        self.log.last().map_or(self.snap.term, |e| e.term)
+    }
+
+    /// Drops the log up to `index`, which the host's state now holds; the
+    /// host keeps that state as the snapshot it sends followers that need
+    /// more than the log has.
+    pub fn compact(&mut self, index: u64) {
+        #[cfg(test)]
+        let index = if self.bug == Bug::CompactPastApplied {
+            self.last_index()
+        } else {
+            index
+        };
+        #[cfg(test)]
+        let applied = if self.bug == Bug::CompactPastApplied {
+            self.last_index()
+        } else {
+            self.applied
+        };
+        #[cfg(not(test))]
+        let applied = self.applied;
+        if index <= self.snap.index || index > applied {
+            return;
+        }
+        let term = self.term_at(index).expect("applied entries are in the log");
+        let drop = self.at(index) + 1;
+        self.log.drain(..drop);
+        self.snap = SnapshotMeta { index, term };
+    }
+
+    pub fn snapshot(&self) -> SnapshotMeta {
+        self.snap
     }
 
     fn quorum(&self) -> usize {
@@ -388,7 +454,8 @@ impl Node {
     }
 
     fn truncate_and_append(&mut self, from: u64, entries: &[Entry]) {
-        self.log.truncate(from as usize - 1);
+        let keep = self.at(from);
+        self.log.truncate(keep);
         self.log.extend_from_slice(entries);
         self.dirty_from = Some(self.dirty_from.map_or(from, |d| d.min(from)));
     }
@@ -405,10 +472,10 @@ impl Node {
             self.hard_dirty = false;
         }
         if let Some(from) = self.dirty_from.take() {
-            r.entries = self.log[from as usize - 1..].to_vec();
+            r.entries = self.log[self.at(from)..].to_vec();
         }
         if self.commit > self.applied {
-            r.committed = self.log[self.applied as usize..self.commit as usize].to_vec();
+            r.committed = self.log[self.at(self.applied + 1)..=self.at(self.commit)].to_vec();
             self.applied = self.commit;
         }
         r
@@ -550,10 +617,28 @@ impl Node {
             return;
         };
         let next = pr.next.max(1);
+        if next <= self.snap.index {
+            // the log no longer reaches back that far
+            let (term, snap) = (self.term, self.snap);
+            return self.send(
+                to,
+                term,
+                Body::Snapshot {
+                    index: snap.index,
+                    term: snap.term,
+                },
+            );
+        }
         let prev_index = next - 1;
         let prev_term = self.term_at(prev_index).unwrap_or(0);
-        let end = (self.last_index() as usize).min(prev_index as usize + self.config.max_batch);
-        let entries = self.log[prev_index as usize..end].to_vec();
+        let end = self
+            .last_index()
+            .min(prev_index + self.config.max_batch as u64);
+        let entries = if end < next {
+            Vec::new()
+        } else {
+            self.log[self.at(next)..self.at(end) + 1].to_vec()
+        };
         let (term, commit) = (self.term, self.commit);
         self.send(
             to,
@@ -612,7 +697,7 @@ impl Node {
                     pre: true,
                     granted: true,
                 } => {}
-                Body::Append { .. } | Body::ReadCheck { .. } => {
+                Body::Append { .. } | Body::ReadCheck { .. } | Body::Snapshot { .. } => {
                     self.become_follower(m.term, Some(m.from))
                 }
                 _ => self.become_follower(m.term, None),
@@ -620,7 +705,7 @@ impl Node {
         } else if m.term < self.term {
             match m.body {
                 // a stale leader learns the term and steps down
-                Body::Append { .. } | Body::ReadCheck { .. } => {
+                Body::Append { .. } | Body::ReadCheck { .. } | Body::Snapshot { .. } => {
                     let term = self.term;
                     self.send(
                         m.from,
@@ -700,6 +785,12 @@ impl Node {
                 self.reset_timeout();
                 self.handle_append(m.from, prev_index, prev_term, entries, commit);
             }
+            Body::Snapshot { index, term } => {
+                self.role = Role::Follower;
+                self.leader = Some(m.from);
+                self.reset_timeout();
+                self.install(m.from, index, term);
+            }
             Body::ReadIndex { req } => {
                 if self.role == Role::Leader {
                     self.leader_read(m.from, req);
@@ -767,6 +858,45 @@ impl Node {
                 }
             }
         }
+    }
+
+    fn install(&mut self, leader: NodeId, index: u64, term: u64) {
+        let reply = self.term;
+        if index <= self.commit {
+            let commit = self.commit;
+            return self.send(
+                leader,
+                reply,
+                Body::AppendReply {
+                    index: commit,
+                    success: true,
+                },
+            );
+        }
+        if self.term_at(index) == Some(term) {
+            // the log already has it: what follows may stay
+            let drop = self.at(index) + 1;
+            self.log.drain(..drop);
+        } else {
+            self.log.clear();
+        }
+        self.snap = SnapshotMeta { index, term };
+        self.commit = index;
+        self.applied = index;
+        self.hard_dirty = true;
+        self.ready.snapshot = Some(self.snap);
+        // what was kept after the snapshot is written again from the start
+        if !self.log.is_empty() {
+            self.dirty_from = Some(index + 1);
+        }
+        self.send(
+            leader,
+            reply,
+            Body::AppendReply {
+                index,
+                success: true,
+            },
+        );
     }
 
     fn handle_append(

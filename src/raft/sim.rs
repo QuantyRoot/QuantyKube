@@ -28,6 +28,9 @@ enum Aimed {
 #[derive(Default, Clone)]
 struct Disk {
     hard: HardState,
+    /// The state machine is the global record of applied entries, so a
+    /// snapshot is only where it ends.
+    snap: SnapshotMeta,
     log: Vec<Entry>,
 }
 
@@ -73,6 +76,7 @@ struct Sim {
     stuck_reads: Vec<(u64, usize)>,
     next_read: u64,
     reads_served: u64,
+    snapshots: u64,
 }
 
 impl Sim {
@@ -104,6 +108,7 @@ impl Sim {
             stuck_reads: Vec::new(),
             next_read: 0,
             reads_served: 0,
+            snapshots: 0,
         };
         s.max_batch = 1 + (s.random() % 4) as usize;
         s.rates = match s.random() % 3 {
@@ -139,9 +144,18 @@ impl Sim {
             election_ticks: 20,
             ..Config::default()
         };
-        let mut n = Node::new(self.ids[i], &self.ids, config, d.hard, d.log, 0, seed);
+        let mut n = Node::new(
+            self.ids[i],
+            &self.ids,
+            config,
+            d.hard,
+            d.snap,
+            d.log,
+            0,
+            seed,
+        );
         n.bug = self.bug;
-        self.applied_to[i] = 0;
+        self.applied_to[i] = d.snap.index;
         n
     }
 
@@ -197,12 +211,28 @@ impl Sim {
             let at = self.now + 1;
             self.aimed.push((at, i, Aimed::Crash));
         }
+        if let Some(snap) = r.snapshot {
+            // the leader's state up to its index arrives with the message;
+            // every entry in it must be one that was applied as such
+            for index in self.applied_to[i] + 1..=snap.index {
+                if !self.applied.contains_key(&index) {
+                    return Err(format!(
+                        "node {id} took a snapshot with {index} never applied"
+                    ));
+                }
+            }
+            self.applied_to[i] = self.applied_to[i].max(snap.index);
+            self.snapshots += 1;
+            let disk = &mut self.disks[i];
+            disk.snap = snap;
+            disk.log.clear();
+        }
         let persist = |disk: &mut Disk, hard: Option<HardState>, entries: &[Entry]| {
             if let Some(h) = hard {
                 disk.hard = h;
             }
             if let Some(first) = entries.first() {
-                disk.log.truncate(first.index as usize - 1);
+                disk.log.retain(|e| e.index < first.index);
                 disk.log.extend_from_slice(entries);
             }
         };
@@ -257,6 +287,20 @@ impl Sim {
                 let (_, index, term, data) = self.pending.remove(k);
                 if term == e.term && data == e.data {
                     self.acked.push((index, term, data));
+                }
+            }
+        }
+        // now and then the state is written down and the log behind it
+        // dropped, so that followers far behind need a snapshot
+        let applied = self.applied_to[i];
+        if self.chance(100) {
+            if let Some(node) = self.nodes[i].as_mut() {
+                if applied > node.snapshot().index + 8 {
+                    node.compact(applied);
+                    let snap = node.snapshot();
+                    let disk = &mut self.disks[i];
+                    disk.snap = snap;
+                    disk.log.retain(|e| e.index > snap.index);
                 }
             }
         }
@@ -466,7 +510,7 @@ impl Sim {
 
     /// Faults for `ticks`, then a healed cluster that must make progress
     /// and agree on everything that was acknowledged.
-    fn run(&mut self, ticks: u64) -> Result<(), String> {
+    fn run(&mut self, ticks: u64) -> Result<u64, String> {
         for _ in 0..ticks {
             self.step(true, true)?;
         }
@@ -518,11 +562,12 @@ impl Sim {
                 ));
             }
         }
-        Ok(())
+        Ok(self.snapshots)
     }
 }
 
-fn run(seed: u64, nodes: usize, bug: Bug, host_bug: HostBug) -> Result<(), String> {
+/// Returns how many snapshots were installed.
+fn run(seed: u64, nodes: usize, bug: Bug, host_bug: HostBug) -> Result<u64, String> {
     Sim::new(seed, nodes, bug, host_bug).run(2000)
 }
 
@@ -535,13 +580,18 @@ fn seeds() -> u64 {
 
 #[test]
 fn raft_keeps_its_promises_under_faults() {
+    let mut snapshots = 0;
     for nodes in [3, 5] {
         for seed in 0..seeds() {
-            if let Err(e) = run(seed, nodes, Bug::None, HostBug::None) {
-                panic!("{nodes} nodes, seed {seed}: {e}");
+            match run(seed, nodes, Bug::None, HostBug::None) {
+                Ok(n) => snapshots += n,
+                Err(e) => panic!("{nodes} nodes, seed {seed}: {e}"),
             }
         }
     }
+    // followers too far behind for the log were brought up by snapshots
+    assert!(snapshots > 0);
+    eprintln!("{snapshots} snapshots installed");
 }
 
 #[test]
@@ -559,6 +609,7 @@ fn the_simulator_finds_planted_bugs() {
         (Bug::KeepConflicts, HostBug::None),
         (Bug::ReadWithoutQuorum, HostBug::None),
         (Bug::ReadBeforeOwnCommit, HostBug::None),
+        (Bug::CompactPastApplied, HostBug::None),
         (Bug::None, HostBug::SendBeforePersist),
     ];
     for (bug, host_bug) in planted {

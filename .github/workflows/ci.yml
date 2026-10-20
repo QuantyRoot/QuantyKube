@@ -147,6 +147,8 @@ jobs:
       - run: cargo test --release --lib raft:: -- --nocapture
         env:
           QUANTY_RAFT_SEEDS: "5000"
+          # an index that runs past the log must fail here, not wrap
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
 
   msrv:
     name: test on MSRV (1.89)

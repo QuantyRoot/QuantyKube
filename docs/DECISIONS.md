@@ -993,13 +993,17 @@ term, a vote for a candidate whose log is behind, committing an entry
 of an earlier term by counting replicas (Figure 8 of the Raft paper,
 found only after the aimed faults were added), keeping entries that
 conflict with the leader's, a host that sends before its disk has what
-the message promises, a read answered without asking a majority, and a
-read answered before the leader committed an entry of its own term.
+the message promises, a read answered without asking a majority, a
+read answered before the leader committed an entry of its own term, and
+a snapshot holding entries that were not yet applied.
 Each is found within 300 seeds, the rarest in about one seed of 25; the
 correct node passed 20,000. Every CI run checks the planted bugs and
 5,000 seeds per cluster size. The simulator found one real fault on the
 way: a reply claiming more of the log than the leader holds made it
-index past its log, which it now ignores.
+index past its log, which it now ignores. A second one showed only in
+a debug build: an index one before the log's start, which a release
+build wrapped around harmlessly by luck. The deep run in CI therefore
+keeps overflow checks on.
 
 What the node does: elections with pre-vote, so that a node returning
 from a partition cannot unseat a working leader; check quorum, so that
@@ -1007,12 +1011,13 @@ a leader that cannot reach a majority steps down; a node that heard
 from a leader within the election timeout refuses to vote for another;
 replication in batches with fast backtracking; a new leader's empty
 entry to commit its term; linearizable reads through ReadIndex, which
-a follower asks of its leader.
+a follower asks of its leader; a log the host compacts once its state
+holds what the entries said, and a snapshot for a follower that needs
+more than the log still has. The host carries the snapshot's data; in
+the simulator, 200,000 snapshots were installed over 20,000 runs.
 
 **What it does not do yet, and what that costs:** membership is fixed
 when the cluster starts, so a node is replaced by restarting all of
-them with the new list; the log is never compacted and is kept whole
-in memory, so it grows with every write until snapshots exist; a
-leader sends the next batch only once the last is acknowledged, so a
-follower far behind catches up one round trip per batch. The first two
-come before the cluster is shown, or the talk says what is missing.
+them with the new list; a leader sends the next batch only once the
+last is acknowledged, so a follower far behind catches up one round
+trip per batch.
