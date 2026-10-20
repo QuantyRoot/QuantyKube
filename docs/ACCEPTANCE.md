@@ -53,7 +53,8 @@ Without all of these there is no demonstration.
     cluster of item 9, one worker runs its pods on `quantykube runtime`
     and the other on containerd, the same deployment on both, and pod
     start time and memory per node are compared there, on cgroup v2
-    (BENCHMARKS.md has the first numbers and why they are not final).
+    (BENCHMARKS.md has the first numbers and why they are not final;
+    CLUSTER.md has the plan).
 
 ## Not part of this date
 
