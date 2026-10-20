@@ -44,7 +44,7 @@ Without all of these there is no demonstration.
 
 ## Not part of this date
 
-TLS, more than one node, Raft, the node runtime (ADR-005), authentication
+TLS, more than one store node, Raft, the node runtime (ADR-005), authentication
 and authorization on the etcd API, and any RPC the API server does not
 call.
 
