@@ -774,8 +774,15 @@ A seccomp profile of the node's own (Localhost) is refused; Unconfined,
 which the kubelet sends for every pod that names no profile, gets the
 default filter, as with the kubelet's `--seccomp-default`.
 
+The device filter followed the same evening: every container cgroup
+gets an eBPF program of type cgroup device, as runc loads one, that lets
+a container make or open only the standard character devices and the
+pty slaves. A test interprets the program for allowed and refused
+devices, and in CI a container that holds MKNOD can neither make a
+node for a disk nor open one, while `/dev/null` works. MKNOD stays out
+of the default set all the same: two locks where one would do.
+
 **The cost:** a program that makes device nodes fails here where it
 works under Docker, and a pod that asks for Unconfined to make a call
-Docker's profile refuses fails too. The device filter, a cgroup BPF
-program as runc loads, would allow MKNOD back.
+Docker's profile refuses fails too.
 
