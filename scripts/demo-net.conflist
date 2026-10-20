@@ -1,0 +1,13 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "demo",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "qkdemo0",
+      "isGateway": true,
+      "ipMasq": true,
+      "ipam": {"type": "host-local", "ranges": [[{"subnet": "10.42.0.0/24"}]]}
+    }
+  ]
+}

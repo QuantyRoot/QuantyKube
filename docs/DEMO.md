@@ -102,7 +102,40 @@ This works after the API server has compacted etcd, for as long as
 `--retain` keeps history (ADR-011). `--ago 5m` instead of `--rev` picks
 the state five minutes ago.
 
-## 6. The numbers
+## 6. The other half: the node runtime
+
+The control plane from step 2 runs without a node. This adds one whose
+kubelet starts containers through `quantykube runtime`; it needs cgroup
+v2 and the CNI plugins (v1.8.0) under `/opt/cni/bin`. Stop the k3s from
+step 2 first, two k3s on one machine collide (BENCHMARKS.md).
+
+```
+sudo target/release/quantykube import --root $D/rt <busybox image dir> test/busybox:1
+sudo mkdir -p $D/net.d
+sudo cp scripts/demo-net.conflist $D/net.d/10-demo.conflist
+sudo target/release/quantykube runtime --root $D/rt --socket $D/cri.sock \
+  --cni-conf $D/net.d &
+sudo k3s server --token demo --data-dir $D/k3s \
+  --datastore-endpoint=unix://$D/qk.sock --write-kubeconfig $D/k.yaml \
+  --container-runtime-endpoint=unix://$D/cri.sock \
+  --kubelet-arg cgroup-driver=cgroupfs \
+  --disable=traefik,servicelb,metrics-server,local-storage,coredns \
+  --disable-network-policy --flannel-backend=none --disable-kube-proxy \
+  --disable-cloud-controller --disable-helm-controller &
+kubectl get nodes
+kubectl run hello --image=test/busybox:1 --image-pull-policy=Never \
+  -- sh -c 'echo hello from QuantyKube; exec sleep 3600'
+kubectl get pod hello -o wide
+kubectl logs hello
+ps -o pid,rss,cmd -C quantykube
+```
+
+One process for the runtime and none per pod: no shim, no pause
+container. `scripts/cluster.sh` runs the same in CI; these exact lines
+have not been run yet, which this machine (cgroup v1) cannot, and are
+the first thing to run on the rented servers.
+
+## 7. The numbers
 
 The benchmark tables from `docs/BENCHMARKS.md`, whichever way they came
 out.
