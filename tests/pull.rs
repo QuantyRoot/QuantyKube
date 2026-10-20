@@ -179,5 +179,16 @@ fn an_image_is_pulled_and_imported() {
     let rt = Runtime::new(&base.join("state2")).unwrap();
     let err = rt.import(&base.join("layout2"), &image).unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");
+
+    // and so is a manifest other than the one the index names
+    routes.lock().unwrap().insert(
+        format!("/v2/test/box/manifests/{}", digest(manifest.as_bytes())),
+        (
+            "application/vnd.oci.image.manifest.v1+json".into(),
+            manifest.replace("\"size\"", "\"size\" ").into_bytes(),
+        ),
+    );
+    let err = registry::pull(&image, &base.join("layout3"), &opts, Some(&creds)).unwrap_err();
+    assert!(err.to_string().contains("does not match"), "{err}");
     fs::remove_dir_all(&base).unwrap();
 }

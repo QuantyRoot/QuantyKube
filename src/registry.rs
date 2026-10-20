@@ -342,10 +342,15 @@ pub fn pull(
                         && p(e, "architecture").as_deref() == Some("amd64")
                 })
                 .ok_or_else(|| invalid(format!("{image} has no linux/amd64 image")))?;
+            // a digest, so the manifest it names is checked against it
             reference = entry
                 .get("digest")
                 .and_then(Value::as_str)
-                .ok_or_else(|| invalid("index entry without digest"))?
+                .filter(|d| {
+                    d.strip_prefix("sha256:")
+                        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                })
+                .ok_or_else(|| invalid("index entry without a sha256 digest"))?
                 .to_string();
             continue;
         }
