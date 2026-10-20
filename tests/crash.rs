@@ -1,7 +1,9 @@
-//! Kills the server with SIGKILL while a client writes, restarts it, and
+//! Kills the server with SIGKILL while clients write, restarts it, and
 //! checks the one promise that matters: every write that was acknowledged
-//! is there, with the revision it was acknowledged at. Writes that were in
-//! flight may or may not have landed; either is correct.
+//! is there, with the revision it was acknowledged at, and no revision was
+//! acknowledged twice. Writes that were in flight may or may not have
+//! landed; either is correct. Several writers at once, so that group
+//! commits hold more than one write.
 //!
 //! QUANTY_CRASH_ITERS sets the number of kills (default 20).
 
@@ -13,6 +15,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+const WRITERS: u64 = 4;
 
 /// Kills the server when dropped, so a failing assertion cannot leave it
 /// running with the test's output pipe open, which hangs `cargo test`.
@@ -63,9 +67,10 @@ fn acknowledged_writes_survive_sigkill() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dir: Arc<PathBuf> = Arc::new(dir);
-    let acked: Arc<Mutex<Vec<(u64, i64)>>> = Arc::default();
+    // (writer, index, revision) of every acknowledged write
+    let acked: Arc<Mutex<Vec<(u64, u64, i64)>>> = Arc::default();
     let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
-    let mut next = 0u64;
+    let mut next = vec![0u64; WRITERS as usize];
     let mut last_head = 0;
 
     for round in 0..iters {
@@ -84,12 +89,12 @@ fn acknowledged_writes_survive_sigkill() {
             assert!(head >= last_head, "round {round}: head went back to {head}");
             last_head = head;
         }
-        for &(i, rev) in acked.lock().unwrap().iter() {
+        for &(w, i, rev) in acked.lock().unwrap().iter() {
             let r: RangeResponse = rpc(
                 &dir,
                 "/etcdserverpb.KV/Range",
                 RangeRequest {
-                    key: format!("/k/{i}").into_bytes(),
+                    key: format!("/k/{w}/{i}").into_bytes(),
                     ..Default::default()
                 },
             )
@@ -97,32 +102,41 @@ fn acknowledged_writes_survive_sigkill() {
             let kv = r
                 .kvs
                 .first()
-                .unwrap_or_else(|| panic!("round {round}: /k/{i} lost"));
-            assert_eq!(kv.value, i.to_string().as_bytes(), "round {round}: /k/{i}");
-            assert_eq!(kv.mod_revision, rev, "round {round}: /k/{i} revision");
+                .unwrap_or_else(|| panic!("round {round}: /k/{w}/{i} lost"));
+            assert_eq!(
+                kv.value,
+                i.to_string().as_bytes(),
+                "round {round}: /k/{w}/{i}"
+            );
+            assert_eq!(kv.mod_revision, rev, "round {round}: /k/{w}/{i} revision");
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let writer = {
-            let (dir, acked, stop) = (dir.clone(), acked.clone(), stop.clone());
-            let first = next;
-            std::thread::spawn(move || {
-                let mut i = first;
-                while !stop.load(Ordering::Relaxed) {
-                    let put = PutRequest {
-                        key: format!("/k/{i}").into_bytes(),
-                        value: i.to_string().into_bytes(),
-                        ..Default::default()
-                    };
-                    match rpc::<PutResponse>(&dir, "/etcdserverpb.KV/Put", put) {
-                        Some(r) => acked.lock().unwrap().push((i, r.header.unwrap().revision)),
-                        None => break,
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let (dir, acked, stop) = (dir.clone(), acked.clone(), stop.clone());
+                let first = next[w as usize];
+                std::thread::spawn(move || {
+                    let mut i = first;
+                    while !stop.load(Ordering::Relaxed) {
+                        let put = PutRequest {
+                            key: format!("/k/{w}/{i}").into_bytes(),
+                            value: i.to_string().into_bytes(),
+                            ..Default::default()
+                        };
+                        match rpc::<PutResponse>(&dir, "/etcdserverpb.KV/Put", put) {
+                            Some(r) => {
+                                let rev = r.header.unwrap().revision;
+                                acked.lock().unwrap().push((w, i, rev));
+                            }
+                            None => break,
+                        }
+                        i += 1;
                     }
-                    i += 1;
-                }
-                i
+                    i
+                })
             })
-        };
+            .collect();
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
@@ -130,7 +144,18 @@ fn acknowledged_writes_survive_sigkill() {
         drop(child);
         stop.store(true, Ordering::Relaxed);
         // keys written in flight may have landed; never reuse their names
-        next = writer.join().unwrap() + 1;
+        for (w, writer) in writers.into_iter().enumerate() {
+            next[w] = writer.join().unwrap() + 1;
+        }
+        let mut revs: Vec<i64> = acked.lock().unwrap().iter().map(|a| a.2).collect();
+        revs.sort_unstable();
+        let total = revs.len();
+        revs.dedup();
+        assert_eq!(
+            revs.len(),
+            total,
+            "round {round}: a revision acknowledged twice"
+        );
     }
     let n = acked.lock().unwrap().len();
     eprintln!("{iters} kills, {n} acknowledged writes checked after each");
