@@ -62,17 +62,21 @@ Taken from `pkg/apis/runtime/v1/api.proto` in kubernetes/cri-api. Two
 gRPC services on a Unix socket, the same transport QuantyCore already
 serves for the store.
 
-**RuntimeService**, grouped by what must work first:
+**RuntimeService**, grouped by what must work first, and what of it is
+built:
 
-| Group | Methods |
-| --- | --- |
-| Lifecycle | Version, Status, RuntimeConfig, RunPodSandbox, StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox, CreateContainer, StartContainer, StopContainer, RemoveContainer, ListContainers, ContainerStatus |
-| Kubelet needs these to stay healthy | ContainerStats, ListContainerStats, PodSandboxStats, ListPodSandboxStats, ReopenContainerLog, UpdateContainerResources, GetContainerEvents |
-| `kubectl exec`, `attach`, `port-forward` | ExecSync, Exec, Attach, PortForward |
-| Later or never | the Stream* variants, CheckpointContainer, CheckpointPod, RestorePod, ListMetricDescriptors, ListPodSandboxMetrics, UpdateRuntimeConfig, UpdatePodSandboxResources |
+| Group | Methods | Built |
+| --- | --- | --- |
+| Lifecycle | Version, Status, RunPodSandbox, StopPodSandbox, RemovePodSandbox, PodSandboxStatus, ListPodSandbox, CreateContainer, StartContainer, StopContainer, RemoveContainer, ListContainers, ContainerStatus | all |
+| Lifecycle | RuntimeConfig | no; the kubelet falls back to its own `--cgroup-driver` |
+| Kubelet needs these to stay healthy | ContainerStats, ListContainerStats, PodSandboxStats, ListPodSandboxStats, ReopenContainerLog, UpdateContainerResources | all |
+| Kubelet needs these to stay healthy | GetContainerEvents | no; only the evented PLEG, off by default, uses it |
+| `kubectl exec`, `attach`, `port-forward` | ExecSync | built |
+| `kubectl exec`, `attach`, `port-forward` | Exec, Attach, PortForward | no |
+| Later or never | the Stream* variants, CheckpointContainer, CheckpointPod, RestorePod, ListMetricDescriptors, ListPodSandboxMetrics, UpdateRuntimeConfig, UpdatePodSandboxResources | no |
 
 **ImageService:** ListImages, ImageStatus, PullImage, RemoveImage,
-ImageFsInfo.
+ImageFsInfo, all built; PullImage over plain HTTP only until TLS.
 
 Exec, Attach and PortForward do not stream over gRPC. They return a URL,
 and the kubelet proxies the client's connection to an HTTP server the
