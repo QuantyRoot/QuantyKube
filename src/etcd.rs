@@ -1025,3 +1025,174 @@ fn set_txn_headers(r: &mut TxnResponse, h: &Option<ResponseHeader>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Quanty;
+
+    fn etcd() -> Arc<Etcd<Quanty<quantydb_core::MemStorage>>> {
+        Etcd::new(
+            Arc::new(Quanty::in_memory().unwrap()),
+            "unix:///test".into(),
+        )
+        .unwrap()
+    }
+
+    fn call<Q: Message, R: Message>(e: &Etcd<impl Backend>, method: &str, req: Q) -> R {
+        R::decode(&e.unary(method, &req.encode()).unwrap()).unwrap()
+    }
+
+    fn put(e: &Etcd<impl Backend>, k: &str, v: &str, lease: i64) {
+        let _: PutResponse = call(
+            e,
+            "/etcdserverpb.KV/Put",
+            PutRequest {
+                key: k.into(),
+                value: v.into(),
+                lease,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn keys(r: &RangeResponse) -> Vec<String> {
+        r.kvs
+            .iter()
+            .map(|k| String::from_utf8(k.key.clone()).unwrap())
+            .collect()
+    }
+
+    // what the API server relies on for paginated lists
+    #[test]
+    fn limit_reports_more_and_the_full_count() {
+        let e = etcd();
+        for k in ["/a/1", "/a/2", "/a/3", "/b"] {
+            put(&e, k, "v", 0);
+        }
+        let r: RangeResponse = call(
+            &e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/a/".into(),
+                range_end: "/a0".into(),
+                limit: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(keys(&r), ["/a/1", "/a/2"]);
+        assert!(r.more);
+        assert_eq!(r.count, 3);
+        let r: RangeResponse = call(
+            &e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/".into(),
+                range_end: vec![0],
+                sort_order: SortOrder::Descend,
+                limit: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(keys(&r), ["/b", "/a/3"]);
+    }
+
+    #[test]
+    fn a_failed_compare_runs_the_failure_branch_and_writes_nothing() {
+        let e = etcd();
+        put(&e, "/k", "v1", 0);
+        let head = e.store.head();
+        let r: TxnResponse = call(
+            &e,
+            "/etcdserverpb.KV/Txn",
+            TxnRequest {
+                compare: vec![Compare {
+                    key: "/k".into(),
+                    target: CompareTarget::Mod,
+                    target_union: Some(TargetUnion::ModRevision(0)),
+                    ..Default::default()
+                }],
+                success: vec![RequestOp {
+                    request: Some(OpRequest::Put(PutRequest {
+                        key: "/k".into(),
+                        value: "v2".into(),
+                        ..Default::default()
+                    })),
+                }],
+                failure: vec![RequestOp {
+                    request: Some(OpRequest::Range(RangeRequest {
+                        key: "/k".into(),
+                        ..Default::default()
+                    })),
+                }],
+            },
+        );
+        assert!(!r.succeeded);
+        assert_eq!(e.store.head(), head);
+        assert_eq!(r.header.unwrap().revision, head);
+        let Some(OpResponse::Range(got)) = &r.responses[0].response else {
+            panic!("expected a range response");
+        };
+        assert_eq!(got.kvs[0].value, b"v1");
+    }
+
+    #[test]
+    fn a_missing_key_compares_as_zero_except_by_value() {
+        let e = etcd();
+        let missing = |target, union| {
+            let c = Compare {
+                key: "/none".into(),
+                target,
+                target_union: Some(union),
+                ..Default::default()
+            };
+            e.store
+                .read(0, &mut |v| {
+                    assert_eq!(
+                        Etcd::<Quanty<quantydb_core::MemStorage>>::compare(&c, v).unwrap(),
+                        target != CompareTarget::Value
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        };
+        missing(CompareTarget::Version, TargetUnion::Version(0));
+        missing(CompareTarget::Mod, TargetUnion::ModRevision(0));
+        missing(CompareTarget::Value, TargetUnion::Value(Vec::new()));
+    }
+
+    #[test]
+    fn keys_go_with_their_lease() {
+        let e = etcd();
+        let g: LeaseGrantResponse = call(
+            &e,
+            "/etcdserverpb.Lease/LeaseGrant",
+            LeaseGrantRequest { ttl: 1, id: 0 },
+        );
+        put(&e, "/event", "x", g.id);
+        put(&e, "/kept", "y", 0);
+        std::thread::sleep(Duration::from_millis(2200));
+        let r: RangeResponse = call(
+            &e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/".into(),
+                range_end: vec![0],
+                ..Default::default()
+            },
+        );
+        assert_eq!(keys(&r), ["/kept"]);
+        let err = e
+            .unary(
+                "/etcdserverpb.KV/Put",
+                &PutRequest {
+                    key: "/late".into(),
+                    lease: g.id,
+                    ..Default::default()
+                }
+                .encode(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, code::NOT_FOUND);
+    }
+}
