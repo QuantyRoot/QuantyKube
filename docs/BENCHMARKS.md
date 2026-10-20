@@ -78,6 +78,12 @@ it can, that is 169 MB against etcd's 130. Under the Kubernetes workload
 it is 45 MB against 124. Space is reused once history ages out of the
 window; the file does not shrink, and `etcdctl defrag` is not supported.
 
+Retention changed after these runs (ADR-014): snapshots now live a
+minute and the history lives in the change log. A 15 minute soak with a
+k3s control plane under steady writes, 12,368 revisions with `--retain
+2m --snapshots 30s`, settled at 51 MB on disk and 31 MB of memory, where
+the earlier design grew without bound until the API server compacted.
+
 **In a Kubernetes control plane the stores are even.** The API server
 takes the same time to become ready and to apply and list objects on
 both. Deleting 500 objects took 100 seconds on both, which is a limit of
