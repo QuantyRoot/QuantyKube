@@ -18,6 +18,23 @@ pub struct Options {
     pub plain_http: Vec<String>,
 }
 
+/// What the kubelet passes from an image pull secret.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+    /// A token the registry issued, used as is instead of a login.
+    pub registry_token: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub registry: String,
@@ -85,7 +102,9 @@ impl<T: Read + Write> Stream for T {}
 
 struct Client<'a> {
     opts: &'a Options,
-    token: Option<String>,
+    creds: Option<&'a Credentials>,
+    /// The Authorization header for the next request.
+    auth: Option<String>,
 }
 
 impl Client<'_> {
@@ -120,7 +139,7 @@ impl Client<'_> {
         let mut challenged = false;
         for _ in 0..6 {
             let host = url.authority();
-            let auth = self.token.as_ref().map(|t| format!("Bearer {t}"));
+            let auth = self.auth.clone();
             let mut headers = vec![("User-Agent", "quantykube")];
             if let Some(a) = accept {
                 headers.push(("Accept", a));
@@ -147,7 +166,7 @@ impl Client<'_> {
                     // a blob store on another host gets no registry token,
                     // and neither does anything reached without TLS
                     if next.host != url.host || next.scheme != url.scheme {
-                        self.token = None;
+                        self.auth = None;
                     }
                     url = next;
                 }
@@ -157,7 +176,7 @@ impl Client<'_> {
                         .header("www-authenticate")
                         .ok_or_else(|| invalid("401 without a challenge"))?
                         .to_string();
-                    self.token = Some(self.authenticate(&header)?);
+                    self.auth = Some(self.authenticate(&header)?);
                 }
                 status => {
                     return Err(io::Error::other(format!(
@@ -173,10 +192,22 @@ impl Client<'_> {
     fn authenticate(&mut self, challenge: &str) -> io::Result<String> {
         let (scheme, params) = http1::parse_www_authenticate(challenge)
             .ok_or_else(|| invalid("unreadable challenge"))?;
-        if !scheme.eq_ignore_ascii_case("bearer") {
+        let basic = self.creds.filter(|c| !c.username.is_empty()).map(|c| {
+            format!(
+                "Basic {}",
+                base64(format!("{}:{}", c.username, c.password).as_bytes())
+            )
+        });
+        if scheme == "basic" {
+            return basic.ok_or_else(|| io::Error::other("the registry wants a login"));
+        }
+        if scheme != "bearer" {
             return Err(io::Error::other(format!(
-                "registry asks for {scheme} authentication, only anonymous Bearer is supported"
+                "registry asks for {scheme} authentication"
             )));
+        }
+        if let Some(c) = self.creds.filter(|c| !c.registry_token.is_empty()) {
+            return Ok(format!("Bearer {}", c.registry_token));
         }
         let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         let realm = param("realm").ok_or_else(|| invalid("challenge without realm"))?;
@@ -190,18 +221,38 @@ impl Client<'_> {
             }
         }
         let url = http1::parse_url(&target).map_err(|e| invalid(format!("{e:?}")))?;
-        let mut anonymous = Client {
+        let mut token_client = Client {
             opts: self.opts,
-            token: None,
+            creds: None,
+            auth: basic,
         };
-        let body = anonymous.get(url, None, &mut |r| read_limited(r))?;
+        let body = token_client.get(url, None, &mut |r| read_limited(r))?;
         let v = json::parse_bytes(&body).map_err(|e| invalid(format!("token: {e}")))?;
         v.get("token")
             .or_else(|| v.get("access_token"))
             .and_then(Value::as_str)
-            .map(str::to_string)
+            .map(|t| format!("Bearer {t}"))
             .ok_or_else(|| invalid("token response without a token"))
     }
+}
+
+fn base64(data: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = c
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                ABC[(n >> (18 - 6 * i)) as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
 }
 
 fn encode(s: &str) -> String {
@@ -246,14 +297,23 @@ fn at(base: &Url, target: String) -> Url {
 
 /// Fetches the image into `layout`, an empty directory, as an OCI image
 /// layout with the chosen manifest as its only entry.
-pub fn pull(image: &str, layout: &Path, opts: &Options) -> io::Result<()> {
+pub fn pull(
+    image: &str,
+    layout: &Path,
+    opts: &Options,
+    creds: Option<&Credentials>,
+) -> io::Result<()> {
     let r = parse(image)?;
     let mut base = base_url(&r)?;
     if opts.plain_http.contains(&r.registry) {
         base = http1::parse_url(&format!("http://{}/", r.registry))
             .map_err(|e| invalid(format!("{e:?}")))?;
     }
-    let mut client = Client { opts, token: None };
+    let mut client = Client {
+        opts,
+        creds,
+        auth: None,
+    };
     let blobs = layout.join("blobs").join("sha256");
     fs::create_dir_all(&blobs)?;
     let manifest_url =
@@ -348,6 +408,9 @@ mod tests {
         let d = format!("sha256:{}", "a".repeat(64));
         assert_eq!(r(&format!("ghcr.io/x/y@{d}")), format!("ghcr.io x/y {d}"));
         assert!(parse("UPPER/case").is_err());
+        assert_eq!(base64(b"user:pa"), "dXNlcjpwYQ==");
+        assert_eq!(base64(b"user:pas"), "dXNlcjpwYXM=");
+        assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
         assert!(parse("a/b:../x").is_err());
     }
 }

@@ -694,14 +694,24 @@ impl Cri {
                 let r = req!(PullImageRequest);
                 let name = r.image.unwrap_or_default().image;
                 let auth = r.auth.unwrap_or_default();
-                if auth != cripb::AuthConfig::default() {
+                // the kubelet decodes pull secrets into username and
+                // password; an identity token needs an OAuth2 exchange
+                if !auth.identity_token.is_empty()
+                    || (!auth.auth.is_empty() && auth.username.is_empty())
+                {
                     return Err(Status::new(
                         code::UNIMPLEMENTED,
-                        "registry credentials are not supported yet",
+                        "this form of registry credentials is not supported yet",
                     ));
                 }
+                let creds = crate::registry::Credentials {
+                    username: auth.username,
+                    password: auth.password,
+                    registry_token: auth.registry_token,
+                };
+                let creds = (creds != Default::default()).then_some(creds);
                 let img = rt
-                    .pull(&name, &self.registries)
+                    .pull(&name, &self.registries, creds.as_ref())
                     .map_err(|e| Status::new(code::UNKNOWN, format!("pulling {name}: {e}")))?;
                 PullImageResponse { image_ref: img.id }.encode()
             }

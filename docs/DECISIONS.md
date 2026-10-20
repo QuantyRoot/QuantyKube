@@ -732,6 +732,11 @@ HTTP goes through QuantyCore's HTTP/1.1 client. Until QuantyCore has
 TLS, only registries named with `--plain-http` can be reached, which is
 how a local registry in an air gapped network is usually run.
 
-**The cost:** no public registry is reachable before TLS, and none with
-credentials after: PullImage refuses an image that comes with any.
+Credentials from an image pull secret are sent only to the token
+endpoint, as HTTP Basic, or to a registry that asks for Basic itself; a
+token issued by the registry is used as it is. They never follow a
+redirect to another host.
+
+**The cost:** no public registry is reachable before TLS, and identity
+tokens, which need an OAuth2 exchange, are refused.
 

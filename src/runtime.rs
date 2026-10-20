@@ -479,12 +479,17 @@ impl Runtime {
     }
 
     /// Fetches `name` from its registry unless the node has it already.
-    pub fn pull(&self, name: &str, opts: &crate::registry::Options) -> Result<Image> {
+    pub fn pull(
+        &self,
+        name: &str,
+        opts: &crate::registry::Options,
+        creds: Option<&crate::registry::Credentials>,
+    ) -> Result<Image> {
         if let Some(img) = self.find_image(name) {
             return Ok(img);
         }
         let dir = self.dir.join("pulls").join(new_id()?);
-        let result = crate::registry::pull(name, &dir, opts)
+        let result = crate::registry::pull(name, &dir, opts, creds)
             .map_err(Error::Io)
             .and_then(|()| self.import(&dir, name));
         let _ = fs::remove_dir_all(&dir);

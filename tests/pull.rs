@@ -1,4 +1,4 @@
-//! A pull from a registry served here: anonymous Bearer tokens, an index
+//! A pull from a registry served here: a login for a Bearer token, an index
 //! resolved to linux/amd64, blobs behind a redirect.
 
 use quantykube::registry::{self, Options};
@@ -29,11 +29,16 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
         reader.read_line(&mut line).unwrap();
         let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
         let mut authorized = false;
+        let mut logged_in = false;
         loop {
             let mut h = String::new();
             reader.read_line(&mut h).unwrap();
             if h.trim().is_empty() {
                 break;
+            }
+            // user:pass
+            if h.trim_end() == "Authorization: Basic dXNlcjpwYXNz" {
+                logged_in = true;
             }
             if h.to_ascii_lowercase()
                 .starts_with("authorization: bearer secret")
@@ -51,7 +56,9 @@ fn serve(listener: TcpListener, routes: Routes, log: Arc<Mutex<Vec<String>>>) {
             c.write_all(head.as_bytes()).unwrap();
             c.write_all(body).unwrap();
         };
-        if path.starts_with("/token?") {
+        if path.starts_with("/token?") && !logged_in {
+            reply(&mut conn, "401 Unauthorized", "", "text/plain", b"");
+        } else if path.starts_with("/token?") {
             assert!(
                 path.contains("scope=repository%3Atest%2Fbox%3Apull"),
                 "{path}"
@@ -143,7 +150,13 @@ fn an_image_is_pulled_and_imported() {
     };
 
     let image = format!("{addr}/test/box:1");
-    registry::pull(&image, &base.join("layout"), &opts).unwrap();
+    assert!(registry::pull(&image, &base.join("anonymous"), &opts, None).is_err());
+    let creds = registry::Credentials {
+        username: "user".into(),
+        password: "pass".into(),
+        ..Default::default()
+    };
+    registry::pull(&image, &base.join("layout"), &opts, Some(&creds)).unwrap();
     let rt = Runtime::new(&base.join("state")).unwrap();
     let img = rt.import(&base.join("layout"), &image).unwrap();
     assert_eq!(img.id, digest(config));
@@ -162,7 +175,7 @@ fn an_image_is_pulled_and_imported() {
         format!("/v2/test/box/blobs/{}", digest(&layer)),
         ("application/octet-stream".into(), bad),
     );
-    registry::pull(&image, &base.join("layout2"), &opts).unwrap();
+    registry::pull(&image, &base.join("layout2"), &opts, Some(&creds)).unwrap();
     let rt = Runtime::new(&base.join("state2")).unwrap();
     let err = rt.import(&base.join("layout2"), &image).unwrap_err();
     assert!(err.to_string().contains("does not match"), "{err}");

@@ -358,7 +358,7 @@ fn pull(args: &[String]) -> Result<(), String> {
     let image = args.last().filter(|a| !a.starts_with("--")).ok_or(USAGE)?;
     let rt = quantykube::runtime::Runtime::new(&root).map_err(|e| e.to_string())?;
     let img = rt
-        .pull(image, &registry_options(args))
+        .pull(image, &registry_options(args), None)
         .map_err(|e| format!("{image}: {e}"))?;
     println!("{}", img.id);
     Ok(())
