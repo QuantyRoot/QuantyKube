@@ -592,3 +592,47 @@ fn seccomp_refuses_what_docker_refuses_and_nothing_a_program_needs() {
     rt.remove_image("test/sh:1").unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_rotated_log_is_reopened() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("rotate");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "rotate".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let id = rt
+        .create_container(
+            &pod,
+            spec("ticks", &["while :; do echo tick; sleep 0.05; done"]),
+        )
+        .unwrap();
+    rt.start_container(&id).unwrap();
+    let grown = |p: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::metadata(p).map_or(0, |m| m.len()) == 0 {
+            assert!(Instant::now() < deadline, "{} stayed empty", p.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let (log, old) = (logs.join("ticks.log"), logs.join("ticks.log.1"));
+    grown(&log);
+    fs::rename(&log, &old).unwrap();
+    rt.reopen_log(&id).unwrap();
+    let rotated = fs::metadata(&old).unwrap().len();
+    grown(&log);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fs::metadata(&old).unwrap().len(), rotated);
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}

@@ -639,6 +639,11 @@ impl Cri {
                 }
                 .encode()
             }
+            ("runtime.v1.RuntimeService", "ReopenContainerLog") => {
+                let r = req!(ReopenContainerLogRequest);
+                rt.reopen_log(&r.container_id).map_err(status)?;
+                ReopenContainerLogResponse {}.encode()
+            }
             ("runtime.v1.RuntimeService", "UpdateContainerResources") => {
                 let r = req!(UpdateContainerResourcesRequest);
                 let limits = r.linux.as_ref().map(limits_of).unwrap_or_default();

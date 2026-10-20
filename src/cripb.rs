@@ -338,6 +338,7 @@ proto_enum!(Signal {
 });
 
 empty_message!(
+    ReopenContainerLogResponse,
     UpdateContainerResourcesResponse,
     StopPodSandboxResponse,
     RemovePodSandboxResponse,
@@ -2931,6 +2932,26 @@ impl Message for ContainerStats {
                 5 => merge_opt(&mut self.swap, v.bytes(n)?)?,
                 6 => merge_opt(&mut self.io, v.bytes(n)?)?,
                 _ => {}
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReopenContainerLogRequest {
+    pub container_id: String,
+}
+
+impl Message for ReopenContainerLogRequest {
+    fn write(&self, out: &mut Vec<u8>) {
+        put_string(out, 1, &self.container_id);
+    }
+
+    fn merge(&mut self, buf: &[u8]) -> Result<(), DecodeError> {
+        each_field(buf, |n, v| {
+            if n == 1 {
+                self.container_id = string(v, n)?;
             }
             Ok(())
         })

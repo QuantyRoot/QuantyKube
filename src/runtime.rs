@@ -240,6 +240,9 @@ pub struct Runtime {
     containers: Mutex<HashMap<String, Container>>,
     exited: Condvar,
     cni: Option<Cni>,
+    /// The open log file of each running container, shared with the
+    /// threads that write it.
+    logs: Mutex<HashMap<String, Arc<Mutex<File>>>>,
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -324,6 +327,7 @@ impl Runtime {
             containers: Mutex::new(HashMap::new()),
             exited: Condvar::new(),
             cni,
+            logs: Mutex::new(HashMap::new()),
         };
         rt.load_images()?;
         rt.clean_up_after_a_restart();
@@ -823,9 +827,18 @@ impl Runtime {
                     .append(true)
                     .open(path)?,
             ));
+            self.logs
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), log.clone());
             let l2 = log.clone();
             std::thread::spawn(move || pump(out_r, "stdout", log));
             std::thread::spawn(move || pump(err_r, "stderr", l2));
+        } else {
+            // read and dropped, so a write to stdout never fails
+            for mut r in [out_r, err_r] {
+                std::thread::spawn(move || io::copy(&mut r, &mut io::sink()));
+            }
         }
         {
             let mut cs = self.containers.lock().unwrap();
@@ -951,6 +964,22 @@ impl Runtime {
         })
     }
 
+    /// Opens the container's log file anew, after the kubelet has moved
+    /// the old one aside to rotate it.
+    pub fn reopen_log(&self, id: &str) -> Result<()> {
+        let c = self.container(id)?;
+        let log = self.logs.lock().unwrap().get(id).cloned();
+        let (Some(log), Some(path)) = (log, self.log_path(&c)) else {
+            return Err(Error::Invalid(format!("container {id} has no open log")));
+        };
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        *log.lock().unwrap() = file;
+        Ok(())
+    }
+
     /// Changes the limits of a container in place, as the kubelet does to
     /// resize a pod.
     pub fn update_limits(&self, id: &str, limits: cgroup::Limits) -> Result<()> {
@@ -1014,6 +1043,7 @@ impl Runtime {
             self.stop_container(id, Duration::ZERO)?;
         }
         fs::remove_dir_all(self.dir.join("containers").join(id))?;
+        self.logs.lock().unwrap().remove(id);
         self.containers.lock().unwrap().remove(id);
         Ok(())
     }
