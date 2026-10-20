@@ -16,6 +16,7 @@ through and add a new entry, never silently edit history.
 - [ADR-009](#adr-009-kubectl-apply-installs-an-operator-that-swaps-and-undoes) kubectl apply installs an operator that swaps and undoes
 - [ADR-010](#adr-010-a-revision-is-a-commit-and-the-change-log-keeps-both-sides) A revision is a commit, and the change log keeps both sides
 - [ADR-011](#adr-011-history-is-kept-by-time-whatever-the-api-server-compacts) History is kept by time, whatever the API server compacts
+- [ADR-012](#adr-012-a-commit-holds-a-range-of-revisions-so-writes-share-fsyncs) A commit holds a range of revisions, so writes share fsyncs
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -274,6 +275,9 @@ between each place the kubelet's configuration somewhere else.
 
 ## ADR-010: A revision is a commit, and the change log keeps both sides
 
+*Partly superseded by ADR-012: a commit now holds a range of revisions.
+The change log and the layout below are unchanged.*
+
 Every etcd write is one QuantyDB commit, and its commit id is the etcd
 revision. A request that changes nothing, such as a transaction whose
 compare fails, commits nothing and takes no revision. Revision 1 is the
@@ -323,4 +327,45 @@ pages. The benchmarks will say how much that is under a real API server
 before the default is defended in public. A restore brings back the
 value, not the lease, so an object that had a lease comes back without
 one.
+
+## ADR-012: A commit holds a range of revisions, so writes share fsyncs
+
+ADR-010 made every write its own QuantyDB commit, with two fsyncs each.
+The first benchmark against etcd (16 clients, 256 byte puts, same machine
+and disk) showed what that costs: 1,409 writes a second against etcd's
+7,129, because etcd lets concurrent writes share one sync and this did
+not. Revision numbers are kept distinct and dense, as etcd's are; what
+changed is how many of them one commit carries.
+
+**How a group forms.** A write that arrives while a commit is on its way
+to disk waits. When the commit lands, the waiting writes apply one after
+another into a single new transaction, each with the next revision, and
+the last of them commits for all. A write that fails rolls back to a
+savepoint and leaves the others alone. Nobody waits for a timer: a lone
+write commits at once, and groups are exactly as large as the load
+makes them. Watchers are told about each revision in order, after the
+commit is durable and before any later one.
+
+**Reading at a revision inside a group.** The commit index maps each
+commit to the last revision it holds. Reading at the last one is a plain
+snapshot. Reading at an earlier one takes that snapshot and sets back
+the keys changed later in the same commit, using the previous state the
+change log already stores (ADR-010). A test writes from eight threads at
+once and checks a scan and every key at every single revision against a
+model.
+
+**Measured afterwards,** same benchmark, same machine: 4,200 to 4,800
+writes a second with 16 clients, about 8 writes per commit, and half the
+disk per write. The other half of the gain was not in the store: the
+gRPC server ran unary calls on 4 threads, so no more than 4 writes were
+ever in flight. QuantyCore now uses 64. A single client is unchanged at
+about 950 a second, since it has nobody to share a commit with.
+
+**The cost:** revision and commit are no longer the same number, so the
+store keeps an index between them, and reading inside a group costs a
+scan of that group's log. Bookkeeping commits, such as compaction and
+leases, no longer take a revision at all, which also makes revisions
+dense again. etcd is still faster at 16 clients on this machine, by
+roughly half again; the server is now bound by CPU per write, which is
+the next thing to profile.
 

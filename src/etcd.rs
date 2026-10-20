@@ -37,11 +37,14 @@ fn status(code: u32, msg: &str) -> Status {
 
 fn store_error(e: store::Error) -> Status {
     let c = match e {
-        store::Error::Compacted(_) | store::Error::FutureRevision => code::OUT_OF_RANGE,
+        store::Error::Compacted(_)
+        | store::Error::FutureRevision
+        | store::Error::NotRetained(_) => code::OUT_OF_RANGE,
         store::Error::KeyTooLong => code::INVALID_ARGUMENT,
-        store::Error::Engine(_) | store::Error::Corrupt(_) | store::Error::Aborted => {
-            code::INTERNAL
-        }
+        store::Error::Engine(_)
+        | store::Error::Corrupt(_)
+        | store::Error::Aborted
+        | store::Error::Commit(_) => code::INTERNAL,
     };
     status(c, &e.to_string())
 }
@@ -104,25 +107,20 @@ impl<B: Backend> Etcd<B> {
         store.read(0, &mut |_| Ok(()))?;
         // leases live in the store's metadata; reading it needs a write
         // transaction, which commits nothing when nothing changes
-        store.write(
-            &mut |tx| {
-                tx.meta_scan(b"lease/", &mut |k, v| {
-                    if let (Ok(id), Some((ttl, exp))) =
-                        (<[u8; 8]>::try_from(&k[6..]), decode_pair(v))
-                    {
-                        leases.insert(
-                            u64::from_be_bytes(id) as i64,
-                            Lease {
-                                ttl,
-                                expires_ms: exp,
-                            },
-                        );
-                    }
-                    true
-                })
-            },
-            &mut |_, _| {},
-        )?;
+        store.write(&mut |tx| {
+            tx.meta_scan(b"lease/", &mut |k, v| {
+                if let (Ok(id), Some((ttl, exp))) = (<[u8; 8]>::try_from(&k[6..]), decode_pair(v)) {
+                    leases.insert(
+                        u64::from_be_bytes(id) as i64,
+                        Lease {
+                            ttl,
+                            expires_ms: exp,
+                        },
+                    );
+                }
+                true
+            })
+        })?;
         let hub = Arc::new(Hub {
             state: Mutex::new(HubState {
                 last_rev: store.head(),
@@ -130,6 +128,8 @@ impl<B: Backend> Etcd<B> {
                 subs: HashMap::new(),
             }),
         });
+        let publish = hub.clone();
+        store.set_publisher(Box::new(move |rev, changes| publish.publish(rev, changes)));
         let etcd = Arc::new(Etcd {
             store,
             hub,
@@ -160,11 +160,7 @@ impl<B: Backend> Etcd<B> {
         &self,
         f: &mut dyn FnMut(&mut dyn Tx) -> store::Result<()>,
     ) -> store::Result<Option<i64>> {
-        let hub = self.hub.clone();
-        let r = self
-            .store
-            .write(f, &mut |rev, changes| hub.publish(rev, changes))?;
-        Ok(r.map(|(rev, _)| rev))
+        Ok(self.store.write(f)?.map(|(rev, _)| rev))
     }
 
     fn range(&self, req: &RangeRequest, view: &dyn View, rev: i64) -> store::Result<RangeResponse> {

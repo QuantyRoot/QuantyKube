@@ -11,8 +11,10 @@
 //! every change, because rebuilding them from snapshots would walk the
 //! commit chain once per event.
 
-use quantydb_core::{Db, FileStorage, MemStorage, Storage};
-use std::sync::{Mutex, RwLock};
+use quantydb_core::{Db, FileStorage, MemStorage, Storage, SuspendedTx};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Record {
@@ -48,6 +50,10 @@ pub enum Error {
     Corrupt(&'static str),
     /// The caller's transaction gave up; nothing was committed.
     Aborted,
+    /// The group commit this write was part of failed.
+    Commit(String),
+    /// The revision is older than the retained history.
+    NotRetained(i64),
 }
 
 impl From<quantydb_core::Error> for Error {
@@ -66,6 +72,13 @@ impl std::fmt::Display for Error {
             Error::Engine(e) => write!(f, "storage: {e}"),
             Error::Corrupt(what) => write!(f, "storage: corrupt {what}"),
             Error::Aborted => f.write_str("transaction aborted"),
+            Error::Commit(e) => write!(f, "storage: commit failed: {e}"),
+            Error::NotRetained(from) => {
+                write!(
+                    f,
+                    "revision is no longer retained, history starts at {from}"
+                )
+            }
         }
     }
 }
@@ -95,19 +108,22 @@ pub trait Tx: View {
     fn meta_scan(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool) -> Result<()>;
 }
 
+pub type Publisher = Box<dyn Fn(i64, &[Change]) + Send + Sync>;
+
 pub trait Backend: Send + Sync + 'static {
     fn head(&self) -> i64;
     fn compacted(&self) -> i64;
     /// `rev` 0 reads the newest state.
     fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()>;
-    /// Runs `f` in one transaction. If it changed anything, commits and
-    /// returns the new revision and the changes, after `publish` saw them
-    /// while no later write could have been committed yet.
+    /// Runs `f` as one atomic write. If it changed a key, it gets the next
+    /// revision; once that is durable, the publisher has seen it, in
+    /// revision order, and this returns. `f` failing changes nothing.
     fn write(
         &self,
         f: &mut dyn FnMut(&mut dyn Tx) -> Result<()>,
-        publish: &mut dyn FnMut(i64, &[Change]),
     ) -> Result<Option<(i64, Vec<Change>)>>;
+    /// Called with every committed revision and its changes, in order.
+    fn set_publisher(&self, p: Publisher);
     /// Replays the change log for revisions in `[from, to]` until `f`
     /// returns false.
     fn changes(&self, from: i64, to: i64, f: &mut dyn FnMut(i64, Change) -> bool) -> Result<()>;
@@ -129,16 +145,42 @@ const LIVE: u8 = b'k';
 const LOG: u8 = b'e';
 const META: u8 = b'm';
 const COMPACTED: &[u8] = b"compacted";
+const RETAINED_FROM: &[u8] = b"retained";
+const COMMITS: &[u8] = b"c/";
 
 /// QuantyDB keys are capped at an eighth of a page, 512 bytes at the
 /// default size, and every key here carries a one byte prefix.
 pub const MAX_KEY: usize = 511;
 
+/// Writes gathered into one QuantyDB commit (ADR-012). Writes that arrive
+/// while a commit is on its way to disk wait, apply one after another into
+/// a new transaction, and the last of them commits it for all.
+struct Batch {
+    tx: Option<SuspendedTx>,
+    /// writes in `tx` that changed something, keys or metadata
+    members: usize,
+    changes: Vec<(i64, Vec<Change>)>,
+    next_rev: i64,
+    epoch: u64,
+    committed: u64,
+    failed: Option<(u64, String)>,
+    committing: bool,
+    waiting: usize,
+}
+
 pub struct Quanty<S: Storage + 'static> {
     db: RwLock<Db<S>>,
-    writer: Mutex<()>,
-    head: std::sync::atomic::AtomicI64,
-    compacted: std::sync::atomic::AtomicI64,
+    batch: Mutex<Batch>,
+    done: Condvar,
+    publisher: RwLock<Option<Publisher>>,
+    head: AtomicI64,
+    compacted: AtomicI64,
+    /// the oldest revision history can still be read at
+    retained_from: AtomicI64,
+    /// (last revision, commit id) of every retained commit that carries
+    /// revisions, oldest first; a commit holds the revisions after the
+    /// previous entry's up to its own
+    commits: RwLock<Vec<(i64, u64)>>,
 }
 
 impl Quanty<FileStorage> {
@@ -165,70 +207,280 @@ pub struct HistoryEntry {
     pub change: Change,
 }
 
+fn commit_key(id: u64) -> Vec<u8> {
+    let mut k = vec![META];
+    k.extend_from_slice(COMMITS);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+fn varint(v: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint(&mut out, v as u64);
+    out
+}
+
 impl<S: Storage + 'static> Quanty<S> {
+    fn start(db: Db<S>) -> Result<Self> {
+        if db.head_commit() == 0 {
+            let mut tx = db.begin();
+            let id = tx.pending_commit_id();
+            tx.put(&commit_key(id), &varint(1))?;
+            tx.commit()?;
+        }
+        let (compacted, retained_from, commits, head) = {
+            let snap = db.snapshot();
+            let meta = |name: &[u8], default: i64| -> Result<i64> {
+                match snap.get(&prefixed(META, name))? {
+                    Some(v) => decode_i64(&v),
+                    None => Ok(default),
+                }
+            };
+            let compacted = meta(COMPACTED, 0)?;
+            let retained_from = meta(RETAINED_FROM, 1)?;
+            let from = prefixed(META, COMMITS);
+            let to = prefix_end(&from);
+            let mut commits = Vec::new();
+            for item in snap.scan(Some(&from), to.as_deref())? {
+                let (k, v) = item?;
+                let id = u64::from_be_bytes(
+                    k[from.len()..]
+                        .try_into()
+                        .map_err(|_| Error::Corrupt("commit index"))?,
+                );
+                commits.push((decode_i64(&v)?, id));
+            }
+            let head = commits.last().ok_or(Error::Corrupt("commit index"))?.0;
+            (compacted, retained_from, commits, head)
+        };
+        Ok(Quanty {
+            db: RwLock::new(db),
+            batch: Mutex::new(Batch {
+                tx: None,
+                members: 0,
+                changes: Vec::new(),
+                next_rev: head + 1,
+                epoch: 1,
+                committed: 0,
+                failed: None,
+                committing: false,
+                waiting: 0,
+            }),
+            done: Condvar::new(),
+            publisher: RwLock::new(None),
+            head: head.into(),
+            compacted: compacted.into(),
+            retained_from: retained_from.into(),
+            commits: RwLock::new(commits),
+        })
+    }
+
+    fn lock_batch(&self) -> MutexGuard<'_, Batch> {
+        self.batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Commits the open batch, `tx` holding its writes. The batch lock is
+    /// let go during the fsync; `committing` keeps everyone else out.
+    fn commit_batch<'g>(
+        &'g self,
+        mut g: MutexGuard<'g, Batch>,
+        mut tx: quantydb_core::WriteTx<'_, S>,
+    ) -> MutexGuard<'g, Batch> {
+        g.committing = true;
+        let epoch = g.epoch;
+        g.epoch += 1;
+        g.members = 0;
+        let changes = std::mem::take(&mut g.changes);
+        drop(g);
+        let last = changes.last().map(|c| c.0);
+        let id = tx.pending_commit_id();
+        let result = match last {
+            Some(l) => tx.put(&commit_key(id), &varint(l)).map(|()| tx),
+            None => Ok(tx),
+        }
+        .and_then(|tx| tx.commit());
+        let mut g = self.lock_batch();
+        match result {
+            Ok(id) => {
+                if let Some(l) = last {
+                    self.commits
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((l, id));
+                    self.head.store(l, Ordering::Release);
+                }
+                if let Some(p) = &*self.publisher.read().unwrap_or_else(|e| e.into_inner()) {
+                    for (rev, c) in &changes {
+                        p(*rev, c);
+                    }
+                }
+            }
+            Err(e) => {
+                g.failed = Some((epoch, e.to_string()));
+                g.next_rev = self.head() + 1;
+            }
+        }
+        g.committed = epoch;
+        g.committing = false;
+        self.done.notify_all();
+        g
+    }
+
+    /// The commit holding `rev` and the last revision in it.
+    fn commit_of(&self, rev: i64) -> Result<(i64, u64)> {
+        if rev < self.retained_from.load(Ordering::Acquire) {
+            return Err(Error::NotRetained(
+                self.retained_from.load(Ordering::Acquire),
+            ));
+        }
+        let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
+        let i = commits.partition_point(|c| c.0 < rev);
+        commits.get(i).copied().ok_or(Error::FutureRevision)
+    }
+
+    /// The store as it was right after `rev`.
+    fn read_at(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()> {
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let (last, id) = self.commit_of(rev)?;
+        let snap = db.snapshot_at(id)?;
+        let base = Reader { get: &snap };
+        if last == rev {
+            return f(&base);
+        }
+        // the commit also holds later revisions; undo them with the log
+        let mut overlay = BTreeMap::new();
+        for item in snap.scan(Some(&log_key(rev + 1, 0)), Some(&log_key(last + 1, 0)))? {
+            let (_, v) = item?;
+            let c = decode_change(&v)?;
+            overlay.entry(c.kv.key).or_insert(c.prev);
+        }
+        f(&Overlay {
+            base: &base,
+            overlay,
+        })
+    }
+
     /// Drops history older than `keep_ms`, but never a revision etcd
     /// clients may still read, that is anything from the compaction
     /// revision on. Returns how many commits were collected.
     pub fn enforce_retention(&self, keep_ms: i64, now_ms: i64) -> Result<usize> {
-        let _w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let (keep, floor, total) = {
+        let mut g = self.lock_batch();
+        while g.committing || g.tx.is_some() {
+            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let (keep, floor_id, total) = {
             let db = self.db.read().unwrap_or_else(|e| e.into_inner());
             let log = db.log()?;
             let cutoff = now_ms - keep_ms;
-            // keep the newest commit older than the cutoff too: it is the
+            // the newest commit older than the cutoff stays: it is the
             // state at the cutoff itself
             let by_time = log
                 .iter()
                 .position(|c| (c.unix_ts_ms as i64) < cutoff)
                 .map_or(log.len(), |i| i + 1);
-            let by_etcd = (self.head() - self.compacted() + 1).max(1) as usize;
-            let keep = by_time.max(by_etcd).min(log.len());
-            (keep, log[keep - 1].commit_id as i64, log.len())
+            let needed = match self.commit_of(self.compacted().max(1)) {
+                Ok((_, id)) => id,
+                Err(_) => 0,
+            };
+            let by_etcd = log.iter().filter(|c| c.commit_id >= needed).count();
+            let keep = by_time.max(by_etcd).clamp(1, log.len());
+            (keep, log[keep - 1].commit_id, log.len())
         };
         if keep >= total {
             return Ok(0);
         }
-        let pruned = {
+        let (dropped, from) = {
+            let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
+            let n = commits.partition_point(|c| c.1 < floor_id);
+            let from = if n == 0 {
+                self.retained_from.load(Ordering::Acquire)
+            } else {
+                commits[n - 1].0 + 1
+            };
+            (commits[..n].to_vec(), from)
+        };
+        {
             let db = self.db.read().unwrap_or_else(|e| e.into_inner());
             let mut tx = db.begin();
             let old: Vec<Vec<u8>> = tx
-                .scan(Some(&[LOG]), Some(&log_key(floor, 0)))?
+                .scan(Some(&[LOG]), Some(&log_key(from, 0)))?
                 .map(|r| r.map(|(k, _)| k))
                 .collect::<std::result::Result<_, _>>()?;
             for k in &old {
                 tx.delete(k)?;
             }
-            if old.is_empty() {
-                false
-            } else {
-                let committed = tx.commit()? as i64;
-                self.head
-                    .store(committed, std::sync::atomic::Ordering::Release);
-                true
+            for (_, id) in &dropped {
+                tx.delete(&commit_key(*id))?;
             }
-        };
-        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
-        let report = db.gc(keep + usize::from(pruned))?;
-        Ok(report.pruned_commits as usize)
-    }
-
-    fn start(db: Db<S>) -> Result<Self> {
-        if db.head_commit() == 0 {
-            let mut tx = db.begin();
-            tx.put(&[META, b'v'], b"1")?;
+            tx.put(&prefixed(META, RETAINED_FROM), &varint(from))?;
             tx.commit()?;
         }
-        let compacted = match db.snapshot().get(&prefixed(META, COMPACTED))? {
-            Some(v) => decode_i64(&v)?,
-            None => 0,
-        };
-        let head = db.head_commit() as i64;
-        Ok(Quanty {
-            db: RwLock::new(db),
-            writer: Mutex::new(()),
-            head: head.into(),
-            compacted: compacted.into(),
-        })
+        self.commits
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..dropped.len());
+        self.retained_from.store(from, Ordering::Release);
+        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let report = db.gc(keep + 1)?;
+        drop(g);
+        Ok(report.pruned_commits as usize)
+    }
+}
+
+/// A snapshot with some keys set back to earlier states.
+struct Overlay<'a> {
+    base: &'a dyn View,
+    overlay: BTreeMap<Vec<u8>, Option<Record>>,
+}
+
+impl View for Overlay<'_> {
+    fn get(&self, key: &[u8]) -> Result<Option<Record>> {
+        match self.overlay.get(key) {
+            Some(r) => Ok(r.clone()),
+            None => self.base.get(key),
+        }
+    }
+
+    fn scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        f: &mut dyn FnMut(Record) -> bool,
+    ) -> Result<()> {
+        use std::ops::Bound;
+        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut extra = self
+            .overlay
+            .range::<[u8], _>((Bound::Included(start), hi))
+            .peekable();
+        let mut go = true;
+        self.base.scan(start, end, &mut |rec| {
+            while let Some((k, v)) = extra.next_if(|(k, _)| k.as_slice() < rec.key.as_slice()) {
+                let _ = k;
+                if let Some(r) = v {
+                    go = f(r.clone());
+                    if !go {
+                        return false;
+                    }
+                }
+            }
+            go = match extra.next_if(|(k, _)| k.as_slice() == rec.key.as_slice()) {
+                Some((_, Some(r))) => f(r.clone()),
+                Some((_, None)) => true,
+                None => f(rec),
+            };
+            go
+        })?;
+        if go {
+            for (_, v) in extra {
+                if let Some(r) = v {
+                    if !f(r.clone()) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -518,57 +770,100 @@ impl<S: Storage + 'static> Tx for Writing<'_, '_, S> {
 
 impl<S: Storage + 'static> Backend for Quanty<S> {
     fn head(&self) -> i64 {
-        self.head.load(std::sync::atomic::Ordering::Acquire)
+        self.head.load(Ordering::Acquire)
     }
 
     fn compacted(&self) -> i64 {
-        self.compacted.load(std::sync::atomic::Ordering::Acquire)
+        self.compacted.load(Ordering::Acquire)
     }
 
     fn read(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        if rev > db.head_commit() as i64 {
+        let head = self.head();
+        if rev > head {
             return Err(Error::FutureRevision);
         }
         if rev > 0 && rev < self.compacted() {
             return Err(Error::Compacted(self.compacted()));
         }
-        let snap = if rev == 0 {
-            db.snapshot()
-        } else {
-            db.snapshot_at(rev as u64)?
-        };
-        f(&Reader { get: &snap })
+        // the newest state is read at the head revision too, so that the
+        // data and the revision reported with it always agree
+        self.read_at(if rev == 0 { head } else { rev }, f)
     }
 
     fn write(
         &self,
         f: &mut dyn FnMut(&mut dyn Tx) -> Result<()>,
-        publish: &mut dyn FnMut(i64, &[Change]),
     ) -> Result<Option<(i64, Vec<Change>)>> {
-        let _w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.lock_batch();
+        g.waiting += 1;
+        while g.committing {
+            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.waiting -= 1;
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let mut tx = db.begin();
-        let rev = tx.pending_commit_id() as i64;
+        let mut tx = match g.tx.take() {
+            Some(t) => db.resume(t)?,
+            None => db.begin(),
+        };
+        let rev = g.next_rev;
+        let roots = tx.roots();
+        tx.savepoint();
         let mut w = Writing {
             tx: &mut tx,
             rev,
             changes: Vec::new(),
             meta_dirty: false,
         };
-        f(&mut w)?;
-        let (changes, meta_dirty) = (w.changes, w.meta_dirty);
-        if changes.is_empty() && !meta_dirty {
+        let res = f(&mut w);
+        let (changes, meta_dirty) = (std::mem::take(&mut w.changes), w.meta_dirty);
+        let res = res.and_then(|()| {
+            for (i, c) in changes.iter().enumerate() {
+                tx.put(&log_key(rev, i as u32), &encode_change(c))?;
+            }
+            Ok(())
+        });
+        let wrote = res.is_ok() && (!changes.is_empty() || meta_dirty);
+        if wrote {
+            tx.release_savepoint();
+            g.members += 1;
+            if !changes.is_empty() {
+                g.next_rev += 1;
+                g.changes.push((rev, changes.clone()));
+            }
+        } else {
+            tx.rollback_savepoint(roots);
+            tx.release_savepoint();
+        }
+        let epoch = g.epoch;
+        // whoever applies last while nobody else waits commits the batch,
+        // even if its own write changed nothing
+        g = if g.members == 0 {
+            drop(tx);
+            g
+        } else if g.waiting == 0 {
+            self.commit_batch(g, tx)
+        } else {
+            g.tx = Some(tx.suspend());
+            g
+        };
+        drop(db);
+        res?;
+        if !wrote {
             return Ok(None);
         }
-        for (i, c) in changes.iter().enumerate() {
-            tx.put(&log_key(rev, i as u32), &encode_change(c))?;
+        while g.committed < epoch {
+            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
         }
-        let committed = tx.commit()? as i64;
-        debug_assert_eq!(committed, rev);
-        self.head.store(rev, std::sync::atomic::Ordering::Release);
-        publish(rev, &changes);
-        Ok(Some((rev, changes)))
+        if let Some((e, msg)) = &g.failed {
+            if *e == epoch {
+                return Err(Error::Commit(msg.clone()));
+            }
+        }
+        Ok((!changes.is_empty()).then_some((rev, changes)))
+    }
+
+    fn set_publisher(&self, p: Publisher) {
+        *self.publisher.write().unwrap_or_else(|e| e.into_inner()) = Some(p);
     }
 
     fn changes(&self, from: i64, to: i64, f: &mut dyn FnMut(i64, Change) -> bool) -> Result<()> {
@@ -587,14 +882,29 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
     }
 
     fn read_retained(&self, rev: i64, f: &mut dyn FnMut(&dyn View) -> Result<()>) -> Result<()> {
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        let snap = db.snapshot_at(rev as u64)?;
-        f(&Reader { get: &snap })
+        if rev > self.head() {
+            return Err(Error::FutureRevision);
+        }
+        self.read_at(rev, f)
     }
 
     fn revision_at(&self, unix_ms: i64) -> Result<i64> {
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        Ok(db.snapshot_at_time(unix_ms.max(0) as u64)?.commit_id() as i64)
+        let id = match db.snapshot_at_time(unix_ms.max(0) as u64) {
+            Ok(s) => s.commit_id(),
+            Err(_) => {
+                return Err(Error::NotRetained(
+                    self.retained_from.load(Ordering::Acquire),
+                ))
+            }
+        };
+        let commits = self.commits.read().unwrap_or_else(|e| e.into_inner());
+        match commits.partition_point(|c| c.1 <= id) {
+            0 => Err(Error::NotRetained(
+                self.retained_from.load(Ordering::Acquire),
+            )),
+            i => Ok(commits[i - 1].0),
+        }
     }
 
     fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>> {
@@ -604,6 +914,11 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
             .into_iter()
             .map(|c| (c.commit_id, c.unix_ts_ms))
             .collect();
+        let commits = self
+            .commits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let snap = db.snapshot();
         let mut out = Vec::new();
         for item in snap.scan(Some(&[LOG]), Some(&[LOG + 1]))? {
@@ -615,10 +930,11 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
                 Some(e) => key >= start && key < e,
             };
             if hit {
-                let rev = u64::from_be_bytes(k[1..9].try_into().unwrap());
+                let rev = u64::from_be_bytes(k[1..9].try_into().unwrap()) as i64;
+                let commit = commits.get(commits.partition_point(|c| c.0 < rev));
                 out.push(HistoryEntry {
-                    rev: rev as i64,
-                    unix_ms: times.get(&rev).copied().unwrap_or(0) as i64,
+                    rev,
+                    unix_ms: commit.and_then(|c| times.get(&c.1)).copied().unwrap_or(0) as i64,
                     change,
                 });
             }
@@ -643,19 +959,8 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
         if rev > self.head() {
             return Err(Error::FutureRevision);
         }
-        let _w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
-        // bookkeeping is a commit like any other, so it takes a revision;
-        // etcd does not, but no client depends on revisions being dense
-        let mut tx = db.begin();
-        let mut v = Vec::new();
-        put_varint(&mut v, rev as u64);
-        tx.put(&prefixed(META, COMPACTED), &v)?;
-        let committed = tx.commit()? as i64;
-        self.head
-            .store(committed, std::sync::atomic::Ordering::Release);
-        self.compacted
-            .store(rev, std::sync::atomic::Ordering::Release);
+        self.write(&mut |tx| tx.meta_put(COMPACTED, &varint(rev)))?;
+        self.compacted.fetch_max(rev, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -673,7 +978,7 @@ mod tests {
     use super::*;
 
     fn put(s: &Quanty<MemStorage>, k: &[u8], v: &[u8]) -> i64 {
-        s.write(&mut |tx| tx.put(k, v, 0).map(|_| ()), &mut |_, _| {})
+        s.write(&mut |tx| tx.put(k, v, 0).map(|_| ()))
             .unwrap()
             .unwrap()
             .0
@@ -707,10 +1012,81 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writes_share_commits_and_every_revision_reads_back_exactly() {
+        let s = std::sync::Arc::new(Quanty::in_memory().unwrap());
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let mut x = t * 7919 + 1;
+                    let mut seen = Vec::new();
+                    for _ in 0..60 {
+                        x = x
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let key = format!("/k/{}", (x >> 33) % 12).into_bytes();
+                        let r = if (x >> 20) % 4 == 0 {
+                            s.write(&mut |tx| tx.delete(&key).map(|_| ()))
+                        } else {
+                            let v = format!("{t}-{x}").into_bytes();
+                            s.write(&mut |tx| tx.put(&key, &v, 0).map(|_| ()))
+                        };
+                        seen.extend(r.unwrap());
+                    }
+                    seen
+                })
+            })
+            .collect();
+        let mut log: Vec<(i64, Vec<Change>)> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        log.sort_by_key(|e| e.0);
+        let revs: Vec<i64> = log.iter().map(|e| e.0).collect();
+        let dense: Vec<i64> = (2..=s.head()).collect();
+        assert_eq!(revs, dense, "every revision used once, none skipped");
+        let commits = s.commits.read().unwrap().len();
+        assert!(
+            commits < revs.len(),
+            "{commits} commits for {} writes",
+            revs.len()
+        );
+
+        let mut model = BTreeMap::new();
+        for (rev, changes) in &log {
+            for c in changes {
+                match c.kind {
+                    Kind::Put => model.insert(c.kv.key.clone(), c.kv.value.clone()),
+                    Kind::Delete => model.remove(&c.kv.key),
+                };
+            }
+            let mut got = BTreeMap::new();
+            s.read(*rev, &mut |v| {
+                v.scan(b"/", None, &mut |r| {
+                    got.insert(r.key, r.value);
+                    true
+                })
+            })
+            .unwrap();
+            assert_eq!(got, model, "scan at revision {rev}");
+            for k in 0..12 {
+                let key = format!("/k/{k}").into_bytes();
+                let mut one = None;
+                s.read(*rev, &mut |v| {
+                    one = v.get(&key)?.map(|r| r.value);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(one.as_ref(), model.get(&key), "get at revision {rev}");
+            }
+        }
+    }
+
+    #[test]
     fn a_write_that_changes_nothing_takes_no_revision() {
         let s = Quanty::in_memory().unwrap();
         let r = s
-            .write(&mut |tx| tx.delete(b"/missing").map(|_| ()), &mut |_, _| {})
+            .write(&mut |tx| tx.delete(b"/missing").map(|_| ()))
             .unwrap();
         assert!(r.is_none());
         assert_eq!(s.head(), 1);
@@ -722,7 +1098,7 @@ mod tests {
         put(&s, b"/a", b"1");
         put(&s, b"/a", b"2");
         let del = s
-            .write(&mut |tx| tx.delete(b"/a").map(|_| ()), &mut |_, _| {})
+            .write(&mut |tx| tx.delete(b"/a").map(|_| ()))
             .unwrap()
             .unwrap()
             .0;
@@ -768,8 +1144,7 @@ mod tests {
         {
             let s = Quanty::open(&dir).unwrap();
             for k in [&b"/a"[..], b"/b", b"/b/x", b"/c"] {
-                s.write(&mut |tx| tx.put(k, b"v", 0).map(|_| ()), &mut |_, _| {})
-                    .unwrap();
+                s.write(&mut |tx| tx.put(k, b"v", 0).map(|_| ())).unwrap();
             }
             let mut keys = Vec::new();
             s.read(0, &mut |v| {
@@ -788,7 +1163,7 @@ mod tests {
         }
         let s = Quanty::open(&dir).unwrap();
         assert_eq!(s.compacted(), 3);
-        assert_eq!(s.head(), 6);
+        assert_eq!(s.head(), 5, "compaction is bookkeeping, not a revision");
         std::fs::remove_file(&dir).unwrap();
     }
 }
