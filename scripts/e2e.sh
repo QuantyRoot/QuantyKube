@@ -46,6 +46,7 @@ expect() {
 }
 
 start
+expect 600 stat -c %a "$sock"
 expect OK e put /a hello
 expect OK e put /a again
 expect $'/a\nagain' e get /a

@@ -294,6 +294,11 @@ fn serve(args: &[String]) -> Result<(), String> {
         std::fs::remove_file(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     }
     let listener = UnixListener::bind(&socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    // the socket's mode is the store's only access control (ADR-004):
+    // whoever can connect can read and write every object in the cluster
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
     eprintln!("quantykube: serving {} on {endpoint}", data.display());
     quantycore::grpc::serve_unix(listener, etcd).map_err(|e| e.to_string())
 }

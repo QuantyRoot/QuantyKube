@@ -95,7 +95,8 @@ which a loopback port does not have.
 
 **The cost:** the store cannot be reached from another machine, so the
 API server and QuantyKube always share a host. The only access control is
-the socket's file mode and owner. A CIS style benchmark scan will flag the
+the socket's file mode and owner, and the server creates it 0600, owner
+only. A CIS style benchmark scan will flag the
 missing etcd TLS settings, and that finding is correct. This record is
 superseded when QuantyCore's TLS meets its own bar.
 
