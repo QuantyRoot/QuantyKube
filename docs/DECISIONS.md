@@ -546,9 +546,8 @@ The CRI service (`src/cri.rs`) is in place before most of what the
 kubelet can ask of it. A request this runtime would carry out differently
 from what it says is refused with INVALID_ARGUMENT and the reason, never
 run in part: image volumes and mount propagation, devices, a terminal
-or stdin, a privileged container, a pod on the host's network or with a shared PID namespace, any runtime handler but
-the default. Status reports NetworkReady false, because no CNI plugin is
-run yet.
+or stdin, a privileged container, a pod on the host's network or with a
+shared PID namespace, any runtime handler but the default.
 
 A container started without the volume holding its secrets, or with a
 shared PID namespace it did not get, would look like it works and be
