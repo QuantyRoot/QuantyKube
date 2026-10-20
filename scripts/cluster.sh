@@ -85,15 +85,23 @@ spec:
     livenessProbe:
       exec: {command: [test, -e, /tmp/alive]}
       periodSeconds: 2
+  - name: caps
+    image: test/busybox:1
+    imagePullPolicy: Never
+    command: [sh, -c, 'grep CapEff /proc/self/status; exec sleep 3600']
+    securityContext:
+      capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}
   volumes: [{name: config, configMap: {name: greeting}}]
 YAML
 until_ok "pod running" sh -c "'$K3S' kubectl get pod hello -o jsonpath='{.status.phase}' | grep -qx Running"
-until_ok "pod logs" sh -c "'$K3S' kubectl logs hello | grep -qx 'hello from a ConfigMap'"
-[ "$(k logs hello | tail -1)" = 1000 ] || fail "runAsUser: $(k logs hello)"
+until_ok "pod logs" sh -c "'$K3S' kubectl logs hello -c hello | grep -qx 'hello from a ConfigMap'"
+[ "$(k logs hello -c hello | tail -1)" = 1000 ] || fail "runAsUser: $(k logs hello -c hello)"
+[ "$(k logs hello -c caps)" = "$(printf 'CapEff:\t0000000000000400')" ] ||
+    fail "capabilities: $(k logs hello -c caps)"
 ip=$(k get pod hello -o jsonpath='{.status.podIP}')
 case $ip in 10.42.0.*) ;; *) fail "pod address: $ip" ;; esac
 sleep 6
-[ "$(k get pod hello -o jsonpath='{.status.containerStatuses[0].restartCount}')" = 0 ] ||
+[ "$(k get pod hello -o jsonpath='{.status.containerStatuses[?(@.name=="hello")].restartCount}')" = 0 ] ||
     fail "the liveness probe failed"
 # for the record, not a check
 for p in "${pids[@]}"; do
