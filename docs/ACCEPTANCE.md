@@ -32,10 +32,13 @@ Without all of these there is no demonstration.
 
 ## Should
 
-7. A complete single node cluster: controller manager, scheduler and a
-   kubelet with an existing CRI runtime, on one of Elchi's machines.
-   `kubectl get nodes` reports the node Ready, and
-   `kubectl create deployment` results in a running pod.
+7. A real small cluster: one control plane machine running the API
+   server, controller manager, scheduler and QuantyKube, plus at least two
+   worker machines with kubelets and an existing CRI runtime, as virtual
+   machines on Elchi's server. `kubectl get nodes` reports every node
+   Ready, a deployment spreads its pods across the workers, and the
+   cluster is driven from the presenter's laptop. The store is still a
+   single node; only the workers are many, and the talk says so.
 8. `etcdctl get`, `put` and `watch` work against QuantyKube for the keys
    the API server writes, for showing the raw store on stage.
 
@@ -47,8 +50,10 @@ call.
 
 ## How it is run on the day
 
-- Everything runs on one machine that is physically present. Nothing
-  depends on the venue network.
+- Must items 1 to 6 also run entirely on the presenter's laptop, so that
+  the demonstration survives a venue network that fails. The real cluster
+  from item 7 is reached through a tunnel over a phone hotspot, not over
+  the venue network.
 - `docs/DEMO.md` contains the exact commands, and they are run verbatim
   from a clean machine at least five times before the day. A step that is
   only ever run from memory is not part of the demonstration.
