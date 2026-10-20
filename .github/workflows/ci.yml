@@ -137,6 +137,17 @@ jobs:
           t=$RUNNER_TEMP
           sudo env K3S=$t/k3s IMAGE=$t/busybox CNI_BIN=$t/cni scripts/cluster.sh
 
+  raft:
+    name: Raft in the simulator, 5000 seeds per cluster size
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: cargo test --release --lib raft:: -- --nocapture
+        env:
+          QUANTY_RAFT_SEEDS: "5000"
+
   msrv:
     name: test on MSRV (1.89)
     runs-on: ubuntu-latest

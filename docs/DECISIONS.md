@@ -36,6 +36,7 @@ through and add a new entry, never silently edit history.
 - [ADR-029](#adr-029-the-demonstration-and-the-installer-target-kubeadm) The demonstration and the installer target kubeadm
 - [ADR-030](#adr-030-a-failed-commit-stops-the-store) A failed commit stops the store
 - [ADR-031](#adr-031-over-a-network-the-store-speaks-tls-and-wants-a-client-certificate) Over a network the store speaks TLS and wants a client certificate
+- [ADR-032](#adr-032-raft-is-a-state-machine-without-io-tested-by-a-simulator-that-finds-planted-bugs) Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -961,3 +962,48 @@ anyone who did not write it (QuantyCore ADR-003), and it is now the
 lock on the whole cluster's data whenever the store is reached over a
 network. Until the review, a store reachable over a network should
 also be fenced in by the network itself.
+
+## ADR-032: Raft is a state machine without I/O, tested by a simulator that finds planted bugs
+
+The Raft node (`src/raft/mod.rs`) never touches a disk, a clock or a
+network. Its host calls `tick`, `step` with a message and `propose`
+with a command, and after each call takes a `Ready`: first the term,
+vote and log entries to make durable, then the messages to send, then
+the committed entries to apply. This is how etcd's raft library is
+built, and for the same reason: the protocol can then run anywhere,
+in particular in a simulator.
+
+The simulator (`src/raft/sim.rs`, ADR-008) runs a cluster in one
+process from one seed: message delays, reordering, loss, duplication,
+partitions into up to three parts or around one node, crashes that
+keep only what was made durable, restarts, fault rates that differ
+from seed to seed, and faults aimed at the moments that matter, a new
+leader cut off before it replicates and a leader dying right after a
+commit, as FoundationDB's buggify aims them. It checks at every step
+that no term has two leaders and that every index is applied as the
+same entry everywhere, and at the end, with the network healed, that
+the cluster makes progress and that every acknowledged command is
+applied on every node.
+
+It counts only because it finds what was planted: a second vote in a
+term, a vote for a candidate whose log is behind, committing an entry
+of an earlier term by counting replicas (Figure 8 of the Raft paper,
+found only after the aimed faults were added), keeping entries that
+conflict with the leader's, and a host that sends before its disk has
+what the message promises. Each is found within 300 seeds; the correct
+node passed 20,000. Every CI run checks the planted bugs and 5,000
+seeds per cluster size.
+
+What the node does: elections with pre-vote, so that a node returning
+from a partition cannot unseat a working leader; check quorum, so that
+a leader that cannot reach a majority steps down; a node that heard
+from a leader within the election timeout refuses to vote for another;
+replication in batches with fast backtracking; a new leader's empty
+entry to commit its term.
+
+**What it does not do yet, and what that costs:** membership is fixed
+when the cluster starts, so a node is replaced by restarting all of
+them with the new list; the log is never compacted and is kept whole
+in memory, so it grows with every write until snapshots exist; reads
+are not yet linearizable through ReadIndex. All three come before the
+cluster is shown, or the talk says which are missing.
