@@ -3,8 +3,8 @@
 //! gRPC around it (docs/RUNTIME.md).
 //!
 //! State lives in memory and under one directory. A restart of the
-//! runtime forgets its pods; the kubelet then recreates them, which is
-//! also what it does after a node reboot. Persisting state is later work.
+//! runtime tears down what the last run left, and the kubelet recreates
+//! the pods, as after a node reboot (ADR-017).
 
 use crate::cgroup;
 use crate::cni::{self, Cni};
@@ -404,9 +404,10 @@ impl Runtime {
         Ok(())
     }
 
-    /// Imports an image from a directory holding `manifest.json`, an OCI
-    /// or Docker v2 image manifest, and `blobs/<hex digest>`. Every blob
-    /// is checked against its digest before anything is unpacked.
+    /// Imports an image from an OCI image layout, or from a directory
+    /// holding `manifest.json`, an OCI or Docker v2 image manifest, and
+    /// `blobs/<hex digest>`. Every blob is checked against its digest
+    /// before anything is unpacked.
     pub fn import(&self, from: &Path, reference: &str) -> Result<Image> {
         let (m, blobs) = if from.join("oci-layout").exists() {
             let blobs = from.join("blobs").join("sha256");
