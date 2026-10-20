@@ -22,6 +22,13 @@ real `etcdctl`, an unmodified `kube-apiserver` and a k3s control plane
 (`scripts/e2e.sh`), and against SIGKILL under load (`tests/crash.rs`).
 Nothing has run in production yet.
 
+The second half is a node runtime, the program the kubelet starts
+containers through. In CI a k3s node runs on both halves at once, its
+API server on the store and its kubelet on the runtime, and an unchanged
+kubelet starts a pod with a ConfigMap volume, a service account token,
+CPU and memory limits, a pod network and an exec liveness probe
+(`scripts/cluster.sh`).
+
 ## What it does
 
 ```
@@ -60,6 +67,7 @@ watches see the object return.
 | Retention: long history in the log, short lived snapshots ([ADR-014](docs/DECISIONS.md)) | built, soak tested |
 | TLS, so the store can be reached over a network | waiting for QuantyCore |
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
+| A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI; pod start measured against containerd; no pull yet |
 | Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
 
