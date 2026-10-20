@@ -15,10 +15,10 @@ written before most of the code.
   standard devices, `devpts` and `/dev/shm`; `/sys` read only; the paths
   runc masks or makes read only under `/proc` and `/sys`; Docker's
   default capabilities except MKNOD in every set (ADR-026), the rest
-  dropped from the bounding set; `no_new_privs`; Docker's seccomp allowlist (ADR-024);
-  and, with `--cgroup`, a cgroup v2 with memory and pid limits that the
-  process is in before any of its own code runs (ADR-013). alpine,
-  busybox and nginx run in it.
+  dropped from the bounding set; `no_new_privs`; Docker's seccomp
+  allowlist (ADR-024); and, with `--cgroup`, a cgroup v2 with memory and
+  pid limits that the process is in before any of its own code runs
+  (ADR-013). alpine, busybox and nginx run in it.
 
 - `quantykube runtime` serves RuntimeService and ImageService on a Unix
   socket: version and status, pods and containers from creation to
