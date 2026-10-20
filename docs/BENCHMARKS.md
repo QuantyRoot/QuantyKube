@@ -102,3 +102,33 @@ Before group commit, the 16 client put workload ran at 564 to 1,494
 requests a second and the data file grew by up to 25 KB per write. Both
 improved with ADR-012: 4,399 to 4,515 requests a second, and about 8.5 KB
 per write.
+
+## Pod start: the runtime against containerd
+
+`scripts/podstart.sh`, on the same 2 vCPU machine, with only one runtime
+up at a time. Both got the same crictl v1.34.0, the same busybox image
+(manifest `sha256:b7f3d86d...`), the same pod and container definitions
+and the same CNI bridge network (plugins v1.9.1). containerd v2.4.2 ran
+runc v1.3.2 with the cgroupfs driver and `registry.k8s.io/pause:3.10.1`
+as its sandbox image. 30 pods each, after one untimed warm-up, two runs:
+
+| | RunPodSandbox | to container running | memory, 10 pods |
+| --- | --- | --- | --- |
+| QuantyKube | 37 to 39 ms (p90 44 to 45) | 95 to 98 ms (p90 105 to 108) | 7 MiB, 1 process |
+| containerd | 107 to 109 ms (p90 118 to 126) | 223 to 236 ms (p90 245 to 268) | 179 MiB, 11 processes |
+
+The memory is the resident size of the runtime's processes: containerd
+and its ten shims, without the ten pause processes, against the one
+QuantyKube process that holds no process per pod (ADR-017).
+
+What makes this less than a final claim:
+
+- The machine has cgroup v1. containerd put each pod into a cgroup;
+  QuantyKube, which supports only v2 (ADR-020), created none. This is
+  the largest known difference in work done, and the rented nodes, on
+  cgroup v2, will measure both doing it.
+- Each step is a separate crictl process, 12 to 17 ms to start, in
+  both columns alike; a kubelet calls over a held connection, so the
+  real gap in absolute time is the same and the ratio larger.
+- containerd's OOM score adjustment had to be restricted, because the
+  test machine lacks CAP_SYS_RESOURCE.
