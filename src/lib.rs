@@ -1,6 +1,7 @@
 //! A Kubernetes data store with time travel: the etcd v3 API the Kubernetes
 //! API server uses, on the QuantyDB engine.
 
+pub mod cripb;
 pub mod etcd;
 pub mod etcdpb;
 pub mod image;
