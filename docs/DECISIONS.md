@@ -31,6 +31,9 @@ through and add a new entry, never silently edit history.
 - [ADR-024](#adr-024-the-seccomp-filter-is-dockers-allowlist) The seccomp filter is Docker's allowlist
 - [ADR-025](#adr-025-pulls-go-through-the-import) Pulls go through the import
 - [ADR-026](#adr-026-without-a-device-filter-there-is-no-mknod) Without a device filter there is no MKNOD
+- [ADR-027](#adr-027-raft-before-17-november-with-a-cut-off) Raft before 17 November, with a cut off
+- [ADR-028](#adr-028-history-is-served-through-the-kubernetes-api) History is served through the Kubernetes API
+- [ADR-029](#adr-029-the-demonstration-and-the-installer-target-kubeadm) The demonstration and the installer target kubeadm
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -205,6 +208,9 @@ later.
 
 ## ADR-008: Raft comes later, and starts with a simulator
 
+*Its date is superseded by ADR-027: Raft is attempted before 17 November.
+How it is built stands.*
+
 Multiple store nodes with Raft are the goal of the next phase, not of the
 first demonstration. ADR-001 stands for that date.
 
@@ -232,6 +238,9 @@ available store, is answered on 17 November with a plan and not with a
 running system, and the talk has to say so.
 
 ## ADR-009: kubectl apply installs an operator that swaps and undoes
+
+*Its date is superseded by ADR-029: the installer is attempted before 17
+November, for kubeadm first. The shape stands.*
 
 Moving an existing cluster onto QuantyKube is one command,
 `kubectl apply` of a published manifest. It installs an operator that
@@ -799,3 +808,82 @@ of the default set all the same: two locks where one would do.
 works under Docker, and a pod that asks for Unconfined to make a call
 Docker's profile refuses fails too.
 
+## ADR-027: Raft before 17 November, with a cut off
+
+ADR-008 put several store nodes after the first demonstration. Two
+things changed. Most companies that would run QuantyKube run a highly
+available store today and will not consider one that is not, so the
+talk without it answers the first question with a plan. And the
+reasons for waiting are gone: HTTP/2, gRPC and Watch are built, and
+QuantyCore has TLS for the transport between the store nodes.
+
+Raft is built as ADR-008 says: a deterministic simulator first, in which
+several members run in one process against a simulated network and
+disks, driven by a seed, and which must find bugs planted in it before
+the protocol is written against it. Then three processes on one machine
+with real partitions in CI, then the three rented servers, one member
+on each.
+
+The store fixes from the review of 20 October come first, since Raft
+replicates exactly that write path, and so does the store over TCP with
+TLS and client certificates, which Raft, the installer and the
+aggregated API (ADR-028) all need.
+
+**The cut off** is 7 November. If the simulator and the partition test
+in CI do not pass by then, the demonstration shows a single store node
+and the talk says why. A Raft that loses a write on stage would cost
+more than one that is not shown.
+
+**The cost:** three weeks of work go into the part of the project that
+is hardest to get right, alongside everything else for the same date,
+and the comparison with etcd has to be made again, three members
+against three.
+
+## ADR-028: History is served through the Kubernetes API
+
+`kubectl quanty` reached the History service over the store's Unix
+socket, so it had to run on the machine of the store, as root. On stage
+the cluster is driven from a Windows laptop that holds a kubeconfig and
+nothing else, and at a company nobody gets a shell on the control plane
+to bring back a ConfigMap.
+
+The store registers an aggregated API with the API server, an
+APIService under its own group, and serves history, reads at a revision
+and restores over HTTPS. The API server authenticates the caller,
+authorizes with RBAC against that group, and forwards the request with
+the caller's identity, which the store checks against the API server's
+client certificate. `kubectl-quanty` becomes a thin program that calls
+`kubectl get --raw` and `kubectl create --raw`, so it needs no TLS and
+no kubeconfig parsing of its own, and it is built for Windows in CI.
+
+The Unix socket keeps History for the node itself and for tests.
+
+Rejected: a TCP endpoint of the store with client certificates for the
+plugin, since every user would need a certificate from the store and
+none of the cluster's access control would apply; and SSH to the
+control plane, for the reason above.
+
+**The cost:** the store becomes an HTTPS server on the cluster network
+that the API server must reach, and a restore is now something RBAC
+can grant, so the default roles must not grant it.
+
+## ADR-029: The demonstration and the installer target kubeadm
+
+The cluster on stage is upstream Kubernetes set up with kubeadm, on
+three servers with Ubuntu 26.04. k3s was the first target because it is
+one binary and starts in seconds, and it stays in CI for that reason,
+but it is a distribution, and the question a k3s demonstration invites
+is whether it works with real Kubernetes. Nothing in the store or the
+runtime depends on the distribution: they serve the etcd v3 API and
+the CRI.
+
+The installer (ADR-009) does depend on it, since every distribution
+keeps the API server's flags and the kubelet's configuration somewhere
+else. kubeadm is the reference for clusters people run themselves, and
+it makes the change clean: the API server is a static pod whose
+manifest the kubelet watches, so pointing `--etcd-servers` at
+QuantyKube restarts it. kubeadm is the first installer target and the
+only one for 17 November; k3s follows.
+
+**The cost:** kubeadm needs more memory and more steps than k3s, and CI
+gets a kubeadm cluster as an additional job.

@@ -1,9 +1,12 @@
 # The rented cluster
 
-The plan for ACCEPTANCE.md items 9 and 11: three small servers, cgroup
-v2, k3s v1.37.1. Nothing here has run yet; the first pass on the
-servers turns each step into commands that did, and DEMO.md takes them
-from there.
+The plan for the setup in ACCEPTANCE.md: three servers, cgroup v2, k3s
+v1.37.1. Nothing here has run yet; the first pass on the servers turns
+each step into commands that did, and DEMO.md takes them from there.
+
+The cluster on stage is kubeadm on Ubuntu 26.04 (ADR-029). The steps
+below are written for k3s and are rewritten for kubeadm before the
+servers exist; what they check stays the same.
 
 | Machine | Runs |
 | --- | --- |

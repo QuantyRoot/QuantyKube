@@ -6,8 +6,8 @@ Everything below has been run as written against k3s v1.37.1 (control
 plane only) and etcd v3.6.15's `etcdctl`, which `scripts/e2e.sh` also
 uses.
 
-The real cluster on rented servers (ACCEPTANCE.md item 9) gets its own
-section once the servers exist.
+The cluster on rented servers (the setup in ACCEPTANCE.md) gets its
+own section once the servers exist.
 
 ## Pinned versions
 
