@@ -298,6 +298,12 @@ fn serve(args: &[String]) -> Result<(), String> {
     let retain = duration(value(args, "--retain").unwrap_or("1h"))?;
     let snapshots = duration(value(args, "--snapshots").unwrap_or("1m"))?;
     let store = Arc::new(open(&data).map_err(|e| format!("{}: {e}", data.display()))?);
+    // as etcd: after a failed commit only a restart knows what is on disk
+    // (ADR-030), and the API server reconnects to the restarted store
+    store.on_stop(Box::new(|msg| {
+        eprintln!("quantykube: a commit failed, stopping: {msg}");
+        std::process::exit(1);
+    }));
     let endpoint = format!("unix://{}", socket.display());
     let etcd =
         quantykube::etcd::Etcd::new(store.clone(), endpoint.clone()).map_err(|e| e.to_string())?;

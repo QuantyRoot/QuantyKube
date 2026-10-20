@@ -177,6 +177,9 @@ struct Batch {
     next_rev: i64,
     epoch: u64,
     committed: u64,
+    /// The first commit that failed, by epoch. After it the store takes no
+    /// more writes (ADR-030): what is on disk is then known only to a
+    /// restart, which recovers it.
     failed: Option<(u64, String)>,
     committing: bool,
     waiting: usize,
@@ -197,7 +200,11 @@ pub struct Quanty<S: Storage + 'static> {
     commits: RwLock<Vec<CommitEntry>>,
     /// the oldest commit QuantyDB still keeps a snapshot of (ADR-014)
     snap_floor: AtomicU64,
+    /// Told once when a commit fails; the server exits from it.
+    on_stop: RwLock<Option<StopHook>>,
 }
+
+pub type StopHook = Box<dyn Fn(&str) + Send + Sync>;
 
 impl Quanty<FileStorage> {
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -298,6 +305,7 @@ impl<S: Storage + 'static> Quanty<S> {
                 waiting: 0,
             }),
             done: Condvar::new(),
+            on_stop: RwLock::new(None),
             publisher: RwLock::new(None),
             head: head.into(),
             compacted: compacted.into(),
@@ -352,15 +360,27 @@ impl<S: Storage + 'static> Quanty<S> {
                     }
                 }
             }
-            Err(e) => {
-                g.failed = Some((epoch, e.to_string()));
-                g.next_rev = self.head() + 1;
-            }
+            Err(e) => self.stop(&mut g, epoch, &e.to_string()),
         }
         g.committed = epoch;
         g.committing = false;
         self.done.notify_all();
         g
+    }
+
+    /// Called with what to do when a commit fails, instead of only
+    /// refusing every write after it.
+    pub fn on_stop(&self, hook: StopHook) {
+        *self.on_stop.write().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    fn stop(&self, g: &mut Batch, epoch: u64, msg: &str) {
+        if g.failed.is_none() {
+            g.failed = Some((epoch, msg.to_string()));
+            if let Some(hook) = &*self.on_stop.read().unwrap_or_else(|e| e.into_inner()) {
+                hook(msg);
+            }
+        }
     }
 
     /// The oldest commit with a snapshot that holds `rev` or comes after
@@ -434,6 +454,11 @@ impl<S: Storage + 'static> Quanty<S> {
             let d = commits.partition_point(|c| c.last_rev < from);
             (from, commits[..d].to_vec())
         };
+        if let Some((_, msg)) = &g.failed {
+            return Err(Error::Commit(format!(
+                "stopped after a failed commit: {msg}"
+            )));
+        }
         let moved = from > retained;
         if moved {
             let db = self.db.read().unwrap_or_else(|e| e.into_inner());
@@ -449,7 +474,11 @@ impl<S: Storage + 'static> Quanty<S> {
                 tx.delete(&commit_key(c.id))?;
             }
             tx.put(&prefixed(META, RETAINED_FROM), &varint(from))?;
-            tx.commit()?;
+            if let Err(e) = tx.commit() {
+                let epoch = g.epoch;
+                self.stop(&mut g, epoch, &e.to_string());
+                return Err(e.into());
+            }
             self.commits
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -849,6 +878,11 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
             g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         g.waiting -= 1;
+        if let Some((_, msg)) = &g.failed {
+            return Err(Error::Commit(format!(
+                "stopped after a failed commit: {msg}"
+            )));
+        }
         let db = self.db.read().unwrap_or_else(|e| e.into_inner());
         let mut tx = match g.tx.take() {
             Some(t) => db.resume(t)?,
@@ -1010,6 +1044,7 @@ fn tests_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn put(s: &Quanty<MemStorage>, k: &[u8], v: &[u8]) -> i64 {
         s.write(&mut |tx| tx.put(k, v, 0).map(|_| ()))
@@ -1241,5 +1276,56 @@ mod tests {
         assert_eq!(s.compacted(), 3);
         assert_eq!(s.head(), 5, "compaction is bookkeeping, not a revision");
         std::fs::remove_file(&dir).unwrap();
+    }
+
+    /// Memory whose syncs fail while `fail` is set, as a full or broken
+    /// disk does.
+    struct Flaky {
+        mem: MemStorage,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Storage for Flaky {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> quantydb_core::Result<()> {
+            self.mem.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> quantydb_core::Result<()> {
+            self.mem.write_at(offset, buf)
+        }
+        fn sync(&self) -> quantydb_core::Result<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("no space left on device").into());
+            }
+            self.mem.sync()
+        }
+        fn len(&self) -> quantydb_core::Result<u64> {
+            self.mem.len()
+        }
+    }
+
+    // as etcd: a store whose commit failed knows its disk only after a
+    // restart, so it takes nothing more, and nothing it said was written
+    // is later found missing
+    #[test]
+    fn after_a_failed_commit_the_store_takes_no_more_writes() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = Flaky {
+            mem: MemStorage::new(),
+            fail: fail.clone(),
+        };
+        let s = Quanty::start(Db::create(storage, Default::default()).unwrap()).unwrap();
+        let stops = Arc::new(Mutex::new(Vec::new()));
+        let seen = stops.clone();
+        s.on_stop(Box::new(move |m| seen.lock().unwrap().push(m.to_string())));
+        let w = |s: &Quanty<Flaky>| s.write(&mut |tx| tx.put(b"k", b"v", 0).map(|_| ()));
+        w(&s).unwrap();
+        let head = s.head();
+        fail.store(true, Ordering::SeqCst);
+        assert!(matches!(w(&s), Err(Error::Commit(_))));
+        fail.store(false, Ordering::SeqCst);
+        assert!(matches!(w(&s), Err(Error::Commit(_))));
+        assert!(s.enforce_retention(0, 0, now_ms()).is_err());
+        assert_eq!(s.head(), head);
+        assert_eq!(stops.lock().unwrap().len(), 1);
     }
 }

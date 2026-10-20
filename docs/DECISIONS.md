@@ -34,6 +34,7 @@ through and add a new entry, never silently edit history.
 - [ADR-027](#adr-027-raft-before-17-november-with-a-cut-off) Raft before 17 November, with a cut off
 - [ADR-028](#adr-028-history-is-served-through-the-kubernetes-api) History is served through the Kubernetes API
 - [ADR-029](#adr-029-the-demonstration-and-the-installer-target-kubeadm) The demonstration and the installer target kubeadm
+- [ADR-030](#adr-030-a-failed-commit-stops-the-store) A failed commit stops the store
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -887,3 +888,31 @@ only one for 17 November; k3s follows.
 
 **The cost:** kubeadm needs more memory and more steps than k3s, and CI
 gets a kubeadm cluster as an additional job.
+
+## ADR-030: A failed commit stops the store
+
+When a commit fails, from a full disk or an I/O error, the store
+refuses every write after it, and `quantykube serve` exits. A restart
+recovers what is on disk, and the API server reconnects to the restarted
+store as it does after `kill -9`, the path the crash test exercises 200
+times in CI.
+
+A review found that carrying on was wrong in two ways. The record of a
+failed group commit was a single slot, so when the next commit failed
+too before the first one's writers woke, those writers were told they
+had succeeded, and their revision was handed out again. And when
+QuantyDB wrote its meta page but the sync after it failed, every later
+commit failed while the store kept answering reads, and a restart
+brought back the writes that had been reported as failed. After a
+failed commit, the state in memory and the state on disk can differ in
+ways only recovery from the disk sorts out. etcd does the same: a
+failed write to its log or backend is fatal.
+
+Rejected: retrying the commit, which is new code on a path that almost
+never runs and so is never really tested; and staying up read only,
+which answers reads from a state the disk may not hold.
+
+**The cost:** a full disk stops the store instead of leaving it
+readable, and the restart fails too until there is space. A quota that
+refuses writes before the disk is full, as etcd's NOSPACE alarm does, is
+the friendlier half and comes later.
