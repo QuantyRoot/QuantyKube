@@ -36,16 +36,25 @@ extern "C" {
     fn setns(fd: c_int, nstype: c_int) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
 }
 
 const SYS_CLONE: c_long = 56;
 const SYS_CAPSET: c_long = 126;
 const SYS_PIVOT_ROOT: c_long = 155;
 const SYS_MKNODAT: c_long = 259;
+const SYS_OPEN_TREE: c_long = 428;
+const SYS_MOVE_MOUNT: c_long = 429;
+const OPEN_TREE_CLONE: c_uint = 1;
+const AT_RECURSIVE: c_uint = 0x8000;
+const MOVE_MOUNT_F_EMPTY_PATH: c_uint = 4;
 const AT_FDCWD: c_long = -100;
 const SIGCHLD: c_ulong = 17;
 const O_CLOEXEC: c_int = 0o2000000;
+const O_WRONLY: c_int = 1;
+const O_CREAT: c_int = 0o100;
 const ENOENT: c_int = 2;
+const EEXIST: c_int = 17;
 
 const CLONE_NEWNS: c_ulong = 0x0002_0000;
 const CLONE_NEWUTS: c_ulong = 0x0400_0000;
@@ -271,6 +280,7 @@ pub struct Spawn {
     root: CString,
     overlay: Option<CString>,
     join: Vec<(std::fs::File, c_int)>,
+    binds: Vec<Bind>,
     stdio: Option<(std::fs::File, std::fs::File, std::fs::File)>,
     cwd: Option<CString>,
     hostname: Option<CString>,
@@ -282,6 +292,19 @@ pub struct Spawn {
     argv_ptrs: Vec<*const c_char>,
     _env: Vec<CString>,
     env_ptrs: Vec<*const c_char>,
+}
+
+/// A host path mounted into the container. The child clones the source
+/// as a detached mount before the pivot and attaches it after, so the
+/// target is created and resolved only inside the container, and a
+/// symlink in the image cannot point it at the host.
+struct Bind {
+    source: CString,
+    tree: std::sync::atomic::AtomicI32,
+    ancestors: Vec<CString>,
+    target: CString,
+    is_dir: bool,
+    readonly: bool,
 }
 
 /// Where the child failed, reported as its exit status. Above anything a
@@ -305,6 +328,7 @@ pub enum Step {
     Capabilities = 113,
     Seccomp = 114,
     Exec = 115,
+    Volumes = 116,
 }
 
 impl Step {
@@ -328,6 +352,7 @@ impl Step {
             Capabilities,
             Seccomp,
             Exec,
+            Volumes,
         ]
         .into_iter()
         .find(|s| *s as i32 == code)
@@ -392,6 +417,7 @@ impl Spawn {
             root: cstr(root)?,
             overlay: None,
             join: Vec::new(),
+            binds: Vec::new(),
             stdio: None,
             cwd: None,
             hostname: None,
@@ -439,6 +465,47 @@ impl Spawn {
             let f = std::fs::File::open(held.join(name))?;
             self.join.push((f, kind as c_int));
         }
+        Ok(self)
+    }
+
+    /// Mounts `source` from the host at `target`, an absolute path in the
+    /// container, creating the target and its parents if missing.
+    pub fn bind(
+        mut self,
+        source: &std::path::Path,
+        target: &[u8],
+        readonly: bool,
+    ) -> io::Result<Self> {
+        let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
+        if target.first() != Some(&b'/') {
+            return Err(invalid("a mount target must be absolute"));
+        }
+        let parts: Vec<&[u8]> = target
+            .split(|&b| b == b'/')
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.iter().any(|p| *p == b"." || *p == b"..") {
+            return Err(invalid("a mount target may not contain . or .."));
+        }
+        if parts.is_empty() {
+            return Err(invalid("cannot mount over the root"));
+        }
+        let is_dir = std::fs::metadata(source)?.is_dir();
+        let mut ancestors = Vec::new();
+        let mut path = Vec::new();
+        for p in &parts[..parts.len() - 1] {
+            path.push(b'/');
+            path.extend_from_slice(p);
+            ancestors.push(cstr(&path)?);
+        }
+        self.binds.push(Bind {
+            source: cstr(source.as_os_str().as_encoded_bytes())?,
+            tree: (-1).into(),
+            ancestors,
+            target: cstr(target)?,
+            is_dir,
+            readonly,
+        });
         Ok(self)
     }
 
@@ -558,6 +625,7 @@ impl Spawn {
             if bound != 0 {
                 fail(Step::BindRoot);
             }
+            self.clone_binds();
             if chdir(root) != 0 {
                 fail(Step::EnterRoot);
             }
@@ -595,6 +663,7 @@ impl Spawn {
                 fail(Step::MountSys);
             }
             self.make_dev();
+            self.mount_binds();
             for p in MASKED {
                 if mount(c"/dev/null".as_ptr(), p.as_ptr(), null, MS_BIND, nodata) != 0
                     && mount(
@@ -723,6 +792,65 @@ impl Spawn {
         }
         umask(0o022);
         let _ = nodata;
+    }
+
+    unsafe fn clone_binds(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for b in &self.binds {
+            let flags = OPEN_TREE_CLONE | O_CLOEXEC as c_uint | AT_RECURSIVE;
+            let fd = syscall(SYS_OPEN_TREE, AT_FDCWD, b.source.as_ptr(), flags);
+            if fd < 0 {
+                _exit(Step::Volumes as c_int);
+            }
+            b.tree.store(fd as i32, Relaxed);
+        }
+    }
+
+    /// Runs after the pivot, so every path here resolves inside the
+    /// container.
+    unsafe fn mount_binds(&self) {
+        let fail = || -> ! { _exit(Step::Volumes as c_int) };
+        let null = std::ptr::null::<c_char>();
+        let nodata = std::ptr::null::<c_void>();
+        for b in &self.binds {
+            for dir in &b.ancestors {
+                if mkdir(dir.as_ptr(), 0o755) != 0 && *__errno_location() != EEXIST {
+                    fail();
+                }
+            }
+            if b.is_dir {
+                if mkdir(b.target.as_ptr(), 0o755) != 0 && *__errno_location() != EEXIST {
+                    fail();
+                }
+            } else {
+                let fd = open(
+                    b.target.as_ptr(),
+                    O_WRONLY | O_CREAT | O_CLOEXEC,
+                    0o644 as c_uint,
+                );
+                if fd < 0 {
+                    fail();
+                }
+                close(fd);
+            }
+            let tree = b.tree.load(std::sync::atomic::Ordering::Relaxed);
+            if syscall(
+                SYS_MOVE_MOUNT,
+                tree,
+                c"".as_ptr(),
+                AT_FDCWD,
+                b.target.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH,
+            ) != 0
+            {
+                fail();
+            }
+            close(tree);
+            let ro = MS_REMOUNT | MS_BIND | MS_RDONLY;
+            if b.readonly && mount(null, b.target.as_ptr(), null, ro, nodata) != 0 {
+                fail();
+            }
+        }
     }
 
     /// Bounding set first, which needs CAP_SETPCAP still held, then the

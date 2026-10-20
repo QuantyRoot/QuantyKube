@@ -54,6 +54,9 @@ fn build_image(at: &Path) {
             }
         }
     }
+    // points at the host, should anything resolve it outside the container
+    std::os::unix::fs::symlink(ESCAPE, root.join("escape")).unwrap();
+    fs::create_dir_all(root.join(&ESCAPE[1..])).unwrap();
     let tar = Command::new("tar")
         .args(["-czf", "-", "-C"])
         .arg(&root)
@@ -74,6 +77,8 @@ fn build_image(at: &Path) {
     );
     fs::write(at.join("manifest.json"), manifest).unwrap();
 }
+
+const ESCAPE: &str = "/tmp/qk-rt-escape-target";
 
 fn wait_exited(rt: &Runtime, id: &str) -> Container {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -250,4 +255,75 @@ fn a_tampered_layer_is_refused() {
     );
     assert!(rt.images().is_empty());
     fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn volumes_are_mounted_inside_the_container() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("volumes");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let shared = base.join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    let secret = base.join("secret");
+    fs::write(&secret, "s3cret\n").unwrap();
+    let _ = fs::remove_dir_all(ESCAPE);
+    fs::create_dir_all(ESCAPE).unwrap();
+
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "vol".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut c = spec(
+        "vol",
+        &[
+            "echo hi > /data/out; cat /run/secret; echo x > /run/secret || echo ro; \
+           echo x > /bin/new || echo rootro; cat /escape/inside/f; echo done",
+        ],
+    );
+    let mount = |host: &Path, at: &str, readonly| Mount {
+        host_path: host.into(),
+        container_path: at.into(),
+        readonly,
+    };
+    c.mounts = vec![
+        mount(&shared, "/data", false),
+        mount(&secret, "/run/secret", true),
+        mount(&shared, "/escape/inside", true),
+    ];
+    c.readonly_rootfs = true;
+    fs::write(shared.join("f"), "through the volume\n").unwrap();
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    let done = wait_exited(&rt, &id);
+    let log = fs::read_to_string(logs.join("vol.log")).unwrap();
+    let out: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(" stdout "))
+        .map(|l| l.rsplit(" F ").next().unwrap())
+        .collect();
+    assert_eq!(done.exit_code, 0, "{} {log}", done.reason);
+    assert_eq!(
+        out,
+        ["s3cret", "ro", "rootro", "through the volume", "done"],
+        "{log}"
+    );
+    assert_eq!(fs::read_to_string(shared.join("out")).unwrap(), "hi\n");
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "s3cret\n");
+    assert!(
+        fs::read_dir(ESCAPE).unwrap().next().is_none(),
+        "a mount target was resolved on the host"
+    );
+    rt.remove_pod(&pod).unwrap();
+    rt.remove_image("test/sh:1").unwrap();
+    fs::remove_dir_all(&base).unwrap();
+    fs::remove_dir_all(ESCAPE).unwrap();
 }

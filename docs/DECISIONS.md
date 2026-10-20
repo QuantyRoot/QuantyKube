@@ -23,6 +23,7 @@ through and add a new entry, never silently edit history.
 - [ADR-016](#adr-016-layers-are-unpacked-with-every-path-resolved-inside-the-root) Layers are unpacked with every path resolved inside the root
 - [ADR-017](#adr-017-a-pod-is-three-bind-mounted-namespaces-and-runtime-state-is-not-kept) A pod is three bind mounted namespaces, and runtime state is not kept
 - [ADR-018](#adr-018-the-runtime-refuses-what-it-cannot-honour) The runtime refuses what it cannot honour
+- [ADR-019](#adr-019-volumes-are-attached-after-the-pivot) Volumes are attached after the pivot
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -540,10 +541,11 @@ layer is refused.
 The CRI service (`src/cri.rs`) is in place before most of what the
 kubelet can ask of it. A request this runtime would carry out differently
 from what it says is refused with INVALID_ARGUMENT and the reason, never
-run in part: volume mounts, devices, a terminal or stdin, a privileged
-container, a user other than root, a pod on the host's network or with a
-shared PID namespace, any runtime handler but the default. Status
-reports NetworkReady false, because no CNI plugin is run yet.
+run in part: image volumes and mount propagation, devices, a terminal
+or stdin, a privileged container, a user other than root, a pod on the
+host's network or with a shared PID namespace, any runtime handler but
+the default. Status reports NetworkReady false, because no CNI plugin is
+run yet.
 
 A container started without the volume holding its secrets, or as root
 when it asked for another user, would look like it works and be wrong;
@@ -551,6 +553,25 @@ refusing shows exactly where the runtime stands. PullImage succeeds for
 an image already on the node, which is what a pull would give, and
 fails with UNIMPLEMENTED otherwise.
 
-**The cost:** almost no real pod runs yet, since the kubelet mounts at
-least a service account token into nearly every one. Volumes come first.
+**The cost:** a pod that needs any of these does not start here until
+the piece is built, and the kubelet reports the reason.
 
+## ADR-019: Volumes are attached after the pivot
+
+A volume is a host path the kubelet asks to see at a path inside the
+container: the service account token, `/etc/hosts`, the termination log,
+every hostPath and emptyDir. The target lies in the image, and the image
+is not trusted. Resolve `/etc/hosts` in a root filesystem whose `/etc` is
+a symlink to `/` and the mount lands on the host's own; runc has had
+this class of hole more than once (CVE-2021-30465, CVE-2024-21626).
+
+Here the child clones each source as a detached mount with `open_tree`
+while it still sees the host, pivots, and only then creates the target
+and its parents and attaches the mount with `move_mount`. After the pivot
+an absolute symlink can only lead somewhere inside the container. A test
+puts exactly such a symlink in an image and mounts through it; done the
+naive way, before the pivot, it creates a directory on the host and the
+test fails.
+
+**The cost:** Linux 5.2 or newer, for the two calls. Every kernel a
+current Kubernetes supports has them.

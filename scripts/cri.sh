@@ -38,9 +38,12 @@ cat >"$work/pod.json" <<JSON
 JSON
 cat >"$work/ctr.json" <<'JSON'
 {"metadata": {"name": "hello"}, "image": {"image": "test/busybox:1"},
- "command": ["sh", "-c", "echo $(hostname) $GREETING; while true; do sleep 1; done"],
+ "command": ["sh", "-c", "echo $(hostname) $GREETING; echo kept > /data/f; while true; do sleep 1; done"],
+ "mounts": [{"container_path": "/data", "host_path": "VOLUME"}],
  "envs": [{"key": "GREETING", "value": "hi"}], "log_path": "hello.log"}
 JSON
+mkdir "$work/volume"
+sed -i "s|VOLUME|$work/volume|" "$work/ctr.json"
 pod=$(c runp "$work/pod.json") || fail "runp"
 ctr=$(c create "$pod" "$work/ctr.json" "$work/pod.json") || fail "create"
 c start "$ctr" >/dev/null || fail "start"
@@ -49,6 +52,7 @@ for _ in $(seq 100); do
     sleep 0.05
 done
 [ "$(c logs "$ctr")" = "web-0 hi" ] || fail "logs: $(c logs "$ctr")"
+[ "$(cat "$work/volume/f")" = kept ] || fail "volume"
 c ps -q --state running | grep -qx "$ctr" || fail "not running"
 
 # a shell as PID 1 ignores SIGTERM, so this takes the SIGKILL

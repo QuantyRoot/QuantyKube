@@ -137,11 +137,27 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
 }
 
 fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Status> {
-    // Running without the volumes the kubelet asked for would start the
-    // container without its secrets and configuration.
-    if !config.mounts.is_empty() {
-        return Err(unsupported("mounting volumes"));
+    let mut mounts = Vec::with_capacity(config.mounts.len());
+    for m in config.mounts {
+        if m.image.is_some() {
+            return Err(unsupported("an image volume"));
+        }
+        if m.propagation != cripb::MountPropagation::Private {
+            return Err(unsupported("mount propagation"));
+        }
+        if m.recursive_read_only {
+            return Err(unsupported("a recursively read only mount"));
+        }
+        if !m.uid_mappings.is_empty() || !m.gid_mappings.is_empty() {
+            return Err(unsupported("an id mapped mount"));
+        }
+        mounts.push(runtime::Mount {
+            host_path: m.host_path.into(),
+            container_path: m.container_path,
+            readonly: m.readonly,
+        });
     }
+    let mut readonly_rootfs = false;
     if !config.devices.is_empty() || !config.cdi_devices.is_empty() {
         return Err(unsupported("passing devices"));
     }
@@ -153,6 +169,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         .as_ref()
         .and_then(|l| l.security_context.as_ref())
     {
+        readonly_rootfs = sc.readonly_rootfs;
         if sc.privileged {
             return Err(unsupported("a privileged container"));
         }
@@ -185,6 +202,8 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         log_path: config.log_path,
         labels: pairs(&config.labels),
         annotations: pairs(&config.annotations),
+        mounts,
+        readonly_rootfs,
     })
 }
 
@@ -544,11 +563,14 @@ mod tests {
         };
         assert!(container_spec(user(0)).is_ok());
         assert!(container_spec(user(1000)).is_err());
-        let with_mount = ContainerConfig {
-            mounts: vec![Default::default()],
+        let shared = ContainerConfig {
+            mounts: vec![cripb::Mount {
+                propagation: cripb::MountPropagation::Bidirectional,
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        assert!(container_spec(with_mount).is_err());
+        assert!(container_spec(shared).is_err());
         let bad_env = ContainerConfig {
             envs: vec![cripb::KeyValue {
                 key: "K".into(),

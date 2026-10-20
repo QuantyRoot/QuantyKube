@@ -73,6 +73,16 @@ pub struct ContainerSpec {
     pub log_path: String,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
+    pub mounts: Vec<Mount>,
+    pub readonly_rootfs: bool,
+}
+
+/// A host file or directory mounted into the container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Mount {
+    pub host_path: PathBuf,
+    pub container_path: String,
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,7 +557,7 @@ impl Runtime {
         };
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
-        let spawn = sys::Spawn::new(&bytes(&dir.join("rootfs")), &argv_b, &env_b)?
+        let mut spawn = sys::Spawn::new(&bytes(&dir.join("rootfs")), &argv_b, &env_b)?
             .overlay(
                 &bytes(&lower),
                 &bytes(&dir.join("upper")),
@@ -555,7 +565,13 @@ impl Runtime {
             )?
             .join(&self.dir.join("pods").join(&c.pod_id).join("ns"))?
             .stdio(File::open("/dev/null")?, out_w, err_w)
-            .cwd(cwd.as_bytes())?;
+            .cwd(cwd.as_bytes())?
+            .readonly(c.spec.readonly_rootfs);
+        for m in &c.spec.mounts {
+            spawn = spawn
+                .bind(&m.host_path, m.container_path.as_bytes(), m.readonly)
+                .map_err(|e| Error::Invalid(format!("mount {}: {e}", m.host_path.display())))?;
+        }
         for d in ["proc", "dev", "sys"] {
             let _ = fs::create_dir(dir.join("upper").join(d));
         }
