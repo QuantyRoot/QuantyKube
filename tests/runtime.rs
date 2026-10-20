@@ -370,3 +370,49 @@ fn limits_hold_and_an_oom_kill_is_reported() {
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_user_other_than_root_has_no_capabilities() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("user");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "user".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let status = "while read -r k v; do case $k in Uid:|Gid:|Groups:|CapEff:) \
+                  echo $k $v;; esac; done < /proc/self/status";
+    let mut c = spec("user", &[&format!("{status}; sleep 60")]);
+    c.user = quantykube::user::Request {
+        uid: Some(1000),
+        gid: Some(1000),
+        supplemental_groups: vec![2000],
+        ..Default::default()
+    };
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    let want = "Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\n\
+                Groups: 1000 2000\nCapEff: 0000000000000000\n";
+    let exec = rt
+        .exec_sync(&id, &["sh".into(), "-c".into(), status.into()], None)
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&exec.stdout), want, "{exec:?}");
+    rt.stop_container(&id, Duration::ZERO).unwrap();
+    let log: String = fs::read_to_string(logs.join("user.log"))
+        .unwrap()
+        .lines()
+        .map(|l| format!("{}\n", l.splitn(4, ' ').nth(3).unwrap_or("")))
+        .collect();
+    assert_eq!(log, want);
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}

@@ -10,3 +10,4 @@ pub mod etcdpb;
 pub mod image;
 pub mod runtime;
 pub mod store;
+pub mod user;

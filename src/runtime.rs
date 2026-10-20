@@ -9,6 +9,7 @@
 use crate::cgroup;
 use crate::cni::{self, Cni};
 use crate::image;
+use crate::user;
 use quantycore::json::{self, Value};
 use quantykube_sys as sys;
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub struct ImageConfig {
     pub cmd: Vec<String>,
     pub env: Vec<String>,
     pub working_dir: String,
+    pub user: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +86,7 @@ pub struct ContainerSpec {
     pub readonly_rootfs: bool,
     pub limits: cgroup::Limits,
     pub oom_score_adj: i64,
+    pub user: user::Request,
 }
 
 /// A host file or directory mounted into the container.
@@ -610,6 +613,7 @@ impl Runtime {
         let cwd = working_dir(&c, &img);
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
+        let u = user::resolve(&lower, &img.config.user, &c.spec.user).map_err(Error::Invalid)?;
         let mut spawn = sys::Spawn::new(&bytes(&dir.join("rootfs")), &argv_b, &env_b)?
             .overlay(
                 &bytes(&lower),
@@ -619,6 +623,7 @@ impl Runtime {
             .join(&self.dir.join("pods").join(&c.pod_id).join("ns"))?
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(cwd.as_bytes())?
+            .user(u.uid, u.gid, &u.groups)
             .readonly(c.spec.readonly_rootfs)
             .cgroup_namespace(cgroup::available());
         for m in &c.spec.mounts {
@@ -749,7 +754,10 @@ impl Runtime {
         let env_b: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
+        let lower = self.dir.join("images").join(&img.id[7..]).join("rootfs");
+        let u = user::resolve(&lower, &img.config.user, &c.spec.user).map_err(Error::Invalid)?;
         let spawn = sys::Spawn::enter(c.pid, &argv_b, &env_b)?
+            .user(u.uid, u.gid, &u.groups)
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(working_dir(&c, &img).as_bytes())?;
         let started = spawn.start()?;
@@ -910,6 +918,10 @@ fn parse_config(text: &str) -> Result<ImageConfig> {
         cmd: strings(field("Cmd")),
         env: strings(field("Env")),
         working_dir: field("WorkingDir")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        user: field("User")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),

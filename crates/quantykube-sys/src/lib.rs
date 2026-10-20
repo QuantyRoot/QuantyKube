@@ -46,6 +46,11 @@ extern "C" {
 
 const SYS_CLONE: c_long = 56;
 const SYS_CAPSET: c_long = 126;
+// raw, because glibc's wrappers would try to signal threads that exist
+// only in the parent
+const SYS_SETRESUID: c_long = 117;
+const SYS_SETRESGID: c_long = 119;
+const SYS_SETGROUPS: c_long = 116;
 const SYS_PIVOT_ROOT: c_long = 155;
 const SYS_MKNODAT: c_long = 259;
 const SYS_OPEN_TREE: c_long = 428;
@@ -298,6 +303,7 @@ pub struct Spawn {
     readonly: bool,
     cgroupns: bool,
     enter: Option<Enter>,
+    user: Option<(u32, u32, Vec<u32>)>,
     caps: u64,
     seccomp: Vec<SockFilter>,
     path: CString,
@@ -389,11 +395,24 @@ fn cstr(s: &[u8]) -> io::Result<CString> {
 pub struct Started {
     pub pid: i32,
     release: c_int,
+    exec: c_int,
 }
 
 impl Started {
+    /// Lets the child go on, and returns once it has called execve or
+    /// died, so that whatever joins the container next finds it set up.
     pub fn release(mut self) -> io::Result<()> {
-        self.signal()
+        self.signal()?;
+        let mut byte = 0u8;
+        // SAFETY: reads into a live local from a pipe this struct owns.
+        // The child holds the only write end, close on exec, so this
+        // returns at its execve or its exit.
+        while unsafe { read(self.exec, (&mut byte as *mut u8).cast(), 1) } < 0 {
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn signal(&mut self) -> io::Result<()> {
@@ -417,6 +436,8 @@ impl Started {
 impl Drop for Started {
     fn drop(&mut self) {
         let _ = self.signal();
+        // SAFETY: closes a descriptor this struct owns, once.
+        unsafe { close(self.exec) };
     }
 }
 
@@ -444,6 +465,7 @@ impl Spawn {
             readonly: false,
             cgroupns: false,
             enter: None,
+            user: None,
             caps: DEFAULT_CAPS,
             seccomp: seccomp_program(),
             path: cstr(first)?,
@@ -593,6 +615,15 @@ impl Spawn {
         self
     }
 
+    /// Runs the command as `uid` and `gid` with these supplementary
+    /// groups. A user other than root starts with no capabilities, as
+    /// under Docker and containerd: it would need file capabilities to
+    /// gain any, and `no_new_privs` refuses those.
+    pub fn user(mut self, uid: u32, gid: u32, groups: &[u32]) -> Self {
+        self.user = Some((uid, gid, groups.to_vec()));
+        self
+    }
+
     /// The capability set the command keeps; [`DEFAULT_CAPS`] unless set.
     pub fn capabilities(mut self, caps: u64) -> Self {
         self.caps = caps;
@@ -606,6 +637,16 @@ impl Spawn {
         // SAFETY: fds is a valid two element array.
         if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
+        }
+        let mut exec = [0 as c_int; 2];
+        // SAFETY: as above.
+        if unsafe { pipe2(exec.as_mut_ptr(), O_CLOEXEC) } != 0 {
+            let e = io::Error::last_os_error();
+            unsafe {
+                close(fds[0]);
+                close(fds[1]);
+            }
+            return Err(e);
         }
         let own = if self.join.is_empty() {
             CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET
@@ -627,16 +668,22 @@ impl Spawn {
                 unsafe {
                     close(fds[0]);
                     close(fds[1]);
+                    close(exec[0]);
+                    close(exec[1]);
                 }
                 Err(e)
             }
-            0 if self.enter.is_some() => self.child_enter(fds[0]),
+            0 if self.enter.is_some() => self.child_enter(fds[0], exec[1]),
             0 => self.child(fds[0]),
             pid => {
-                unsafe { close(fds[0]) };
+                unsafe {
+                    close(fds[0]);
+                    close(exec[1]);
+                }
                 Ok(Started {
                     pid: pid as i32,
                     release: fds[1],
+                    exec: exec[0],
                 })
             }
         }
@@ -875,7 +922,7 @@ impl Spawn {
     /// it, so this child joins and forks once more, then waits and exits
     /// with the status of the command, 128 and the signal if it was
     /// killed by one.
-    fn child_enter(&self, wait: c_int) -> ! {
+    fn child_enter(&self, wait: c_int, exec: c_int) -> ! {
         use std::os::fd::AsRawFd;
         let fail = |step: Step| -> ! { unsafe { _exit(step as c_int) } };
         let enter = self.enter.as_ref().expect("checked by the caller");
@@ -907,6 +954,9 @@ impl Spawn {
                 fail(Step::Namespaces);
             }
             if pid > 0 {
+                // only the command may hold it, or release would wait for
+                // the command to end
+                close(exec);
                 let mut status: c_int = 0;
                 while waitpid(pid as c_int, &mut status, 0) != pid as c_int {
                     if *__errno_location() != EINTR {
@@ -1021,8 +1071,20 @@ impl Spawn {
                 fail();
             }
         }
+        let mut caps = self.caps;
+        if let Some((uid, gid, groups)) = &self.user {
+            if syscall(SYS_SETGROUPS, groups.len(), groups.as_ptr()) != 0
+                || syscall(SYS_SETRESGID, *gid, *gid, *gid) != 0
+                || syscall(SYS_SETRESUID, *uid, *uid, *uid) != 0
+            {
+                fail();
+            }
+            if *uid != 0 {
+                caps = 0;
+            }
+        }
         let header = [LINUX_CAPABILITY_VERSION_3, 0u32];
-        let (lo, hi) = (self.caps as u32, (self.caps >> 32) as u32);
+        let (lo, hi) = (caps as u32, (caps >> 32) as u32);
         // effective, permitted, inheritable; low 32 bits, then high
         let data = [lo, lo, lo, hi, hi, hi];
         if syscall(SYS_CAPSET, header.as_ptr(), data.as_ptr()) != 0 {

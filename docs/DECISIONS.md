@@ -27,6 +27,7 @@ through and add a new entry, never silently edit history.
 - [ADR-020](#adr-020-cgroups-follow-the-cgroupfs-driver) cgroups follow the cgroupfs driver
 - [ADR-021](#adr-021-exec-joins-the-container-through-a-second-fork) Exec joins the container through a second fork
 - [ADR-022](#adr-022-pod-networks-come-from-cni-plugins) Pod networks come from CNI plugins
+- [ADR-023](#adr-023-users-resolve-inside-the-image-and-non-root-means-no-capabilities) Users resolve inside the image, and non-root means no capabilities
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -545,13 +546,13 @@ The CRI service (`src/cri.rs`) is in place before most of what the
 kubelet can ask of it. A request this runtime would carry out differently
 from what it says is refused with INVALID_ARGUMENT and the reason, never
 run in part: image volumes and mount propagation, devices, a terminal
-or stdin, a privileged container, a user other than root, a pod on the
-host's network or with a shared PID namespace, any runtime handler but
+or stdin, a privileged container, a pod on the host's network or with a shared PID namespace, any runtime handler but
 the default. Status reports NetworkReady false, because no CNI plugin is
 run yet.
 
-A container started without the volume holding its secrets, or as root
-when it asked for another user, would look like it works and be wrong;
+A container started without the volume holding its secrets, or with a
+shared PID namespace it did not get, would look like it works and be
+wrong;
 refusing shows exactly where the runtime stands. PullImage succeeds for
 an image already on the node, which is what a pull would give, and
 fails with UNIMPLEMENTED otherwise.
@@ -644,4 +645,27 @@ how the kubelet learns that the network add-on has been installed.
 watches the directory; a network installed later needs a restart of the
 runtime. CNI's CHECK and GC commands, and plugin capabilities such as
 port mappings and bandwidth, are not passed yet.
+
+## ADR-023: Users resolve inside the image, and non-root means no capabilities
+
+A container runs as the user the kubelet sends (`runAsUser`,
+`runAsGroup`, a user name, supplemental groups), and otherwise as the
+image's `User`. Names are looked up in the image's own `/etc/passwd` and
+`/etc/group`, never the host's, and the groups a user is a member of
+there are added, as runc does. An image user that does not exist is an
+error, not root. ImageStatus reports the image's user so that the
+kubelet can enforce `runAsNonRoot` before a container starts.
+
+A process that is not root starts with no capabilities at all, the
+bounding set still limited to the default fourteen and `no_new_privs`
+set, which is what Docker and containerd give it. The ids are set with
+raw system calls: glibc's wrappers would try to synchronise threads that
+exist only in the parent.
+
+StartContainer now returns only once the container's process has called
+execve, read from a pipe that closes on exec. Without that, an exec
+right after a start could join a mount namespace still being set up.
+
+**The cost:** user namespaces are not used, so root in a container is
+root on the host, held in only by capabilities, seccomp and the mounts.
 

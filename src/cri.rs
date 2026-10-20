@@ -89,7 +89,16 @@ fn image_spec(id: &str) -> Option<cripb::ImageSpec> {
 }
 
 fn image(i: &runtime::Image) -> cripb::Image {
+    // the kubelet checks runAsNonRoot against these
+    let user = i.config.user.split(':').next().unwrap_or("");
+    let (uid, username) = match user.parse::<i64>() {
+        Ok(uid) => (Some(cripb::Int64Value { value: uid }), String::new()),
+        Err(_) if user.is_empty() => (Some(cripb::Int64Value { value: 0 }), String::new()),
+        Err(_) => (None, user.to_string()),
+    };
     cripb::Image {
+        uid,
+        username,
         id: i.id.clone(),
         repo_tags: i.refs.clone(),
         size: i.size,
@@ -169,6 +178,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         });
     }
     let mut readonly_rootfs = false;
+    let mut user = crate::user::Request::default();
     let mut limits = cgroup::Limits::default();
     let mut oom_score_adj = 0;
     if let Some(r) = config.linux.as_ref().and_then(|l| l.resources.as_ref()) {
@@ -204,12 +214,26 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         if sc.privileged {
             return Err(unsupported("a privileged container"));
         }
-        if sc.run_as_user.as_ref().is_some_and(|u| u.value != 0)
-            || sc.run_as_group.as_ref().is_some_and(|g| g.value != 0)
-            || !sc.run_as_username.is_empty()
-        {
-            return Err(unsupported("a user other than root"));
-        }
+        let id = |v: &Option<cripb::Int64Value>| -> Result<Option<u32>, Status> {
+            v.as_ref()
+                .map(|v| {
+                    u32::try_from(v.value).map_err(|_| {
+                        Status::new(code::INVALID_ARGUMENT, format!("bad id {}", v.value))
+                    })
+                })
+                .transpose()
+        };
+        user = crate::user::Request {
+            uid: id(&sc.run_as_user)?,
+            gid: id(&sc.run_as_group)?,
+            name: sc.run_as_username.clone(),
+            supplemental_groups: sc
+                .supplemental_groups
+                .iter()
+                .map(|&g| u32::try_from(g))
+                .collect::<Result<_, _>>()
+                .map_err(|_| Status::new(code::INVALID_ARGUMENT, "bad supplemental group"))?,
+        };
     }
     let meta = config.metadata.unwrap_or_default();
     let mut env = Vec::with_capacity(config.envs.len());
@@ -237,6 +261,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         readonly_rootfs,
         limits,
         oom_score_adj,
+        user,
     })
 }
 
@@ -748,8 +773,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(container_spec(user(0)).is_ok());
-        assert!(container_spec(user(1000)).is_err());
+        assert!(container_spec(user(1000)).is_ok());
+        assert!(container_spec(user(-1)).is_err());
         let shared = ContainerConfig {
             mounts: vec![cripb::Mount {
                 propagation: cripb::MountPropagation::Bidirectional,

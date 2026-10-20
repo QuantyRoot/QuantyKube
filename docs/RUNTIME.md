@@ -26,9 +26,9 @@ written before most of the code.
   `scripts/cri.sh` takes a pod through its life with `crictl`. Volumes
   are bind mounted (ADR-019), limits and stats come from cgroup v2
   (ADR-020), ExecSync joins a running container (ADR-021), and pods get
-  their network from CNI plugins (ADR-022). What the kubelet needs
-  beyond that, in order: users other than root, pulling, streaming
-  exec, port mappings.
+  their network from CNI plugins (ADR-022), and containers run as the
+  user asked for (ADR-023). What the kubelet needs beyond that, in
+  order: pulling, streaming exec, port mappings, durable state.
 
 `scripts/sandbox.sh` checks all of that from inside the container and
 times a start against runc on the same root filesystem. On the
