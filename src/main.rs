@@ -10,16 +10,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:
   quantykube serve   --data <file> --socket <path> [--retain <duration>]
-  quantykube history --socket <path> [--prefix] <key>
-  quantykube get     --socket <path> (--rev <n> | --ago <duration>) <key>
-  quantykube restore --socket <path> (--rev <n> | --ago <duration>) <key>
+  quantykube history [--socket <path>] [--prefix] <key>
+  quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
+  quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
+
+The socket defaults to $QUANTYKUBE_SOCKET, then /run/quantykube.sock.
+Linked or copied as kubectl-quanty on the PATH, this is also the kubectl
+plugin `kubectl quanty`, and keys may be given as kind/name or
+kind/namespace/name, such as configmap/default/important.
 
 Durations look like 90s, 15m, 2h or 7d. get writes the stored value as it
 was to stdout. restore writes it back, or deletes the key if it did not
 exist then, as a new revision that every watch sees.";
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let plugin = std::env::args()
+        .next()
+        .is_some_and(|a| a.rsplit('/').next() == Some("kubectl-quanty"));
+    if plugin {
+        args = args.into_iter().map(|a| registry_key(&a)).collect();
+    }
     let result = match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("get") => get(&args[1..]),
@@ -62,6 +73,33 @@ fn positional(args: &[String]) -> Result<&str, String> {
         }
     }
     found.ok_or_else(|| format!("missing key\n{USAGE}"))
+}
+
+/// `configmap/default/x` to `/registry/configmaps/default/x`, the way the
+/// API server lays out keys for built in kinds. Anything starting with `/`
+/// or `-` is left alone.
+fn registry_key(a: &str) -> String {
+    if a.starts_with('/') || a.starts_with('-') || !a.contains('/') {
+        return a.to_string();
+    }
+    let (kind, rest) = a.split_once('/').unwrap();
+    let plural = match kind {
+        "cm" | "configmap" | "configmaps" => "configmaps",
+        "secret" | "secrets" => "secrets",
+        "deploy" | "deployment" | "deployments" => "deployments",
+        "svc" | "service" | "services" => "services/specs",
+        "ns" | "namespace" | "namespaces" => "namespaces",
+        "pod" | "pods" => "pods",
+        "sa" | "serviceaccount" | "serviceaccounts" => "serviceaccounts",
+        "ds" | "daemonset" | "daemonsets" => "daemonsets",
+        "sts" | "statefulset" | "statefulsets" => "statefulsets",
+        "ing" | "ingress" | "ingresses" => "ingress",
+        "role" | "roles" => "roles",
+        "rolebinding" | "rolebindings" => "rolebindings",
+        "crd" | "customresourcedefinition" => "apiextensions.k8s.io/customresourcedefinitions",
+        _ => return a.to_string(),
+    };
+    format!("/registry/{plural}/{rest}")
 }
 
 fn duration(s: &str) -> Result<Duration, String> {
@@ -122,7 +160,11 @@ fn serve(args: &[String]) -> Result<(), String> {
 }
 
 fn history_call(args: &[String], method: &str, req: &[u8]) -> Result<Vec<u8>, String> {
-    let socket = required(args, "--socket")?;
+    let socket = value(args, "--socket")
+        .map(str::to_string)
+        .or_else(|| std::env::var("QUANTYKUBE_SOCKET").ok())
+        .unwrap_or_else(|| "/run/quantykube.sock".to_string());
+    let socket = socket.as_str();
     let conn = UnixStream::connect(socket).map_err(|e| format!("{socket}: {e}"))?;
     quantycore::grpc::call(conn, &format!("/quantykube.History/{method}"), req)
         .map_err(|s| s.message)
@@ -253,6 +295,17 @@ fn utc(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kubectl_names_become_registry_keys() {
+        use super::registry_key as k;
+        assert_eq!(k("cm/default/x"), "/registry/configmaps/default/x");
+        assert_eq!(k("deploy/team/web"), "/registry/deployments/team/web");
+        assert_eq!(k("ns/team"), "/registry/namespaces/team");
+        assert_eq!(k("/raw/key"), "/raw/key");
+        assert_eq!(k("--rev"), "--rev");
+        assert_eq!(k("widget.example.com/x"), "widget.example.com/x");
+    }
+
     #[test]
     fn dates() {
         assert_eq!(super::utc(0), "1970-01-01 00:00:00Z");

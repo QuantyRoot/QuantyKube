@@ -84,15 +84,16 @@ store gave was on disk before it was given.
 ```
 kubectl delete configmap important
 kubectl get configmap important
-target/release/quantykube history --socket $D/qk.sock /registry/configmaps/default/important
+export QUANTYKUBE_SOCKET=$D/qk.sock
+ln -sf "$PWD/target/release/quantykube" /usr/local/bin/kubectl-quanty
+kubectl quanty history configmap/default/important
 ```
 
 The history lists the create, the update and the delete with their
 revisions and times. Take the revision of the update:
 
 ```
-target/release/quantykube restore --socket $D/qk.sock --rev <rev> \
-  /registry/configmaps/default/important
+kubectl quanty restore --rev <rev> configmap/default/important
 kubectl get configmap important -o jsonpath='{.data.password}'
 ```
 

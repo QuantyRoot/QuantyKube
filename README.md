@@ -1,7 +1,9 @@
 # QuantyKube
 
-A Kubernetes data store with time travel, written in Rust, depending only
-on the standard library and other QuantyRoot crates.
+A Kubernetes data store with an undo button. It speaks the etcd v3 API the
+Kubernetes API server uses, keeps history after the API server compacts
+it, and is written in Rust against the standard library and other
+QuantyRoot crates only.
 
 [![CI](https://github.com/QuantyRoot/QuantyKube/actions/workflows/ci.yml/badge.svg)](https://github.com/QuantyRoot/QuantyKube/actions/workflows/ci.yml)
 ![Status](https://img.shields.io/badge/status-early-red)
@@ -10,40 +12,58 @@ on the standard library and other QuantyRoot crates.
 
 ## Read this first
 
-QuantyKube is not a general etcd replacement. It implements only the part
-of the etcd v3 API that the Kubernetes API server uses, on a single node,
-without clustering. Other etcd clients may call things that do not exist
-here. This is a deliberate choice, recorded in
-[ADR-001](docs/DECISIONS.md), and the same one kine makes.
+QuantyKube is not a general etcd replacement. It implements the part of
+the etcd v3 API that the Kubernetes API server uses, on a single node,
+without clustering. Other etcd clients may call things that are not
+there ([ADR-001](docs/DECISIONS.md)); kine makes the same choice.
 
-It is early. What is marked built below runs against the real `etcdctl`
-and a real Kubernetes API server in CI (`scripts/e2e.sh`); nothing has run
-in production.
+It is early. Everything marked built below is exercised in CI against the
+real `etcdctl`, an unmodified `kube-apiserver` and a k3s control plane
+(`scripts/e2e.sh`), and against SIGKILL under load (`tests/crash.rs`).
+Nothing has run in production yet.
 
-## The idea
+## What it does
 
-etcd stores every object in a Kubernetes cluster as a key with a global,
-ever increasing revision. QuantyKube puts that API on top of the QuantyDB
-engine, which already stores data as numbered, immutable commits. The
-revision is the commit. Reading the cluster as it was two hours ago is not
-an added feature; it is how the engine reads anything.
+```
+$ kubectl delete configmap important
+configmap "important" deleted from default namespace
+$ kubectl quanty history configmap/default/important
+     218  2026-10-20 15:25:32Z  create  /registry/configmaps/default/important  220 bytes
+     243  2026-10-20 15:25:33Z  update  /registry/configmaps/default/important  288 bytes
+     251  2026-10-20 15:25:34Z  delete  /registry/configmaps/default/important  0 bytes
+$ kubectl quanty restore --rev 243 configmap/default/important
+/registry/configmaps/default/important: restored as of revision 243, now revision 253
+$ kubectl get configmap important -o jsonpath={.data.password}
+correct horse
+```
 
-## Plan
+etcd numbers every change to a cluster with a revision and throws old
+revisions away when the API server compacts, every five minutes.
+QuantyKube stores data in the QuantyDB engine, where every commit is an
+immutable snapshot, and keeps them for a window you choose, an hour by
+default ([ADR-011](docs/DECISIONS.md)). Inside that window you can list
+what happened to any object, read it as it was at a revision or a time,
+and put it back. A restore is an ordinary write, so controllers and
+watches see the object return.
+
+## Status
 
 | Part | State |
 | --- | --- |
-| etcd v3 subset used by kube-apiserver, Unix socket | built |
-| Watch, including replay from a past revision | built |
-| Reading the cluster at a past revision | built, until the API server compacts |
-| Keeping history beyond compaction | planned |
-| TLS (via QuantyCore) | later |
-| Node runtime behind CRI ([ADR-005](docs/DECISIONS.md)) | later |
-| Clustering | not planned for now |
-
-What the first demonstration has to do is in
-[docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
+| etcd v3 subset used by kube-apiserver, Unix socket ([docs/RPCS.md](docs/RPCS.md)) | built |
+| Watch, with replay from a past revision and progress notifications | built |
+| Leases, with expiry | built |
+| Group commit: concurrent writes share fsyncs ([ADR-012](docs/DECISIONS.md)) | built |
+| History beyond compaction: `history`, `get`, `restore` | built |
+| `kubectl quanty` plugin | built |
+| Benchmarks against etcd ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)) | measured |
+| TLS, so the store can be reached over a network | waiting for QuantyCore |
+| Node runtime behind CRI ([docs/RUNTIME.md](docs/RUNTIME.md)) | designed |
+| Several store nodes (Raft) | later ([ADR-008](docs/DECISIONS.md)) |
 
 ## Trying it
+
+Rust 1.89 or newer.
 
 ```
 cargo build --release
@@ -51,9 +71,27 @@ target/release/quantykube serve --data /var/lib/quantykube/db --socket /run/quan
 kube-apiserver --etcd-servers=unix:///run/quantykube.sock ...
 ```
 
-`etcdctl --endpoints=unix:///run/quantykube.sock` works for looking around.
+With k3s, `--datastore-endpoint=unix:///run/quantykube.sock`. For the
+kubectl plugin, put the binary on the PATH as `kubectl-quanty`:
 
-Rust 1.89 or newer.
+```
+ln -s "$PWD/target/release/quantykube" /usr/local/bin/kubectl-quanty
+kubectl quanty history --prefix configmap/default/
+```
+
+`etcdctl --endpoints=unix:///run/quantykube.sock` works for looking at
+the raw keys.
+
+## How it is built
+
+- [docs/DECISIONS.md](docs/DECISIONS.md): every decision that might be
+  regretted, with what it costs and what was rejected.
+- [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md): what has to work for the first
+  public demonstration, written before the code.
+- [docs/DEMO.md](docs/DEMO.md): that demonstration, as commands.
+- The protocol stack, protobuf, HPACK, HTTP/2 and gRPC, lives in
+  [QuantyCore](https://github.com/QuantyRoot/QuantyCore); the storage
+  engine is [QuantyDB](https://github.com/QuantyRoot/QuantyDatabase).
 
 ## License
 
