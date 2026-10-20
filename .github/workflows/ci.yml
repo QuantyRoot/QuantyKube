@@ -105,6 +105,38 @@ jobs:
           mkdir "$RUNNER_TEMP/cni" && tar -xzf cni.tgz -C "$RUNNER_TEMP/cni"
       - run: sudo env CRICTL="$RUNNER_TEMP/crictl" IMAGE="$RUNNER_TEMP/busybox" CNI_BIN="$RUNNER_TEMP/cni" scripts/cri.sh
 
+  cluster:
+    name: a k3s node on the QuantyKube store and runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: fetch k3s, CNI plugins and busybox at pinned versions
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLo k3s https://github.com/k3s-io/k3s/releases/download/v1.37.1%2Bk3s1/k3s
+          curl -fsSLo cni.tgz https://github.com/containernetworking/plugins/releases/download/v1.8.0/cni-plugins-linux-amd64-v1.8.0.tgz
+          sha256sum -c - <<'SUMS'
+          92b94582eb7b34a8cf532e6006842b9ed215a6783cf56a3dd6271fd35243b2c0  k3s
+          ab3bda535f9d90766cccc90d3dddb5482003dd744d7f22bcf98186bf8eea8be6  cni.tgz
+          SUMS
+          chmod +x k3s
+          mkdir cni && tar -xzf cni.tgz -C cni
+          img=$RUNNER_TEMP/busybox
+          mkdir -p "$img/blobs"
+          reg=https://mirror.gcr.io/v2/library/busybox
+          curl -fsSL -H 'Accept: application/vnd.oci.image.manifest.v1+json' -o "$img/manifest.json" \
+            "$reg/manifests/sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f"
+          echo "b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f  $img/manifest.json" | sha256sum -c -
+          for d in $(grep -o 'sha256:[0-9a-f]\{64\}' "$img/manifest.json"); do
+            curl -fsSL -o "$img/blobs/${d#sha256:}" "$reg/blobs/$d"
+          done
+      - run: cargo build --release
+      - run: |
+          t=$RUNNER_TEMP
+          sudo env K3S=$t/k3s IMAGE=$t/busybox CNI_BIN=$t/cni scripts/cluster.sh
+
   msrv:
     name: test on MSRV (1.89)
     runs-on: ubuntu-latest
