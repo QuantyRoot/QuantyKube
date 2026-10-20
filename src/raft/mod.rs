@@ -11,9 +11,10 @@
 //! What it does: leader election with pre-vote, so a node cut off from the
 //! others cannot force elections when it comes back; check quorum, so a
 //! leader that cannot reach a majority steps down; log replication with
-//! fast backtracking. Membership is fixed at start.
+//! fast backtracking; linearizable reads through ReadIndex. Membership is
+//! fixed at start.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
 mod sim;
@@ -58,6 +59,29 @@ pub enum Body {
         index: u64,
         success: bool,
     },
+    /// A follower asks the leader for a read index on a client's behalf.
+    ReadIndex {
+        req: u64,
+    },
+    ReadIndexReply {
+        req: u64,
+        index: u64,
+    },
+    /// The leader asks whether it still leads, for the reads up to `seq`.
+    ReadCheck {
+        seq: u64,
+    },
+    ReadCheckReply {
+        seq: u64,
+    },
+}
+
+/// A read the host may serve once it has applied up to `index`: by then
+/// its state includes every write acknowledged before the read began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadState {
+    pub req: u64,
+    pub index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +102,7 @@ pub struct Ready {
     pub entries: Vec<Entry>,
     pub messages: Vec<Message>,
     pub committed: Vec<Entry>,
+    pub reads: Vec<ReadState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +148,20 @@ pub enum Bug {
     /// Keeps entries that conflict with the leader's instead of dropping
     /// them.
     KeepConflicts,
+    /// Answers a read with its commit index without asking whether it
+    /// still leads.
+    ReadWithoutQuorum,
+    /// Answers reads before it has committed an entry of its own term,
+    /// when its commit index may be behind its predecessor's.
+    ReadBeforeOwnCommit,
+}
+
+struct PendingRead {
+    seq: u64,
+    index: u64,
+    origin: NodeId,
+    req: u64,
+    acks: BTreeSet<NodeId>,
 }
 
 struct Progress {
@@ -154,6 +193,11 @@ pub struct Node {
     /// The lowest log index changed since the last `Ready`.
     dirty_from: Option<u64>,
     hard_dirty: bool,
+    read_seq: u64,
+    reads: Vec<PendingRead>,
+    /// Reads that came before this leader committed an entry of its own
+    /// term, when its commit index might still be behind.
+    early_reads: Vec<(NodeId, u64)>,
     #[cfg(test)]
     pub bug: Bug,
 }
@@ -190,6 +234,9 @@ impl Node {
             ready: Ready::default(),
             dirty_from: None,
             hard_dirty: false,
+            read_seq: 0,
+            reads: Vec::new(),
+            early_reads: Vec::new(),
             #[cfg(test)]
             bug: Bug::None,
         };
@@ -278,7 +325,66 @@ impl Node {
         self.set_term(term);
         self.role = Role::Follower;
         self.leader = leader;
+        self.reads.clear();
+        self.early_reads.clear();
         self.reset_timeout();
+    }
+
+    /// Asks for a read index for the host's request `req`; it comes back
+    /// in `Ready::reads`, or not at all if leadership changes first, and
+    /// then the host asks again.
+    pub fn read_index(&mut self, req: u64) {
+        match (self.role, self.leader) {
+            (Role::Leader, _) => {
+                let id = self.id;
+                self.leader_read(id, req);
+            }
+            (_, Some(leader)) => {
+                let term = self.term;
+                self.send(leader, term, Body::ReadIndex { req });
+            }
+            _ => {}
+        }
+    }
+
+    fn leader_read(&mut self, origin: NodeId, req: u64) {
+        let own = self.term_at(self.commit) == Some(self.term);
+        #[cfg(test)]
+        let own = own || self.bug == Bug::ReadBeforeOwnCommit;
+        if !own {
+            self.early_reads.push((origin, req));
+            return;
+        }
+        let index = self.commit;
+        #[cfg(test)]
+        if self.bug == Bug::ReadWithoutQuorum {
+            return self.read_done(origin, req, index);
+        }
+        if self.peers.len() == 1 {
+            return self.read_done(origin, req, index);
+        }
+        self.read_seq += 1;
+        let seq = self.read_seq;
+        self.reads.push(PendingRead {
+            seq,
+            index,
+            origin,
+            req,
+            acks: BTreeSet::from([self.id]),
+        });
+        let term = self.term;
+        for p in self.others() {
+            self.send(p, term, Body::ReadCheck { seq });
+        }
+    }
+
+    fn read_done(&mut self, origin: NodeId, req: u64, index: u64) {
+        if origin == self.id {
+            self.ready.reads.push(ReadState { req, index });
+        } else {
+            let term = self.term;
+            self.send(origin, term, Body::ReadIndexReply { req, index });
+        }
     }
 
     fn truncate_and_append(&mut self, from: u64, entries: &[Entry]) {
@@ -476,6 +582,9 @@ impl Node {
         if current {
             self.commit = n;
             self.hard_dirty = true;
+            for (origin, req) in std::mem::take(&mut self.early_reads) {
+                self.leader_read(origin, req);
+            }
         }
     }
 
@@ -503,13 +612,15 @@ impl Node {
                     pre: true,
                     granted: true,
                 } => {}
-                Body::Append { .. } => self.become_follower(m.term, Some(m.from)),
+                Body::Append { .. } | Body::ReadCheck { .. } => {
+                    self.become_follower(m.term, Some(m.from))
+                }
                 _ => self.become_follower(m.term, None),
             }
         } else if m.term < self.term {
             match m.body {
                 // a stale leader learns the term and steps down
-                Body::Append { .. } => {
+                Body::Append { .. } | Body::ReadCheck { .. } => {
                     let term = self.term;
                     self.send(
                         m.from,
@@ -589,8 +700,47 @@ impl Node {
                 self.reset_timeout();
                 self.handle_append(m.from, prev_index, prev_term, entries, commit);
             }
-            Body::AppendReply { index, success } => {
+            Body::ReadIndex { req } => {
+                if self.role == Role::Leader {
+                    self.leader_read(m.from, req);
+                }
+            }
+            Body::ReadIndexReply { req, index } => {
+                self.ready.reads.push(ReadState { req, index });
+            }
+            Body::ReadCheck { seq } => {
+                self.role = Role::Follower;
+                self.leader = Some(m.from);
+                self.reset_timeout();
+                let term = self.term;
+                self.send(m.from, term, Body::ReadCheckReply { seq });
+            }
+            Body::ReadCheckReply { seq } => {
                 if self.role != Role::Leader {
+                    return;
+                }
+                if let Some(pr) = self.progress.get_mut(&m.from) {
+                    pr.active = true;
+                }
+                let quorum = self.quorum();
+                let mut done = Vec::new();
+                self.reads.retain_mut(|r| {
+                    if r.seq <= seq {
+                        r.acks.insert(m.from);
+                    }
+                    if r.acks.len() >= quorum {
+                        done.push((r.origin, r.req, r.index));
+                        return false;
+                    }
+                    true
+                });
+                for (origin, req, index) in done {
+                    self.read_done(origin, req, index);
+                }
+            }
+            Body::AppendReply { index, success } => {
+                // a follower cannot match more than this leader has
+                if self.role != Role::Leader || index > self.last_index() {
                     return;
                 }
                 let Some(pr) = self.progress.get_mut(&m.from) else {

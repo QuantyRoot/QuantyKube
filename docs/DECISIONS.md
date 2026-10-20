@@ -976,34 +976,43 @@ in particular in a simulator.
 The simulator (`src/raft/sim.rs`, ADR-008) runs a cluster in one
 process from one seed: message delays, reordering, loss, duplication,
 partitions into up to three parts or around one node, crashes that
-keep only what was made durable, restarts, fault rates that differ
-from seed to seed, and faults aimed at the moments that matter, a new
-leader cut off before it replicates and a leader dying right after a
-commit, as FoundationDB's buggify aims them. It checks at every step
-that no term has two leaders and that every index is applied as the
-same entry everywhere, and at the end, with the network healed, that
-the cluster makes progress and that every acknowledged command is
+keep only what was made durable, restarts, pauses in which a node
+neither ticks nor hears anything, fault rates that differ from seed to
+seed, and faults aimed at the moments that matter, as FoundationDB's
+buggify aims them: a new leader cut off before it replicates, a leader
+dying right after a commit, a node dying right after it voted, a leader
+cut off or paused while its clients keep reading from it. It checks at
+every step that no term has two leaders, that every index is applied as
+the same entry everywhere, and that a read sees every command
+acknowledged before it began; and at the end, with the network healed,
+that the cluster makes progress and every acknowledged command is
 applied on every node.
 
 It counts only because it finds what was planted: a second vote in a
 term, a vote for a candidate whose log is behind, committing an entry
 of an earlier term by counting replicas (Figure 8 of the Raft paper,
 found only after the aimed faults were added), keeping entries that
-conflict with the leader's, and a host that sends before its disk has
-what the message promises. Each is found within 300 seeds; the correct
-node passed 20,000. Every CI run checks the planted bugs and 5,000
-seeds per cluster size.
+conflict with the leader's, a host that sends before its disk has what
+the message promises, a read answered without asking a majority, and a
+read answered before the leader committed an entry of its own term.
+Each is found within 300 seeds, the rarest in about one seed of 25; the
+correct node passed 20,000. Every CI run checks the planted bugs and
+5,000 seeds per cluster size. The simulator found one real fault on the
+way: a reply claiming more of the log than the leader holds made it
+index past its log, which it now ignores.
 
 What the node does: elections with pre-vote, so that a node returning
 from a partition cannot unseat a working leader; check quorum, so that
 a leader that cannot reach a majority steps down; a node that heard
 from a leader within the election timeout refuses to vote for another;
 replication in batches with fast backtracking; a new leader's empty
-entry to commit its term.
+entry to commit its term; linearizable reads through ReadIndex, which
+a follower asks of its leader.
 
 **What it does not do yet, and what that costs:** membership is fixed
 when the cluster starts, so a node is replaced by restarting all of
 them with the new list; the log is never compacted and is kept whole
-in memory, so it grows with every write until snapshots exist; reads
-are not yet linearizable through ReadIndex. All three come before the
-cluster is shown, or the talk says which are missing.
+in memory, so it grows with every write until snapshots exist; a
+leader sends the next batch only once the last is acknowledged, so a
+follower far behind catches up one round trip per batch. The first two
+come before the cluster is shown, or the talk says what is missing.
