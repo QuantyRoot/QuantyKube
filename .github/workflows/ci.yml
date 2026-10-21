@@ -58,6 +58,32 @@ jobs:
           sudo env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver \
             KUBECTL=$b/kubectl K3S=$b/k3s scripts/e2e.sh
 
+  raft-cluster:
+    name: three store nodes on Raft, etcdctl and kube-apiserver, the leader killed
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: fetch etcdctl and kube-apiserver at pinned versions
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
+          curl -fsSLO https://github.com/etcd-io/etcd/releases/download/v3.6.15/etcd-v3.6.15-linux-amd64.tar.gz
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kube-apiserver
+          curl -fsSLO https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
+          sha256sum -c - <<'SUMS'
+          b51d86e6bff2168de5ba8cd631c0fe6c785c7a1b32b083079f5677d6b7e2772c  etcd-v3.6.15-linux-amd64.tar.gz
+          de9b1b43c10143f448408b3aaf15f44fd5248b97a56301417a1fe2f1fc47a691  kube-apiserver
+          65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  kubectl
+          SUMS
+          tar xzf etcd-v3.6.15-linux-amd64.tar.gz --strip-components=1 etcd-v3.6.15-linux-amd64/etcdctl
+          chmod +x etcdctl kube-apiserver kubectl
+      - run: cargo build --release
+      - name: run
+        run: |
+          b=$RUNNER_TEMP/bin
+          env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver KUBECTL=$b/kubectl scripts/raft.sh
+
   crash:
     name: kill -9 the server under writes (200 kills)
     runs-on: ubuntu-latest

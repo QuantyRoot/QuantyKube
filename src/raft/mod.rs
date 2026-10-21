@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod codec;
+pub mod filelog;
 pub mod host;
 #[cfg(test)]
 mod sim;

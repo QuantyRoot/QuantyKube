@@ -13,6 +13,8 @@ const USAGE: &str = "usage:
                      [--retain <duration>] [--snapshots <duration>]
                      [--listen <addr:port> --cert <pem> --key <pem>
                       --client-ca <pem>]
+                     [--node <id> --peers <id=host:port,...> --peer-cert <pem>
+                      --peer-key <pem> --peer-ca <pem> [--peer-listen <addr>]]
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
@@ -33,6 +35,10 @@ With --listen it also serves the etcd API over TLS on that address,
 only to clients with a certificate from the --client-ca PEM file, as an
 API server's --etcd-certfile gives it; --cert and --key are the
 server's own certificate chain and key.
+With --node it is that node of the Raft cluster --peers lists, its own
+entry included; the nodes talk on those addresses over TLS with
+certificates from --peer-ca (ADR-033), and the Raft log is kept next to
+--data with .raft appended.
 
 history, get and restore read that history through the server's socket,
 $QUANTYKUBE_SOCKET or /run/quantykube.sock unless --socket says otherwise.
@@ -336,6 +342,9 @@ fn serve(args: &[String]) -> Result<(), String> {
     let endpoint = format!("unix://{}", socket.display());
     let etcd =
         quantykube::etcd::Etcd::new(store.clone(), endpoint.clone()).map_err(|e| e.to_string())?;
+    if let Some(node) = value(args, "--node") {
+        join_cluster(&etcd, node, &data, args)?;
+    }
     let keep = retain.as_millis() as i64;
     let snap = snapshots.as_millis() as i64;
     std::thread::spawn(move || loop {
@@ -367,6 +376,66 @@ fn serve(args: &[String]) -> Result<(), String> {
         tcp.local_addr().map_err(|e| e.to_string())?
     );
     quantykube::tlsnet::serve(tcp, Arc::new(config), server).map_err(|e| e.to_string())
+}
+
+/// Makes this store one node of the cluster named by --peers (ADR-034),
+/// its Raft log in a file next to the store's.
+fn join_cluster<B: quantykube::store::Backend>(
+    etcd: &Arc<quantykube::etcd::Etcd<B>>,
+    node: &str,
+    data: &Path,
+    args: &[String],
+) -> Result<(), String> {
+    use quantycore::tls::x509::{pem, PrivateKey, RootStore};
+    use quantykube::raft::{filelog::FileLog, host::Host, transport::Transport};
+    let id: u64 = node.parse().map_err(|_| format!("bad node id {node}"))?;
+    let mut peers = std::collections::BTreeMap::new();
+    for p in required(args, "--peers")?.split(',') {
+        let (pid, addr) = p
+            .split_once('=')
+            .ok_or_else(|| format!("bad peer {p}, want id=host:port"))?;
+        let pid: u64 = pid.parse().map_err(|_| format!("bad peer id in {p}"))?;
+        peers.insert(pid, addr.to_string());
+    }
+    let ids: Vec<u64> = peers.keys().copied().collect();
+    let listen_addr = peers
+        .remove(&id)
+        .ok_or_else(|| format!("--peers does not name node {id}"))?;
+    let listen_addr = value(args, "--peer-listen").map_or(listen_addr, str::to_string);
+    let (cert, key, ca) = (
+        Path::new(required(args, "--peer-cert")?),
+        Path::new(required(args, "--peer-key")?),
+        Path::new(required(args, "--peer-ca")?),
+    );
+    let server = quantykube::tlsnet::server_config(cert, key, ca)?;
+    let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+    let mut roots = RootStore::new();
+    roots
+        .add_pem(&read(ca)?)
+        .map_err(|e| format!("{}: {e:?}", ca.display()))?;
+    let mut client = quantycore::tls::ClientConfig::new(roots);
+    let chain = pem::decode_all(&read(cert)?, "CERTIFICATE").map_err(|e| e.to_string())?;
+    let key = PrivateKey::from_pem(&read(key)?).map_err(|e| e.to_string())?;
+    client.set_client_certificate(chain, key);
+    let listener =
+        std::net::TcpListener::bind(&listen_addr).map_err(|e| format!("{listen_addr}: {e}"))?;
+    let (wire, inbound) = Transport::start(&peers, listener, Arc::new(client), Arc::new(server));
+    let mut log_path = data.as_os_str().to_owned();
+    log_path.push(".raft");
+    let log = FileLog::open(Path::new(&log_path)).map_err(|e| e.to_string())?;
+    etcd.join(id, |machine| {
+        Host::start(
+            id,
+            &ids,
+            Box::new(log),
+            Box::new(wire),
+            machine,
+            Some(inbound),
+        )
+    })
+    .map_err(|e| e.to_string())?;
+    eprintln!("quantykube: node {id} of {ids:?}, peers on {listen_addr}");
+    Ok(())
 }
 
 /// A socket only its owner can connect to: for both servers the mode is

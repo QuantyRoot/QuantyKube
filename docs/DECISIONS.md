@@ -38,6 +38,7 @@ through and add a new entry, never silently edit history.
 - [ADR-031](#adr-031-over-a-network-the-store-speaks-tls-and-wants-a-client-certificate) Over a network the store speaks TLS and wants a client certificate
 - [ADR-032](#adr-032-raft-is-a-state-machine-without-io-tested-by-a-simulator-that-finds-planted-bugs) Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 - [ADR-033](#adr-033-store-nodes-talk-over-tls-in-frames-not-grpc-with-certificates-from-a-peer-ca) Store nodes talk over TLS in frames, not gRPC, with certificates from a peer CA
+- [ADR-034](#adr-034-the-store-on-raft-every-write-a-command-in-the-log-the-log-in-a-file-of-its-own) The store on Raft: every write a command in the log, the log in a file of its own
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1054,3 +1055,46 @@ client certificate from it is a key to the cluster's log, not only to
 its data. Anyone with a client certificate from the client CA must not
 also hold one from the peer CA. Using one CA for both, which small
 setups will want, makes every etcd client able to speak Raft.
+
+## ADR-034: The store on Raft: every write a command in the log, the log in a file of its own
+
+`quantykube serve --node <id> --peers ...` makes the store one node of
+a cluster. Every request that changes the store, Put, DeleteRange, Txn,
+Compact, LeaseGrant, LeaseRevoke and History's Restore, becomes a
+command in the Raft log: the method, the request as the client sent it,
+the time it was taken, and which node and caller wait for it. Every
+node applies the commands in log order through the same code that
+serves them on a single node, so revisions, answers and watch events
+are the same everywhere, and the node a client asked answers it when it
+applies the command itself. A follower passes commands to its leader
+inside Raft. Reads wait for a ReadIndex unless the client asked for a
+serializable read; watches are served from each node's own store.
+
+Leases follow etcd: the node that takes a grant picks the id, so every
+node grants the same lease; only the leader decides that a lease ran
+out, and revokes it through the log; a new leader first gives every
+lease its full TTL again. A keepalive refreshes the lease only on the
+node it reaches, which is the leader's for kube-apiserver in practice
+and not always for other clients.
+
+The Raft log lives in a QuantyDB file next to the store's, `<data>.raft`
+(option a of 21 October). It is the simplest separation, and it costs
+a second fsync per write: one for the log, one when the command is
+applied to the store. Writing the log into the store's own file, so
+that applying and remembering the log share one commit (option b),
+waits for the measurement on the rented servers.
+
+In CI three nodes run on one machine against the real `etcdctl` and an
+unmodified kube-apiserver given all three endpoints: writes through
+every node, reads and a watch through another, the same revision on
+every node, the leader killed with SIGKILL while the others go on, and
+the killed node coming back and catching up.
+
+**What it does not do yet, and what that costs:** a node never compacts
+its Raft log, so the log file grows with every write and a follower is
+never sent a snapshot; one that lost its disk catches up from the start
+of the log. A command passed to a leader that dies before appending it
+is lost, and the client sees a timeout and sends it again, which etcd
+clients do. The store's history timestamps are each node's own clock at
+apply time, not the command's, so `--ago` can differ by milliseconds
+between nodes.

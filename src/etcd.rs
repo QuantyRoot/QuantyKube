@@ -1168,7 +1168,7 @@ impl<B: Backend> Service for Etcd<B> {
         let Some(c) = self.cluster.get() else {
             return self.serve(method, body, now_ms());
         };
-        let timed_out = |_| status(code::UNAVAILABLE, "etcdserver: request timed out");
+        let timed_out = |_| status(code::UNAVAILABLE, "request timed out");
         if is_write(method) {
             let mut body = body.to_vec();
             if method == "/etcdserverpb.Lease/LeaseGrant" {
