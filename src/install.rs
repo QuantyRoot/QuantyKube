@@ -96,13 +96,11 @@ fn api_running() -> bool {
     })
 }
 
-/// The API server answers /readyz with ok, asked with the certificate
+/// The API server answers /readyz with 200, asked with the certificate
 /// kubeadm gives the API server for its kubelets, which is a cluster
 /// admin's.
-fn api_ready(l: &Layout, manifest: &str) -> bool {
-    let Some(host) = flag(manifest, "advertise-address") else {
-        return false;
-    };
+fn api_ready(l: &Layout, manifest: &str) -> Result<(), String> {
+    let host = flag(manifest, "advertise-address").ok_or("no --advertise-address")?;
     let port = flag(manifest, "secure-port").unwrap_or_else(|| "6443".into());
     let config = crate::etcdclient::client_config(
         &l.pki("ca.crt"),
@@ -111,37 +109,77 @@ fn api_ready(l: &Layout, manifest: &str) -> bool {
             &l.pki("apiserver-kubelet-client.key"),
         )),
         &[b"http/1.1"],
-    );
-    let Ok(config) = config else { return false };
+    )?;
     let addr = format!("{host}:{port}");
-    let Ok(stream) = crate::etcdclient::connect(&addr, &Arc::new(config)) else {
-        return false;
-    };
+    let stream =
+        crate::etcdclient::connect(&addr, &Arc::new(config)).map_err(|e| format!("{addr}: {e}"))?;
     let req = quantycore::http1::Request {
         method: "GET",
         target: "/readyz",
         host: &addr,
-        headers: &[],
+        headers: &[("Connection", "close")],
     };
-    match quantycore::http1::send(stream, &req) {
-        Ok(mut resp) => {
-            let mut body = String::new();
-            let _ = resp.read_to_string(&mut body);
-            resp.status == 200 && body.trim() == "ok"
-        }
-        Err(_) => false,
+    let mut resp = quantycore::http1::send(stream, &req).map_err(|e| format!("{addr}: {e}"))?;
+    let mut body = String::new();
+    let _ = resp.read_to_string(&mut body);
+    if resp.status == 200 {
+        Ok(())
+    } else {
+        Err(format!("{addr}/readyz: {} {}", resp.status, body.trim()))
     }
 }
 
-fn wait(what: &str, secs: u64, mut done: impl FnMut() -> bool) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while !done() {
-        if Instant::now() > deadline {
-            return Err(format!("{what} did not happen within {secs}s"));
-        }
-        std::thread::sleep(Duration::from_millis(500));
+/// The store answers /health.
+fn store_ready(l: &Layout) -> Result<(), String> {
+    let config = crate::etcdclient::client_config(
+        &l.pki("etcd/ca.crt"),
+        Some((
+            &l.pki("apiserver-etcd-client.crt"),
+            &l.pki("apiserver-etcd-client.key"),
+        )),
+        &[b"http/1.1"],
+    )?;
+    let addr = format!("127.0.0.1:{}", l.port);
+    let stream =
+        crate::etcdclient::connect(&addr, &Arc::new(config)).map_err(|e| format!("{addr}: {e}"))?;
+    let req = quantycore::http1::Request {
+        method: "GET",
+        target: "/health",
+        host: &addr,
+        headers: &[("Connection", "close")],
+    };
+    let resp = quantycore::http1::send(stream, &req).map_err(|e| format!("{addr}: {e}"))?;
+    if resp.status == 200 {
+        Ok(())
+    } else {
+        Err(format!("{addr}/health: {}", resp.status))
     }
-    Ok(())
+}
+
+/// Polls `check` until it succeeds; the error names the last reason.
+fn wait(
+    what: &str,
+    secs: u64,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match check() {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() > deadline => {
+                return Err(format!("{what} did not happen within {secs}s: {e}"))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+}
+
+fn stopped() -> Result<(), String> {
+    if api_running() {
+        Err("a kube-apiserver process is still running".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn systemctl(args: &[&str]) -> Result<(), String> {
@@ -164,6 +202,7 @@ fn store_unit(l: &Layout) -> String {
          [Service]\n\
          ExecStart={bin} serve --data {data} --socket /run/quantykube/store.sock \
          --listen 127.0.0.1:{port} --cert {cert} --key {key} --client-ca {ca}\n\
+         RuntimeDirectory=quantykube\n\
          Restart=always\n\
          RestartSec=1\n\
          [Install]\n\
@@ -223,7 +262,7 @@ pub fn install(l: &Layout) -> Result<(), String> {
     let parked = l.journal().join("kube-apiserver.parked");
     fs::rename(l.manifest(), &parked).map_err(err(l.manifest().display()))?;
     let moved = (|| {
-        wait("the API server stopping", 120, || !api_running())?;
+        wait("the API server stopping", 120, stopped)?;
         step(l, "copying the keys from etcd")?;
         let client = crate::etcdclient::Client::new(&endpoint, &ca, &cert, &key)?;
         let copy = client.copy().map_err(|s| s.message)?;
@@ -239,6 +278,7 @@ pub fn install(l: &Layout) -> Result<(), String> {
         fs::write(UNIT, store_unit(l)).map_err(err(UNIT))?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", "quantykube-store.service"])?;
+        wait("the store starting", 60, || store_ready(l))?;
         step(l, "starting the API server on the store")?;
         fs::write(&parked, &switched).map_err(err(parked.display()))?;
         fs::rename(&parked, l.manifest()).map_err(err(l.manifest().display()))?;
@@ -282,7 +322,7 @@ pub fn undo(l: &Layout) -> Result<(), String> {
     if l.manifest().exists() {
         fs::rename(l.manifest(), &parked).map_err(err(l.manifest().display()))?;
     }
-    wait("the API server stopping", 120, || !api_running())?;
+    wait("the API server stopping", 120, stopped)?;
     fs::write(&parked, &original).map_err(err(parked.display()))?;
     fs::rename(&parked, l.manifest()).map_err(err(l.manifest().display()))?;
     wait("the API server becoming ready on etcd", 180, || {

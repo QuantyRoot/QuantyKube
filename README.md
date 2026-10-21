@@ -20,8 +20,9 @@ clients may call things that are not there
 ([ADR-001](docs/DECISIONS.md)); kine makes the same choice.
 
 It is early. Everything marked built below is exercised in CI against the
-real `etcdctl`, an unmodified `kube-apiserver` and a k3s control plane
-(`scripts/e2e.sh`), and against SIGKILL under load (`tests/crash.rs`).
+real `etcdctl`, an unmodified `kube-apiserver`, a control plane set up by
+kubeadm and one by k3s (`scripts/e2e.sh`, `scripts/kubeadm.sh`), and
+against SIGKILL under load (`tests/crash.rs`).
 Nothing has run in production yet.
 
 The second half is a node runtime, the program the kubelet starts
@@ -71,7 +72,9 @@ watches see the object return.
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
 | A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |
-| Several store nodes (Raft): a simulator that finds planted bugs, three nodes under kube-apiserver with the leader killed ([ADR-032 to 034](docs/DECISIONS.md)) | built, runs in CI; no log compaction yet |
+| Several store nodes (Raft): a simulator that finds planted bugs, three nodes under kube-apiserver with the leader killed, log compaction and snapshots ([ADR-032 to 034](docs/DECISIONS.md)) | built, runs in CI |
+| kubeadm with the store as its etcd ([scripts/kubeadm.sh](scripts/kubeadm.sh)) | runs in CI |
+| Moving a kubeadm cluster from etcd and back: `migrate`, `install store`, `undo store`, every object at its resourceVersion ([ADR-035](docs/DECISIONS.md)) | runs in CI; writes made on the store are not copied back on undo yet |
 
 ## Trying it
 
