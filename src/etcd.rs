@@ -258,6 +258,20 @@ fn lease_key(id: i64) -> Vec<u8> {
     k
 }
 
+/// The store's whole state from a copy of an etcd, for
+/// [`Backend::import`]: its keys with their revisions, and its leases as
+/// this server keeps them.
+pub fn import_of(copy: &crate::etcdclient::Copy) -> Result<Vec<u8>, store::Error> {
+    let mut meta = Vec::new();
+    for (&id, &ttl) in &copy.leases {
+        meta.push((lease_key(id), encode_pair(ttl, 0)));
+    }
+    for r in copy.records.iter().filter(|r| r.lease != 0) {
+        meta.push((lease_index(r.lease, &r.key), Vec::new()));
+    }
+    store::export_of(copy.revision, &copy.records, &meta)
+}
+
 fn lease_index(id: i64, key: &[u8]) -> Vec<u8> {
     let mut k = b"lkey/".to_vec();
     k.extend_from_slice(&(id as u64).to_be_bytes());

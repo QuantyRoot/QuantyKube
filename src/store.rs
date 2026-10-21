@@ -591,6 +591,36 @@ fn decode_i64(b: &[u8]) -> Result<i64> {
     Ok(take_varint(&mut b)? as i64)
 }
 
+/// What [`Backend::import`] takes, made from another store's keys as of
+/// revision `head`, with their own revisions kept, and metadata entries.
+/// Reads before `head` are then refused as compacted.
+pub fn export_of(head: i64, records: &[Record], meta: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    put_varint(&mut out, head as u64);
+    put_varint(&mut out, head as u64);
+    let mut put = |k: Vec<u8>, v: Vec<u8>| {
+        put_varint(&mut out, k.len() as u64);
+        out.extend_from_slice(&k);
+        put_varint(&mut out, v.len() as u64);
+        out.extend_from_slice(&v);
+    };
+    for r in records {
+        if r.key.len() > MAX_KEY {
+            return Err(Error::KeyTooLong);
+        }
+        if r.mod_rev > head || r.create_rev > r.mod_rev || r.version < 1 {
+            return Err(Error::Corrupt("a record not as of the head"));
+        }
+        let mut v = Vec::new();
+        encode_record(r, false, &mut v);
+        put(prefixed(LIVE, &r.key), v);
+    }
+    for (k, v) in meta {
+        put(prefixed(META, k), v.clone());
+    }
+    Ok(out)
+}
+
 fn encode_record(r: &Record, with_key: bool, out: &mut Vec<u8>) {
     if with_key {
         put_varint(out, r.key.len() as u64);

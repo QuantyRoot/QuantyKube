@@ -20,6 +20,8 @@ const USAGE: &str = "usage:
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
+  quantykube migrate --from <host:port> --etcd-ca <pem> --etcd-cert <pem>
+                     --etcd-key <pem> --data <file>
   quantykube unpack  --to <dir> <layer.tar.gz>...
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
@@ -53,6 +55,12 @@ Linked or copied as kubectl-quanty on the PATH, this is also the kubectl
 plugin `kubectl quanty`, and keys may then be given as kind/namespace/name,
 such as configmap/default/important.
 
+migrate copies every key of the etcd at --from into a new store file
+--data, as of one revision and with etcd's revisions, so that every
+resourceVersion a client holds stays valid and new writes go on after
+them (ADR-035). Nothing may write to the etcd
+meanwhile; the API server is stopped first.
+
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
 layers in order, whiteouts included; sandbox runs one command in its own
@@ -85,6 +93,7 @@ fn main() {
         Some("get") => get(&args[1..]),
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
+        Some("migrate") => migrate(&args[1..]),
         Some("sandbox") => sandbox(&args[1..]),
         Some("unpack") => unpack(&args[1..]),
         Some("runtime") => runtime(&args[1..]),
@@ -327,6 +336,31 @@ fn open(data: &Path) -> Result<Quanty<FileStorage>, store::Error> {
             r => return r,
         }
     }
+}
+
+fn migrate(args: &[String]) -> Result<(), String> {
+    let data = PathBuf::from(required(args, "--data")?);
+    // a store that already holds a cluster is never overwritten
+    if data.exists() {
+        return Err(format!("{} exists", data.display()));
+    }
+    let client = quantykube::etcdclient::Client::new(
+        required(args, "--from")?,
+        Path::new(required(args, "--etcd-ca")?),
+        Path::new(required(args, "--etcd-cert")?),
+        Path::new(required(args, "--etcd-key")?),
+    )?;
+    let copy = client.copy().map_err(|s| s.message)?;
+    let blob = quantykube::etcd::import_of(&copy).map_err(|e| e.to_string())?;
+    let store = open(&data).map_err(|e| format!("{}: {e}", data.display()))?;
+    store::Backend::import(&store, &blob).map_err(|e| e.to_string())?;
+    println!(
+        "copied {} keys and {} leases as of revision {}",
+        copy.records.len(),
+        copy.leases.len(),
+        copy.revision
+    );
+    Ok(())
 }
 
 fn serve(args: &[String]) -> Result<(), String> {

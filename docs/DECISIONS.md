@@ -39,6 +39,7 @@ through and add a new entry, never silently edit history.
 - [ADR-032](#adr-032-raft-is-a-state-machine-without-io-tested-by-a-simulator-that-finds-planted-bugs) Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 - [ADR-033](#adr-033-store-nodes-talk-over-tls-in-frames-not-grpc-with-certificates-from-a-peer-ca) Store nodes talk over TLS in frames, not gRPC, with certificates from a peer CA
 - [ADR-034](#adr-034-the-store-on-raft-every-write-a-command-in-the-log-the-log-in-a-file-of-its-own) The store on Raft: every write a command in the log, the log in a file of its own
+- [ADR-035](#adr-035-a-cluster-moves-from-etcd-with-its-revisions-while-the-api-server-is-stopped) A cluster moves from etcd with its revisions, while the API server is stopped
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1136,3 +1137,40 @@ is lost, and the client sees a timeout and sends it again, which etcd
 clients do. The store's history timestamps are each node's own clock at
 apply time, not the command's, so `--ago` can differ by milliseconds
 between nodes.
+
+## ADR-035: A cluster moves from etcd with its revisions, while the API server is stopped
+
+ADR-009 left open whether the store keeps etcd's revision numbers when
+a cluster moves onto it. It keeps them. `quantykube migrate` reads
+every key of the etcd at one revision, page by page at that revision,
+and writes them into a new store file with their own create and mod
+revisions and versions, the store's head at that revision and
+everything before it compacted. The leases the keys hold come along
+with the TTL they were granted, and get it in full, as after any
+restart of etcd; one that ended after the read gets a second, so its
+keys go as they would have in etcd.
+
+Kept revisions are what make the move invisible to clients: every
+resourceVersion a controller or kubelet holds stays valid, and every
+write after the move gets a higher one. With numbers starting over,
+a client holding a resourceVersion from before would be ahead of the
+store and be refused until the store caught up with it.
+
+Nothing writes while it copies: the API server is the only client of a
+kubeadm cluster's etcd, and it is stopped first by moving its static
+pod manifest out of the kubelet's directory. etcd itself stays as it
+was, untouched, so the way back is to point the API server at it
+again. `migrate` refuses a store file that exists, so a cluster is
+never copied over another.
+
+In CI (`scripts/migrate.sh`) an unmodified kube-apiserver writes into a
+real etcd, is stopped, the keys are copied, and the API server started
+on QuantyKube finds every object at its resourceVersion, events with
+their lease among them.
+
+**The cost:** the API server is down for the copy and its restart,
+seconds for a cluster of the usual size. Its clients' watches are told
+to list again, as after any restart of the API server, since its watch
+cache starts anew. History in QuantyKube begins at the move. Writes
+made after the move are not in etcd, so going back after a while
+needs them copied back, which is not built yet.

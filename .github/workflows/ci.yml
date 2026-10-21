@@ -30,7 +30,7 @@ jobs:
         run: cargo test --workspace
 
   e2e:
-    name: real etcdctl, kube-apiserver and k3s
+    name: real etcdctl, kube-apiserver and k3s, and a move from etcd
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -49,7 +49,8 @@ jobs:
           de9b1b43c10143f448408b3aaf15f44fd5248b97a56301417a1fe2f1fc47a691  kube-apiserver
           65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  kubectl
           SUMS
-          tar xzf etcd-v3.6.15-linux-amd64.tar.gz --strip-components=1 etcd-v3.6.15-linux-amd64/etcdctl
+          tar xzf etcd-v3.6.15-linux-amd64.tar.gz --strip-components=1 \
+            etcd-v3.6.15-linux-amd64/etcdctl etcd-v3.6.15-linux-amd64/etcd
           chmod +x k3s etcdctl kube-apiserver kubectl
       - run: cargo build --release --workspace
       - name: run
@@ -57,6 +58,10 @@ jobs:
           b=$RUNNER_TEMP/bin
           sudo env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver \
             KUBECTL=$b/kubectl K3S=$b/k3s scripts/e2e.sh
+      - name: a cluster moved from a real etcd
+        run: |
+          b=$RUNNER_TEMP/bin
+          env ETCD=$b/etcd KUBE_APISERVER=$b/kube-apiserver KUBECTL=$b/kubectl scripts/migrate.sh
 
   raft-cluster:
     name: three store nodes on Raft, etcdctl and kube-apiserver, the leader killed

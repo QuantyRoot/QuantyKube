@@ -27,6 +27,13 @@ fail() {
     printf 'FAIL: %s\n' "$*"
     kubectl get nodes,pods -A -o wide 2>&1 || true
     kubectl get events -A --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+    for p in $(kubectl get pods -A --no-headers 2>/dev/null |
+        awk '{split($3, r, "/"); if (r[1] != r[2]) print $1 "/" $2}'); do
+        printf '\n--- %s\n' "$p"
+        kubectl -n "${p%%/*}" logs "${p#*/}" --tail=20 2>&1 || true
+    done
+    printf '\n--- kube-proxy\n'
+    kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=20 2>&1 || true
     printf '\n--- store\n'; tail -40 "$work/qk.log"
     printf '\n--- kubelet\n'; journalctl -u kubelet --no-pager | tail -60
     exit 1

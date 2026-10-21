@@ -7,6 +7,7 @@ pub mod cni;
 pub mod cri;
 pub mod cripb;
 pub mod etcd;
+pub mod etcdclient;
 pub mod etcdpb;
 pub mod image;
 pub mod raft;
