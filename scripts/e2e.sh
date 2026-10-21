@@ -271,6 +271,14 @@ expect $'default\nkube-node-lease\nkube-public\nkube-system' \
 k create configmap e2e --from-literal=v=1 >/dev/null
 k patch configmap e2e -p '{"data":{"v":"2"}}' >/dev/null
 expect 2 k get configmap e2e -o 'jsonpath={.data.v}'
+# k3s gives up when its store goes away while its controller manager is
+# still building controllers, as it would with etcd; once they are built
+# it rides out a restart of the store
+for _ in $(seq 60); do
+    k -n kube-system get lease kube-controller-manager >/dev/null 2>&1 && break
+    sleep 1
+done
+sleep 10
 kill -9 "$qk"
 wait "$qk" 2>/dev/null || true
 start

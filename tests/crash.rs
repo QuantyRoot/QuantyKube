@@ -89,26 +89,30 @@ fn acknowledged_writes_survive_sigkill() {
             assert!(head >= last_head, "round {round}: head went back to {head}");
             last_head = head;
         }
+        // every key in one read: checking them one by one grows with
+        // the square of the rounds
+        let r: RangeResponse = rpc(
+            &dir,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: b"/k/".to_vec(),
+                range_end: b"/k0".to_vec(),
+                ..Default::default()
+            },
+        )
+        .expect("the restarted server answers");
+        let stored: std::collections::HashMap<Vec<u8>, (Vec<u8>, i64)> = r
+            .kvs
+            .into_iter()
+            .map(|kv| (kv.key, (kv.value, kv.mod_revision)))
+            .collect();
         for &(w, i, rev) in acked.lock().unwrap().iter() {
-            let r: RangeResponse = rpc(
-                &dir,
-                "/etcdserverpb.KV/Range",
-                RangeRequest {
-                    key: format!("/k/{w}/{i}").into_bytes(),
-                    ..Default::default()
-                },
-            )
-            .expect("the restarted server answers");
-            let kv = r
-                .kvs
-                .first()
-                .unwrap_or_else(|| panic!("round {round}: /k/{w}/{i} lost"));
-            assert_eq!(
-                kv.value,
-                i.to_string().as_bytes(),
-                "round {round}: /k/{w}/{i}"
-            );
-            assert_eq!(kv.mod_revision, rev, "round {round}: /k/{w}/{i} revision");
+            let key = format!("/k/{w}/{i}");
+            let (value, mod_rev) = stored
+                .get(key.as_bytes())
+                .unwrap_or_else(|| panic!("round {round}: {key} lost"));
+            assert_eq!(value, i.to_string().as_bytes(), "round {round}: {key}");
+            assert_eq!(*mod_rev, rev, "round {round}: {key} revision");
         }
 
         let stop = Arc::new(AtomicBool::new(false));
