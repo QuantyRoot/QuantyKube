@@ -14,9 +14,10 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Larger than any batch of entries the leader sends, smaller than what
-/// a broken or hostile peer could make us allocate.
-const MAX_FRAME: usize = 64 << 20;
+/// Larger than any batch of entries and than the snapshot of a store of
+/// the size kube-apiserver keeps by default (etcd's quota is 2 GiB, its
+/// usual size tens of megabytes); a frame is read whole.
+const MAX_FRAME: usize = 256 << 20;
 /// Messages waiting for one peer; beyond it they are dropped, as a slow
 /// network would drop them.
 const QUEUE: usize = 4096;

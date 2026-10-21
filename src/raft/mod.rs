@@ -87,6 +87,9 @@ pub enum Body {
     Snapshot {
         index: u64,
         term: u64,
+        /// The state itself, filled in and taken out by the hosts; the
+        /// node never looks at it.
+        data: Vec<u8>,
     },
     /// A command a follower received, for its leader to append. The
     /// follower learns of it by applying it like any other entry.
@@ -201,6 +204,9 @@ struct Progress {
     matched: u64,
     /// Heard from since the last quorum check.
     active: bool,
+    /// Ticks left before a snapshot sent to this follower may be sent
+    /// again: one is large, and the follower answers when it has it.
+    snapshot_wait: u32,
 }
 
 pub struct Node {
@@ -354,6 +360,11 @@ impl Node {
         self.snap
     }
 
+    /// The term of the entry at `index`, if the log still has it.
+    pub fn term_of(&self, index: u64) -> Option<u64> {
+        self.term_at(index)
+    }
+
     fn quorum(&self) -> usize {
         self.peers.len() / 2 + 1
     }
@@ -493,6 +504,9 @@ impl Node {
     pub fn tick(&mut self) {
         match self.role {
             Role::Leader => {
+                for pr in self.progress.values_mut() {
+                    pr.snapshot_wait = pr.snapshot_wait.saturating_sub(1);
+                }
                 self.heartbeat += 1;
                 self.elapsed += 1;
                 if self.heartbeat >= self.config.heartbeat_ticks {
@@ -581,6 +595,7 @@ impl Node {
                         next,
                         matched: 0,
                         active: true,
+                        snapshot_wait: 0,
                     },
                 )
             })
@@ -637,6 +652,13 @@ impl Node {
         let next = pr.next.max(1);
         if next <= self.snap.index {
             // the log no longer reaches back that far
+            if pr.snapshot_wait > 0 {
+                return;
+            }
+            let wait = self.config.election_ticks * 2;
+            if let Some(pr) = self.progress.get_mut(&to) {
+                pr.snapshot_wait = wait;
+            }
             let (term, snap) = (self.term, self.snap);
             return self.send(
                 to,
@@ -644,6 +666,7 @@ impl Node {
                 Body::Snapshot {
                     index: snap.index,
                     term: snap.term,
+                    data: Vec::new(),
                 },
             );
         }
@@ -803,7 +826,7 @@ impl Node {
                 self.reset_timeout();
                 self.handle_append(m.from, prev_index, prev_term, entries, commit);
             }
-            Body::Snapshot { index, term } => {
+            Body::Snapshot { index, term, .. } => {
                 self.role = Role::Follower;
                 self.leader = Some(m.from);
                 self.reset_timeout();
@@ -861,6 +884,7 @@ impl Node {
                     return;
                 };
                 pr.active = true;
+                pr.snapshot_wait = 0;
                 if success {
                     if index > pr.matched {
                         pr.matched = index;

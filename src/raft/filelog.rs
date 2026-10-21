@@ -137,6 +137,22 @@ impl LogStore for FileLog {
         self.committed()
     }
 
+    fn reset(&mut self, snap: SnapshotMeta) -> io::Result<()> {
+        let mut tx = self.db.begin();
+        let all: Vec<Vec<u8>> = tx
+            .scan(Some(&[ENTRY]), Some(&[ENTRY + 1]))
+            .map_err(err)?
+            .map(|r| r.map(|(k, _)| k))
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
+        for k in all {
+            tx.delete(&k).map_err(err)?;
+        }
+        tx.put(SNAP, &u64s(&[snap.index, snap.term])).map_err(err)?;
+        tx.commit().map_err(err)?;
+        self.committed()
+    }
+
     fn compact(&mut self, snap: SnapshotMeta) -> io::Result<()> {
         let mut tx = self.db.begin();
         let old: Vec<Vec<u8>> = tx

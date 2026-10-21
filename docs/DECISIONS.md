@@ -1107,10 +1107,18 @@ every node, reads and a watch through another, the same revision on
 every node, the leader killed with SIGKILL while the others go on, and
 the killed node coming back and catching up.
 
-**What it does not do yet, and what that costs:** a node never compacts
-its Raft log, so the log file grows with every write and a follower is
-never sent a snapshot; one that lost its disk catches up from the start
-of the log. A command passed to a leader that dies before appending it
+A node cuts its Raft log once 10,000 entries are applied beyond the
+last cut, keeping the last 5,000, as etcd's snapshot count does. A
+follower that needs more than the leader's log still holds gets a
+snapshot: the leader's live keys and metadata as of its last applied
+command, without history, in one message. The follower replaces its
+store with it, ends every watch on it as compacted so that its clients
+list again, and reads before the snapshot's revision are refused as
+compacted there; history on that node begins at the snapshot.
+
+**What it does not do yet, and what that costs:** a snapshot travels as
+one frame of at most 256 MiB, so a larger store cannot bring a follower
+up yet. A command passed to a leader that dies before appending it
 is lost, and the client sees a timeout and sends it again, which etcd
 clients do. The store's history timestamps are each node's own clock at
 apply time, not the command's, so `--ago` can differ by milliseconds

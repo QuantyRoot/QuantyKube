@@ -2,7 +2,7 @@
 //! keeps its clock, writes what it must keep, sends its messages, applies
 //! what it commits, and hands answers back to the callers that waited.
 
-use super::{Config, Entry, HardState, Message, Node, NodeId, Role, SnapshotMeta};
+use super::{Body, Config, Entry, HardState, Message, Node, NodeId, Role, SnapshotMeta};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -18,6 +18,9 @@ pub trait LogStore: Send {
     /// The state up to `snap` is kept elsewhere now; the log before it can
     /// go.
     fn compact(&mut self, snap: SnapshotMeta) -> io::Result<()>;
+    /// The state is a snapshot taken from the leader: the whole log goes,
+    /// and what follows is saved anew.
+    fn reset(&mut self, snap: SnapshotMeta) -> io::Result<()>;
 }
 
 /// A log kept in memory, for tests and for a node that may forget.
@@ -49,6 +52,12 @@ impl LogStore for MemLog {
         self.log.retain(|e| e.index > snap.index);
         Ok(())
     }
+
+    fn reset(&mut self, snap: SnapshotMeta) -> io::Result<()> {
+        self.snap = snap;
+        self.log.clear();
+        Ok(())
+    }
 }
 
 /// How messages leave this node.
@@ -71,6 +80,12 @@ pub trait Machine: Send + Sync {
     fn apply(&self, index: u64, data: &[u8]) -> Option<(u64, Vec<u8>)>;
     /// The last index applied, as kept by `apply`.
     fn applied(&self) -> u64;
+    /// The whole state as of the last command applied, for a follower
+    /// that needs more than the log still holds.
+    fn snapshot(&self) -> io::Result<Vec<u8>>;
+    /// Replaces the state with `data`, taken from the leader as of
+    /// `index`, and keeps `index` as applied.
+    fn restore(&self, index: u64, data: &[u8]) -> io::Result<()>;
 }
 
 enum Input {
@@ -88,6 +103,8 @@ pub struct Status {
     pub role: Role,
     pub commit: u64,
     pub applied: u64,
+    /// Where the log starts: what is before it is only in the store.
+    pub log_start: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,6 +122,23 @@ pub struct Host {
 
 pub const TICK: Duration = Duration::from_millis(100);
 
+/// When the log is cut: once this many entries are applied beyond the
+/// last cut, all but the last `keep` go, as etcd's snapshot-count does.
+#[derive(Debug, Clone, Copy)]
+pub struct Compaction {
+    pub after: u64,
+    pub keep: u64,
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Compaction {
+            after: 10_000,
+            keep: 5_000,
+        }
+    }
+}
+
 impl Host {
     /// Starts the node of `id` among `peers` from what `log` holds.
     /// Messages for it go in through [`Host::step`]; `inbound` is drained
@@ -112,10 +146,31 @@ impl Host {
     pub fn start(
         id: NodeId,
         peers: &[NodeId],
+        log: Box<dyn LogStore>,
+        wire: Box<dyn Wire>,
+        machine: Arc<dyn Machine>,
+        inbound: Option<Receiver<Message>>,
+    ) -> io::Result<Arc<Host>> {
+        Host::start_with(
+            id,
+            peers,
+            log,
+            wire,
+            machine,
+            inbound,
+            Compaction::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with(
+        id: NodeId,
+        peers: &[NodeId],
         mut log: Box<dyn LogStore>,
         wire: Box<dyn Wire>,
         machine: Arc<dyn Machine>,
         inbound: Option<Receiver<Message>>,
+        compaction: Compaction,
     ) -> io::Result<Arc<Host>> {
         let (hard, snap, entries) = log.load()?;
         let seed = id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ now_nanos();
@@ -142,7 +197,7 @@ impl Host {
                 }
             });
         }
-        std::thread::spawn(move || run(node, applied, log, wire, machine, rx));
+        std::thread::spawn(move || run(node, applied, compaction, log, wire, machine, rx));
         Ok(Arc::new(Host {
             input,
             next: Mutex::new(0),
@@ -215,6 +270,9 @@ struct State {
     /// out once one is.
     unsent: Vec<Vec<u8>>,
     unsent_reads: Vec<u64>,
+    compaction: Compaction,
+    /// The last state sent as a snapshot, and the index it was taken at.
+    snapshot: Option<(u64, Arc<Vec<u8>>)>,
 }
 
 impl State {
@@ -223,14 +281,12 @@ impl State {
     fn ready(&mut self) {
         let r = self.node.take_ready();
         if let Some(snap) = r.snapshot {
-            // installing the state behind a snapshot is not built yet:
-            // with fixed membership and logs kept long, a follower needs
-            // one only after losing its disk (ADR-034)
-            eprintln!(
-                "quantykube: raft: a snapshot to {} cannot be installed yet",
-                snap.index
-            );
-            std::process::exit(1);
+            // the machine took the state before the node was told
+            self.applied = snap.index;
+            if let Err(e) = self.log.reset(snap) {
+                eprintln!("quantykube: raft log: {e}; stopping");
+                std::process::exit(1);
+            }
         }
         if r.hard_state.is_some() || !r.entries.is_empty() {
             if let Err(e) = self.log.save(r.hard_state, &r.entries) {
@@ -238,7 +294,32 @@ impl State {
                 std::process::exit(1);
             }
         }
-        for m in r.messages {
+        for mut m in r.messages {
+            if let Body::Snapshot { index, term, data } = &mut m.body {
+                // the state as it is now, which is the state at the last
+                // index applied: newer than the node's snapshot, and as
+                // good, since it is committed too
+                let at = self.applied;
+                let Some(at_term) = self.node.term_of(at) else {
+                    continue;
+                };
+                let state = match &self.snapshot {
+                    Some((i, d)) if *i == at => d.clone(),
+                    _ => match self.machine.snapshot() {
+                        Ok(d) => {
+                            let d = Arc::new(d);
+                            self.snapshot = Some((at, d.clone()));
+                            d
+                        }
+                        Err(e) => {
+                            eprintln!("quantykube: raft: no snapshot to send: {e}");
+                            continue;
+                        }
+                    },
+                };
+                (*index, *term) = (at, at_term);
+                *data = state.to_vec();
+            }
             self.wire.send(m);
         }
         for e in r.committed {
@@ -250,6 +331,17 @@ impl State {
                 if let Some((tx, _)) = self.proposals.remove(&req) {
                     let _ = tx.send(answer);
                 }
+            }
+        }
+        // what the store holds need not stay in the log; a follower that
+        // needs more than is left gets a snapshot instead
+        let c = self.compaction;
+        let snap = self.node.snapshot().index;
+        if self.applied >= snap + c.after + c.keep {
+            self.node.compact(self.applied - c.keep);
+            if let Err(e) = self.log.compact(self.node.snapshot()) {
+                eprintln!("quantykube: raft log: {e}; stopping");
+                std::process::exit(1);
             }
         }
         for read in r.reads {
@@ -274,6 +366,7 @@ impl State {
 fn run(
     node: Node,
     applied: u64,
+    compaction: Compaction,
     log: Box<dyn LogStore>,
     wire: Box<dyn Wire>,
     machine: Arc<dyn Machine>,
@@ -292,12 +385,27 @@ fn run(
         next_read: 0,
         unsent: Vec::new(),
         unsent_reads: Vec::new(),
+        compaction,
+        snapshot: None,
     };
     let mut next_tick = Instant::now() + TICK;
     loop {
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok(Input::Step(m)) => s.node.step(m),
+            Ok(Input::Step(mut m)) => {
+                if let Body::Snapshot { index, data, .. } = &mut m.body {
+                    if *index > s.node.commit() {
+                        // the state first; the node learns of it only once
+                        // it is in place
+                        if let Err(e) = s.machine.restore(*index, data) {
+                            eprintln!("quantykube: raft: a snapshot at {index}: {e}");
+                            continue;
+                        }
+                    }
+                    *data = Vec::new();
+                }
+                s.node.step(m)
+            }
             Ok(Input::Propose(data, req, tx, until)) => {
                 s.proposals.insert(req, (tx, until));
                 s.unsent.push(data);
@@ -315,6 +423,7 @@ fn run(
                     role: s.node.role(),
                     commit: s.node.commit(),
                     applied: s.applied,
+                    log_start: s.node.snapshot().index + 1,
                 });
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -388,6 +497,19 @@ mod tests {
             0
         }
 
+        fn snapshot(&self) -> io::Result<Vec<u8>> {
+            let v = self.values.lock().unwrap();
+            Ok(v.iter().flat_map(|x| x.to_be_bytes()).collect())
+        }
+
+        fn restore(&self, _: u64, data: &[u8]) -> io::Result<()> {
+            *self.values.lock().unwrap() = data
+                .chunks(8)
+                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                .collect();
+            Ok(())
+        }
+
         fn apply(&self, _: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
             let f = |i: usize| u64::from_be_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
             let mut v = self.values.lock().unwrap();
@@ -398,6 +520,10 @@ mod tests {
     }
 
     fn cluster() -> (Vec<Arc<Host>>, Vec<Arc<Listing>>, Down) {
+        cluster_with(Compaction::default())
+    }
+
+    fn cluster_with(compaction: Compaction) -> (Vec<Arc<Host>>, Vec<Arc<Listing>>, Down) {
         let hosts: Hosts = Arc::default();
         let down: Down = Arc::default();
         let ids = [1, 2, 3];
@@ -413,7 +539,8 @@ mod tests {
                 down: down.clone(),
             };
             let log = Box::<MemLog>::default();
-            let h = Host::start(id, &ids, log, Box::new(wire), m.clone(), None).unwrap();
+            let h = Host::start_with(id, &ids, log, Box::new(wire), m.clone(), None, compaction)
+                .unwrap();
             hosts.lock().unwrap().insert(id, Arc::downgrade(&h));
             out.push(h);
             machines.push(m);
@@ -475,5 +602,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(*machines[lagging].values.lock().unwrap(), want);
+    }
+
+    // the log is cut behind what was applied, and the cluster goes on
+    #[test]
+    fn the_log_is_cut_behind_what_was_applied() {
+        let (hosts, machines, _) = cluster_with(Compaction { after: 20, keep: 5 });
+        for v in 0..80u64 {
+            put(&hosts[(v % 3) as usize], (v % 3) + 1, v);
+        }
+        for h in &hosts {
+            h.read_barrier(Duration::from_secs(10)).unwrap();
+            assert!(h.status().unwrap().log_start > 20);
+        }
+        let want = machines[0].values.lock().unwrap().clone();
+        assert!((0..80).all(|v| want.contains(&v)));
+        for m in &machines {
+            assert_eq!(*m.values.lock().unwrap(), want);
+        }
+    }
+
+    // a follower away for longer than the log reaches back is brought up
+    // by a snapshot of the leader's state
+    #[test]
+    fn a_follower_too_far_behind_gets_a_snapshot() {
+        let (hosts, machines, down) = cluster_with(Compaction { after: 20, keep: 5 });
+        put(&hosts[0], 1, 0);
+        let leader = hosts[0].status().unwrap().leader.unwrap();
+        let away = (leader % 3) as usize; // a follower
+        down.lock().unwrap().insert(away as NodeId + 1);
+        let up: Vec<usize> = (0..3).filter(|i| *i != away).collect();
+        for v in 1..100u64 {
+            let i = up[(v % 2) as usize];
+            put(&hosts[i], i as NodeId + 1, v);
+        }
+        assert!(hosts[up[0]].status().unwrap().log_start > 10);
+        down.lock().unwrap().clear();
+        hosts[up[0]].read_barrier(Duration::from_secs(10)).unwrap();
+        let want = machines[up[0]].values.lock().unwrap().clone();
+        for _ in 0..100 {
+            if *machines[away].values.lock().unwrap() == want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(*machines[away].values.lock().unwrap(), want);
+        // and it goes on from there
+        put(&hosts[away], away as NodeId + 1, 1000);
+        hosts[up[0]].read_barrier(Duration::from_secs(10)).unwrap();
+        assert_eq!(machines[away].values.lock().unwrap().last(), Some(&1000));
     }
 }

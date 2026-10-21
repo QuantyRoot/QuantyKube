@@ -110,6 +110,32 @@ fn decode_answer(buf: &[u8]) -> Result<Vec<u8>, Status> {
     }
 }
 
+/// The leases kept in the store's metadata. Reading it needs a write
+/// transaction, which commits nothing when nothing changes.
+fn load_leases<B: Backend>(store: &B) -> Result<HashMap<i64, Lease>, store::Error> {
+    let mut leases = HashMap::new();
+    store.write(&mut |tx| {
+        tx.meta_scan(b"lease/", &mut |k, v| {
+            // as etcd after a restart or a leader change: every lease
+            // gets its full TTL again, since keepalives are not stored
+            if let (Ok(id), Some((ttl, _))) = (<[u8; 8]>::try_from(&k[6..]), decode_pair(v)) {
+                leases.insert(
+                    u64::from_be_bytes(id) as i64,
+                    Lease {
+                        ttl,
+                        expires_ms: now_ms() + ttl * 1000,
+                    },
+                );
+            }
+            true
+        })
+    })?;
+    Ok(leases)
+}
+
+/// Set as a watch's `lagged` when the store it watched was replaced.
+const REPLACED: i64 = -1;
+
 /// Applies committed commands to the store it belongs to.
 struct Applier<B: Backend>(Weak<Etcd<B>>);
 
@@ -126,6 +152,32 @@ impl<B: Backend> crate::raft::host::Machine for Applier<B> {
             Ok(())
         });
         index
+    }
+
+    fn snapshot(&self) -> std::io::Result<Vec<u8>> {
+        let etcd = self
+            .0
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("store gone"))?;
+        etcd.store
+            .export()
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    fn restore(&self, index: u64, data: &[u8]) -> std::io::Result<()> {
+        let etcd = self
+            .0
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("store gone"))?;
+        let io = |e: store::Error| std::io::Error::other(e.to_string());
+        etcd.store.import(data).map_err(io)?;
+        etcd.applying.store(index, Ordering::Relaxed);
+        let kept = etcd.write(&mut |_| Ok(()));
+        etcd.applying.store(0, Ordering::Relaxed);
+        kept.map_err(io)?;
+        *etcd.leases.lock().unwrap() = load_leases(etcd.store.as_ref()).map_err(io)?;
+        etcd.hub.reset(etcd.store.head());
+        Ok(())
     }
 
     fn apply(&self, index: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
@@ -233,26 +285,8 @@ fn in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {
 
 impl<B: Backend> Etcd<B> {
     pub fn new(store: Arc<B>, endpoint: String) -> Result<Arc<Self>, store::Error> {
-        let mut leases = HashMap::new();
         store.read(0, &mut |_| Ok(()))?;
-        // leases live in the store's metadata; reading it needs a write
-        // transaction, which commits nothing when nothing changes
-        store.write(&mut |tx| {
-            tx.meta_scan(b"lease/", &mut |k, v| {
-                // as etcd after a restart or a leader change: every lease
-                // gets its full TTL again, since keepalives are not stored
-                if let (Ok(id), Some((ttl, _))) = (<[u8; 8]>::try_from(&k[6..]), decode_pair(v)) {
-                    leases.insert(
-                        u64::from_be_bytes(id) as i64,
-                        Lease {
-                            ttl,
-                            expires_ms: now_ms() + ttl * 1000,
-                        },
-                    );
-                }
-                true
-            })
-        })?;
+        let leases = load_leases(store.as_ref())?;
         let hub = Arc::new(Hub {
             state: Mutex::new(HubState {
                 last_rev: store.head(),
@@ -992,6 +1026,26 @@ impl<B: Backend> WatchStream<'_, B> {
             })
             .collect();
         for (id, from) in behind {
+            if from == REPLACED {
+                // the store under this watch was replaced by a snapshot:
+                // the client has to list again, as after a compaction
+                if let Some(sub) = self.local.remove(&id) {
+                    self.by_hub.remove(&sub.hub_id);
+                }
+                let compacted = self.etcd.store.compacted();
+                let resp = WatchResponse {
+                    header: self.etcd.header(self.etcd.store.head()),
+                    watch_id: id,
+                    canceled: true,
+                    compact_revision: compacted,
+                    cancel_reason: "etcdserver: mvcc: required revision has been compacted".into(),
+                    ..Default::default()
+                };
+                if !self.send(out, resp) {
+                    return false;
+                }
+                continue;
+            }
             let sub = self.local.get_mut(&id).expect("listed above");
             sub.lagged.store(0, Ordering::Release);
             self.by_hub.remove(&sub.hub_id);
@@ -1157,6 +1211,16 @@ impl Hub {
 
     fn remove(&self, id: u64) {
         self.state.lock().unwrap().subs.remove(&id);
+    }
+
+    /// Ends every watch: the store under them was replaced.
+    fn reset(&self, head: i64) {
+        let mut s = self.state.lock().unwrap();
+        for sub in s.subs.values() {
+            sub.lagged.store(REPLACED, Ordering::Release);
+        }
+        s.subs.clear();
+        s.last_rev = head;
     }
 
     fn last_rev(&self) -> i64 {
@@ -1771,6 +1835,12 @@ mod tests {
         ) -> store::Result<Vec<store::HistoryEntry>> {
             self.0.history(start, end)
         }
+        fn export(&self) -> store::Result<Vec<u8>> {
+            self.0.export()
+        }
+        fn import(&self, data: &[u8]) -> store::Result<()> {
+            self.0.import(data)
+        }
     }
 
     // the API server lists, then watches from the list's revision + 1:
@@ -2218,6 +2288,12 @@ mod tests {
 
     /// Three store nodes in one process, joined by Raft.
     fn three() -> (Vec<Arc<Etcd<Quanty<quantydb_core::MemStorage>>>>, Down) {
+        three_with(crate::raft::host::Compaction::default())
+    }
+
+    fn three_with(
+        compaction: crate::raft::host::Compaction,
+    ) -> (Vec<Arc<Etcd<Quanty<quantydb_core::MemStorage>>>>, Down) {
         let hosts: Hosts = Arc::default();
         let down: Down = Arc::default();
         let ids = [1, 2, 3];
@@ -2229,7 +2305,9 @@ mod tests {
                 e.join(*id, |machine| {
                     let wire = Box::new(Loopback(hosts2, down2));
                     let log = Box::<crate::raft::host::MemLog>::default();
-                    crate::raft::host::Host::start(*id, &ids, log, wire, machine, None)
+                    crate::raft::host::Host::start_with(
+                        *id, &ids, log, wire, machine, None, compaction,
+                    )
                 })
                 .unwrap();
                 let host = e.cluster.get().unwrap().host.clone();
@@ -2324,5 +2402,72 @@ mod tests {
         }
         assert!(done, "no write without the leader");
         assert!(get(rest[1], "/c/after").is_some());
+    }
+
+    // a store node away for longer than the leader's log reaches back
+    // takes the leader's state, and from then on has the same revisions
+    #[test]
+    fn a_store_node_far_behind_takes_a_snapshot() {
+        let (nodes, down) = three_with(crate::raft::host::Compaction { after: 20, keep: 5 });
+        put(&nodes[0], "/s/first", "v", 0);
+        let status: StatusResponse = call(
+            &nodes[0],
+            "/etcdserverpb.Maintenance/Status",
+            StatusRequest {},
+        );
+        let leader = status.leader - MEMBER_ID;
+        let away = nodes
+            .iter()
+            .position(|e| e.cluster.get().unwrap().id != leader)
+            .unwrap();
+        down.lock().unwrap().push(away as u64 + 1);
+        let up: Vec<usize> = (0..3).filter(|i| *i != away).collect();
+        let grant: LeaseGrantResponse = call(
+            &nodes[up[0]],
+            "/etcdserverpb.Lease/LeaseGrant",
+            LeaseGrantRequest { id: 0, ttl: 600 },
+        );
+        for i in 0..60 {
+            put(
+                &nodes[up[i % 2]],
+                &format!("/s/{i:02}"),
+                "v",
+                if i == 7 { grant.id } else { 0 },
+            );
+        }
+        down.lock().unwrap().clear();
+        let serial = |e: &Etcd<_>, k: &str| -> Option<KeyValue> {
+            let r: RangeResponse = call(
+                e,
+                "/etcdserverpb.KV/Range",
+                RangeRequest {
+                    key: k.into(),
+                    serializable: true,
+                    ..Default::default()
+                },
+            );
+            r.kvs.into_iter().next()
+        };
+        for _ in 0..100 {
+            if serial(&nodes[away], "/s/59").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for k in ["/s/first", "/s/07", "/s/59"] {
+            assert_eq!(serial(&nodes[away], k), serial(&nodes[up[0]], k), "{k}");
+        }
+        // the leases come with the state, just after it
+        for _ in 0..50 {
+            if nodes[away].leases.lock().unwrap().contains_key(&grant.id) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(nodes[away].leases.lock().unwrap().contains_key(&grant.id));
+        put(&nodes[away], "/s/after", "v", 0);
+        let a = get(&nodes[away], "/s/after").unwrap();
+        let b = get(&nodes[up[1]], "/s/after").unwrap();
+        assert_eq!(a.mod_revision, b.mod_revision);
     }
 }

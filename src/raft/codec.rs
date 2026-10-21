@@ -98,10 +98,11 @@ pub fn encode(m: &Message) -> Vec<u8> {
             put_uint(&mut out, 4, READ_CHECK_REPLY);
             put_uint(&mut out, 21, *seq);
         }
-        Body::Snapshot { index, term } => {
+        Body::Snapshot { index, term, data } => {
             put_uint(&mut out, 4, SNAPSHOT);
             put_uint(&mut out, 18, *index);
             put_uint(&mut out, 12, *term);
+            put_bytes(&mut out, 22, data);
         }
         Body::Propose { data } => {
             put_uint(&mut out, 4, PROPOSE);
@@ -162,6 +163,7 @@ pub fn decode(buf: &[u8]) -> Result<Message, DecodeError> {
         SNAPSHOT => Body::Snapshot {
             index,
             term: last_term,
+            data: std::mem::take(&mut data),
         },
         PROPOSE => Body::Propose { data },
         _ => return Err(DecodeError::Truncated),
@@ -219,7 +221,11 @@ mod tests {
             Body::ReadIndexReply { req: 5, index: 40 },
             Body::ReadCheck { seq: 3 },
             Body::ReadCheckReply { seq: 3 },
-            Body::Snapshot { index: 99, term: 8 },
+            Body::Snapshot {
+                index: 99,
+                term: 8,
+                data: b"state".to_vec(),
+            },
             Body::Propose {
                 data: b"put".to_vec(),
             },

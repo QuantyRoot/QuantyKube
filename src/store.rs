@@ -140,6 +140,13 @@ pub trait Backend: Send + Sync + 'static {
     /// Every retained change to keys in `[start, end)`, oldest first;
     /// `end` None means the single key `start`.
     fn history(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<HistoryEntry>>;
+    /// The live keys and the metadata as of the head, without history:
+    /// what a store node that fell too far behind takes from its leader.
+    fn export(&self) -> Result<Vec<u8>>;
+    /// Replaces everything with what `export` gave. History before it is
+    /// gone on this node, and reads before its head are refused as
+    /// compacted.
+    fn import(&self, data: &[u8]) -> Result<()>;
 }
 
 const LIVE: u8 = b'k';
@@ -1040,6 +1047,91 @@ impl<S: Storage + 'static> Backend for Quanty<S> {
         ))
     }
 
+    fn export(&self) -> Result<Vec<u8>> {
+        let mut g = self.lock_batch();
+        while g.committing || g.tx.is_some() {
+            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let snap = db.snapshot();
+        let mut out = Vec::new();
+        put_varint(&mut out, self.head() as u64);
+        put_varint(&mut out, self.compacted() as u64);
+        let commits = prefixed(META, COMMITS);
+        let retained = prefixed(META, RETAINED_FROM);
+        for p in [LIVE, META] {
+            for item in snap.scan(Some(&[p]), Some(&[p + 1]))? {
+                let (k, v) = item?;
+                // where history and snapshots are kept is this node's own
+                if k.starts_with(&commits) || k == retained {
+                    continue;
+                }
+                put_varint(&mut out, k.len() as u64);
+                out.extend_from_slice(&k);
+                put_varint(&mut out, v.len() as u64);
+                out.extend_from_slice(&v);
+            }
+        }
+        drop(g);
+        Ok(out)
+    }
+
+    fn import(&self, data: &[u8]) -> Result<()> {
+        let mut b = data;
+        let head = take_varint(&mut b)? as i64;
+        let compacted = take_varint(&mut b)? as i64;
+        let mut pairs = Vec::new();
+        while !b.is_empty() {
+            let n = take_varint(&mut b)? as usize;
+            let k = b.get(..n).ok_or(Error::Corrupt("import"))?.to_vec();
+            b = &b[n..];
+            let n = take_varint(&mut b)? as usize;
+            let v = b.get(..n).ok_or(Error::Corrupt("import"))?.to_vec();
+            b = &b[n..];
+            if !matches!(k.first(), Some(&LIVE) | Some(&META)) {
+                return Err(Error::Corrupt("import"));
+            }
+            pairs.push((k, v));
+        }
+        let mut g = self.lock_batch();
+        while g.committing || g.tx.is_some() {
+            g = self.done.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        let at = now_ms();
+        let db = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let mut tx = db.begin();
+        for p in [LIVE, LOG, META] {
+            let old: Vec<Vec<u8>> = tx
+                .scan(Some(&[p]), Some(&[p + 1]))?
+                .map(|r| r.map(|(k, _)| k))
+                .collect::<std::result::Result<_, _>>()?;
+            for k in old {
+                tx.delete(&k)?;
+            }
+        }
+        for (k, v) in &pairs {
+            tx.put(k, v)?;
+        }
+        // nothing before the head can be read here any more
+        let floor = compacted.max(head);
+        tx.put(&prefixed(META, COMPACTED), &varint(floor))?;
+        tx.put(&prefixed(META, RETAINED_FROM), &varint(head))?;
+        let id = tx.pending_commit_id();
+        tx.put(&commit_key(id), &commit_value(head, at))?;
+        let id = tx.commit()?;
+        drop(db);
+        *self.commits.write().unwrap_or_else(|e| e.into_inner()) = vec![CommitEntry {
+            last_rev: head,
+            id,
+            unix_ms: at,
+        }];
+        self.head.store(head, Ordering::Release);
+        self.compacted.store(floor, Ordering::Release);
+        self.retained_from.store(head, Ordering::Release);
+        g.next_rev = head + 1;
+        Ok(())
+    }
+
     fn compact(&self, rev: i64) -> Result<()> {
         if rev <= self.compacted() {
             return Ok(());
@@ -1396,5 +1488,28 @@ mod tests {
         assert_eq!(seen.as_deref(), Some(&b"new"[..]), "read inside the batch");
         assert!(read.is_err(), "told about a write that was lost");
         assert!(writer.join().unwrap().is_err());
+    }
+
+    // a node that fell behind takes the leader's state: the same keys at
+    // the same revisions, and from there on the same revisions too
+    #[test]
+    fn a_store_taken_from_another_continues_like_it() {
+        let a = Quanty::in_memory().unwrap();
+        for i in 0..5 {
+            put(&a, format!("/k/{i}").as_bytes(), b"v");
+        }
+        a.write(&mut |tx| tx.delete(b"/k/1").map(|_| ())).unwrap();
+        let b = Quanty::in_memory().unwrap();
+        put(&b, b"/old", b"gone after the import");
+        b.import(&a.export().unwrap()).unwrap();
+        assert_eq!(b.head(), a.head());
+        for k in ["/k/0", "/k/1", "/k/4", "/old"] {
+            assert_eq!(get(&b, 0, k.as_bytes()), get(&a, 0, k.as_bytes()), "{k}");
+        }
+        assert_eq!(put(&b, b"/next", b"v"), put(&a, b"/next", b"v"));
+        assert!(matches!(
+            b.read(a.head() - 2, &mut |_| Ok(())),
+            Err(Error::Compacted(_))
+        ));
     }
 }
