@@ -136,6 +136,14 @@ if "$ETCDCTL" --endpoints="https://127.0.0.1:$tls_port" --cacert "$pki/ca.pem" \
     --dial-timeout=2s --command-timeout=3s get /tls >/dev/null 2>&1; then
     echo "FAIL: a client without a certificate was answered"; exit 1
 fi
+# what kubeadm and monitoring ask of etcd's port over HTTP/1.1
+h() {
+    curl -s --http1.1 --cacert "$pki/ca.pem" --cert "$pki/client.pem" \
+        --key "$pki/client.key" "https://127.0.0.1:$tls_port$1"
+}
+expect "{\"etcdserver\":\"3.6.5\",\"etcdcluster\":\"3.6.5\"}" h /version
+expect '{"health":"true","reason":""}' h /health
+expect "404 page not found" h /metrics
 echo "etcdctl over TLS: ok"
 
 if [ -n "${KUBE_APISERVER:-}" ]; then

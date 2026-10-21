@@ -51,6 +51,11 @@ impl TlsSocket {
         Ok(s)
     }
 
+    /// The application protocol the handshake settled on.
+    pub fn alpn(&self) -> Option<Vec<u8>> {
+        self.lock().alpn_protocol().map(<[u8]>::to_vec)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ServerConnection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -166,22 +171,73 @@ pub fn server_config(cert: &Path, key: &Path, client_ca: &Path) -> Result<Server
     Ok(config)
 }
 
-/// Accepts TLS connections forever on `listener`, one thread each.
+/// Accepts TLS connections forever on `listener`, one thread each. A
+/// client that asks for HTTP/1.1 gets what etcd serves on the same port
+/// besides gRPC: `/version`, which kubeadm checks before it uses an
+/// external etcd, and `/health`.
 pub fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
     server: Arc<Server>,
+    service: Arc<dyn Service>,
 ) -> io::Result<()> {
     for tcp in listener.incoming() {
         let Ok(tcp) = tcp else { continue };
-        let (config, server) = (config.clone(), server.clone());
+        let (config, server, service) = (config.clone(), server.clone(), service.clone());
         std::thread::spawn(move || {
-            if let Ok(socket) = TlsSocket::accept(tcp, config) {
+            let Ok(socket) = TlsSocket::accept(tcp, config) else {
+                return;
+            };
+            if socket.alpn().as_deref() == Some(b"http/1.1") {
+                serve_http(socket, service.as_ref());
+            } else {
                 server.serve_connection(socket);
             }
         });
     }
     Ok(())
+}
+
+fn serve_http(socket: TlsSocket, service: &dyn Service) {
+    use crate::aggapi::{read_request, reply};
+    let Ok(mut w) = socket.try_clone() else {
+        return;
+    };
+    let mut r = io::BufReader::new(socket);
+    while let Ok(Some(req)) = read_request(&mut r) {
+        let (code, body) = match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/version") => (
+                200,
+                format!(
+                    "{{\"etcdserver\":\"{v}\",\"etcdcluster\":\"{v}\"}}",
+                    v = crate::etcd::ETCD_VERSION
+                ),
+            ),
+            // as etcd: healthy when a linearizable read is answered
+            ("GET", "/health") => {
+                let read = crate::etcdpb::RangeRequest {
+                    key: b"health".to_vec(),
+                    ..Default::default()
+                };
+                match service.unary(
+                    "/etcdserverpb.KV/Range",
+                    &crate::etcdpb::Message::encode(&read),
+                ) {
+                    Ok(_) => (200, r#"{"health":"true","reason":""}"#.to_string()),
+                    Err(_) => (503, r#"{"health":"false","reason":"no answer"}"#.into()),
+                }
+            }
+            _ => (404, "404 page not found\n".into()),
+        };
+        let ctype = if code == 404 {
+            "text/plain"
+        } else {
+            "application/json"
+        };
+        if reply(&mut w, code, ctype, body.as_bytes()).is_err() || req.close {
+            return;
+        }
+    }
 }
 
 /// The gRPC server both listeners share, so its limits hold across them.

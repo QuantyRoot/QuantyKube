@@ -376,18 +376,19 @@ fn serve(args: &[String]) -> Result<(), String> {
         std::thread::spawn(move || quantykube::aggapi::serve(tcp, Arc::new(config), service));
         eprintln!("quantykube: the history API on https://{addr}");
     }
-    let server = quantykube::tlsnet::grpc_server(etcd);
+    let server = quantykube::tlsnet::grpc_server(etcd.clone());
     let Some(addr) = value(args, "--listen") else {
         eprintln!("quantykube: serving {} on {endpoint}", data.display());
         return server.serve_unix(listener).map_err(|e| e.to_string());
     };
     // over a network only clients with a certificate from --client-ca
     // get in (ADR-031)
-    let config = quantykube::tlsnet::server_config(
+    let mut config = quantykube::tlsnet::server_config(
         Path::new(required(args, "--cert")?),
         Path::new(required(args, "--key")?),
         Path::new(required(args, "--client-ca")?),
     )?;
+    config.set_alpn(&[b"h2", b"http/1.1"]);
     let tcp = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
     let unix = server.clone();
     std::thread::spawn(move || unix.serve_unix(listener));
@@ -396,7 +397,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         data.display(),
         tcp.local_addr().map_err(|e| e.to_string())?
     );
-    quantykube::tlsnet::serve(tcp, Arc::new(config), server).map_err(|e| e.to_string())
+    quantykube::tlsnet::serve(tcp, Arc::new(config), server, etcd).map_err(|e| e.to_string())
 }
 
 /// Makes this store one node of the cluster named by --peers (ADR-034),

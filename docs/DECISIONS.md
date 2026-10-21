@@ -912,6 +912,12 @@ only one for 17 November; k3s follows.
 **The cost:** kubeadm needs more memory and more steps than k3s, and CI
 gets a kubeadm cluster as an additional job.
 
+*Added on 21 October:* the CI job (`scripts/kubeadm.sh`) runs
+`kubeadm init` with QuantyKube as an external etcd, on the certificates
+kubeadm makes for a local one. kubeadm asks an external etcd for
+`/version` over HTTP/1.1 before it uses it, as monitoring asks for
+`/health`, so the store's TLS port answers both besides gRPC (ADR-031).
+
 ## ADR-030: A failed commit stops the store
 
 When a commit fails, from a full disk or an I/O error, the store
@@ -972,6 +978,11 @@ anyone who did not write it (QuantyCore ADR-003), and it is now the
 lock on the whole cluster's data whenever the store is reached over a
 network. Until the review, a store reachable over a network should
 also be fenced in by the network itself.
+
+*Added on 21 October:* a client that offers only HTTP/1.1 in the
+handshake gets `/version` and `/health` as etcd answers them; gRPC
+clients offer h2 and get gRPC. Nothing else is served over HTTP/1.1,
+and the client certificate is required the same way.
 
 ## ADR-032: Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 

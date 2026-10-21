@@ -25,16 +25,16 @@ pub const VERSION: &str = "v1alpha1";
 const MAX_HEAD: usize = 64 << 10;
 const MAX_BODY: usize = 1 << 20;
 
-struct Request {
-    method: String,
-    path: String,
-    query: String,
-    body: Vec<u8>,
-    user: Option<String>,
-    close: bool,
+pub(crate) struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub body: Vec<u8>,
+    pub user: Option<String>,
+    pub close: bool,
 }
 
-fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
+pub(crate) fn read_request(r: &mut impl BufRead) -> io::Result<Option<Request>> {
     let mut head = Vec::new();
     loop {
         let mut line = Vec::new();
@@ -140,7 +140,7 @@ fn read_chunked(r: &mut impl BufRead) -> io::Result<Vec<u8>> {
     }
 }
 
-fn reply(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
+pub(crate) fn reply(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
     let reason = match code {
         200 => "OK",
         201 => "Created",
@@ -148,6 +148,7 @@ fn reply(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> io::Result<
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let head = format!(
