@@ -131,9 +131,11 @@ if [ "$mode" = move ]; then
         kubectl create configmap "before-$i" --from-literal=v="$i" >/dev/null
     done
     objects() {
+        local cols=K:.kind,NS:.metadata.namespace,N:.metadata.name
+        cols+=,RV:.metadata.resourceVersion
         kubectl get configmaps,deployments,services,namespaces -A \
-            -o custom-columns=N:.metadata.name,RV:.metadata.resourceVersion \
-            --no-headers | grep -v '^kube-root-ca' | sort
+            -o custom-columns="$cols" \
+            --no-headers | awk '{print $1 "/" $2 "/" $3, $4}' | sort
     }
     objects >"$work/before"
     "$QK" install store >"$work/install.log" 2>&1 ||
