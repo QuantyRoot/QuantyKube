@@ -272,6 +272,29 @@ pub fn import_of(copy: &crate::etcdclient::Copy) -> Result<Vec<u8>, store::Error
     store::export_of(copy.revision, &copy.records, &meta)
 }
 
+/// The store's live keys and the leases they hold, as of its head, in
+/// the form a copy of an etcd has.
+pub fn copy_of<B: Backend>(store: &B) -> Result<crate::etcdclient::Copy, store::Error> {
+    let mut records = Vec::new();
+    let revision = store.read(0, &mut |v| {
+        v.scan(b"", None, &mut |r| {
+            records.push(r);
+            true
+        })
+    })?;
+    let ttls = load_leases(store)?;
+    let leases = records
+        .iter()
+        .filter(|r| r.lease != 0)
+        .map(|r| (r.lease, ttls.get(&r.lease).map_or(1, |l| l.ttl)))
+        .collect();
+    Ok(crate::etcdclient::Copy {
+        revision,
+        records,
+        leases,
+    })
+}
+
 fn lease_index(id: i64, key: &[u8]) -> Vec<u8> {
     let mut k = b"lkey/".to_vec();
     k.extend_from_slice(&(id as u64).to_be_bytes());

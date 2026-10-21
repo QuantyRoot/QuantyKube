@@ -317,15 +317,13 @@ fn copy_back(l: &Layout, original: &str, at: &str) -> Result<(), String> {
     let (true, Some(recorded)) = (ran, recorded) else {
         return Ok(());
     };
-    let store = crate::etcdclient::Client::new(
-        &format!("127.0.0.1:{}", l.port),
-        &l.pki("etcd/ca.crt"),
-        &l.pki("apiserver-etcd-client.crt"),
-        &l.pki("apiserver-etcd-client.key"),
-    )?;
-    let copy = store
-        .copy()
-        .map_err(|s| format!("reading the store: {}", s.message))?;
+    // read from the file, with the store stopped: nothing writes to it
+    // now, and a large answer over gRPC is what C1 of the review is about
+    systemctl(&["stop", "quantykube-store.service"])?;
+    let copy = {
+        let store = crate::store::Quanty::open(&l.data()).map_err(|e| e.to_string())?;
+        crate::etcd::copy_of(&store).map_err(|e| format!("reading the store: {e}"))?
+    };
     if copy.revision == recorded {
         return Ok(());
     }
@@ -374,6 +372,7 @@ pub fn undo(l: &Layout) -> Result<(), String> {
     wait("the API server stopping", 120, stopped)?;
     if let Err(e) = copy_back(l, &original, &at) {
         // nothing is lost: the API server goes back to the store
+        let _ = systemctl(&["start", "quantykube-store.service"]);
         if let Some(c) = current {
             fs::write(&parked, c).map_err(err(parked.display()))?;
             fs::rename(&parked, l.manifest()).map_err(err(l.manifest().display()))?;
