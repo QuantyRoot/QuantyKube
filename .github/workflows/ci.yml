@@ -169,7 +169,13 @@ jobs:
           sudo env K3S=$t/k3s IMAGE=$t/busybox CNI_BIN=$t/cni scripts/cluster.sh
 
   kubeadm:
-    name: kubeadm with the QuantyKube store as its etcd
+    # external: the store is kubeadm's etcd from the start; move: kubeadm
+    # on its own etcd, moved onto the store and back
+    name: kubeadm and the store (${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [external, move]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -227,7 +233,7 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable kubelet
       - run: cargo build --release
-      - run: sudo scripts/kubeadm.sh
+      - run: sudo scripts/kubeadm.sh ${{ matrix.mode }}
 
   raft:
     name: Raft in the simulator, 5000 seeds per cluster size

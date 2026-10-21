@@ -22,6 +22,8 @@ const USAGE: &str = "usage:
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube migrate --from <host:port> --etcd-ca <pem> --etcd-cert <pem>
                      --etcd-key <pem> --data <file>
+  quantykube install store [--port <n>] [--kubernetes <dir>] [--state <dir>]
+  quantykube undo store    [--kubernetes <dir>] [--state <dir>]
   quantykube unpack  --to <dir> <layer.tar.gz>...
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
@@ -61,6 +63,14 @@ resourceVersion a client holds stays valid and new writes go on after
 them (ADR-035). Nothing may write to the etcd
 meanwhile; the API server is stopped first.
 
+install store, run as root on a kubeadm control plane node, moves its
+API server from etcd onto a QuantyKube store on 127.0.0.1, port 2479 by
+default, run by systemd: it stops the API server, migrates, starts the
+store and the API server on it, and goes back on any failure. undo
+store puts the API server back on etcd, which install never changes.
+--kubernetes is /etc/kubernetes and --state /var/lib/quantykube unless
+given; the journal of each step is in <state>/install.
+
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
 layers in order, whiteouts included; sandbox runs one command in its own
@@ -94,6 +104,12 @@ fn main() {
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("migrate") => migrate(&args[1..]),
+        Some("install") if args.get(1).map(String::as_str) == Some("store") => {
+            install(&args[2..], false)
+        }
+        Some("undo") if args.get(1).map(String::as_str) == Some("store") => {
+            install(&args[2..], true)
+        }
         Some("sandbox") => sandbox(&args[1..]),
         Some("unpack") => unpack(&args[1..]),
         Some("runtime") => runtime(&args[1..]),
@@ -336,6 +352,30 @@ fn open(data: &Path) -> Result<Quanty<FileStorage>, store::Error> {
             r => return r,
         }
     }
+}
+
+fn install(args: &[String], undo: bool) -> Result<(), String> {
+    let binary = PathBuf::from("/usr/local/bin/quantykube");
+    let layout = quantykube::install::Layout {
+        kubernetes: PathBuf::from(value(args, "--kubernetes").unwrap_or("/etc/kubernetes")),
+        state: PathBuf::from(value(args, "--state").unwrap_or("/var/lib/quantykube")),
+        port: value(args, "--port")
+            .unwrap_or("2479")
+            .parse()
+            .map_err(|_| "--port is not a port number")?,
+        binary: binary.clone(),
+    };
+    if undo {
+        return quantykube::install::undo(&layout);
+    }
+    // the store outlives the command that installed it
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    if std::fs::canonicalize(&me).ok() != std::fs::canonicalize(&binary).ok() {
+        let tmp = binary.with_extension("new");
+        std::fs::copy(&me, &tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &binary).map_err(|e| format!("{}: {e}", binary.display()))?;
+    }
+    quantykube::install::install(&layout)
 }
 
 fn migrate(args: &[String]) -> Result<(), String> {

@@ -1174,3 +1174,18 @@ to list again, as after any restart of the API server, since its watch
 cache starts anew. History in QuantyKube begins at the move. Writes
 made after the move are not in etcd, so going back after a while
 needs them copied back, which is not built yet.
+
+*How a node is moved:* `quantykube install store`, as root on a
+kubeadm control plane node, does it from files alone. It keeps the API
+server's manifest in a journal under `/var/lib/quantykube/install`,
+moves the manifest out of the kubelet's directory and waits until no
+kube-apiserver process is left, migrates from the etcd the manifest
+names, with the API server's own etcd client certificate, starts the
+store as the systemd unit `quantykube-store` on 127.0.0.1:2479 with the
+certificates kubeadm made for etcd, and puts the manifest back with only
+`--etcd-servers` changed. It writes each step to the journal before it
+takes it, and on any failure after the API server was stopped it puts
+it back on etcd. `quantykube undo store` does that from the journal
+alone, without the API server, and keeps the store's file under a new
+name. The `kubectl apply` of ADR-009 is to run this command on the
+node; the command is what CI tests (`scripts/kubeadm.sh move`).

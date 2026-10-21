@@ -9,6 +9,7 @@ use quantycore::grpc::Status;
 use quantycore::tls::x509::{pem, PrivateKey, RootStore};
 use quantycore::tls::{ClientConfig, ClientConnection, Stream};
 use std::collections::BTreeMap;
+use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ const PAGE: i64 = 500;
 
 pub struct Client {
     addr: String,
-    host: String,
     config: Arc<ClientConfig>,
 }
 
@@ -31,62 +31,75 @@ pub struct Copy {
     pub leases: BTreeMap<i64, i64>,
 }
 
+/// A TLS client configuration that trusts `ca` and, with `cert` and `key`,
+/// shows that certificate.
+pub fn client_config(
+    ca: &Path,
+    cert: Option<(&Path, &Path)>,
+    alpn: &[&[u8]],
+) -> Result<ClientConfig, String> {
+    let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
+    let mut roots = RootStore::new();
+    let (ok, _) = roots
+        .add_pem(&read(ca)?)
+        .map_err(|e| format!("{}: {e:?}", ca.display()))?;
+    if ok == 0 {
+        return Err(format!("{}: no CA certificate", ca.display()));
+    }
+    let mut config = ClientConfig::new(roots);
+    if let Some((cert, key)) = cert {
+        let chain = pem::decode_all(&read(cert)?, "CERTIFICATE")
+            .map_err(|e| format!("{}: {e}", cert.display()))?;
+        let key =
+            PrivateKey::from_pem(&read(key)?).map_err(|e| format!("{}: {e}", key.display()))?;
+        config.set_client_certificate(chain, key);
+    }
+    config.set_alpn(alpn);
+    Ok(config)
+}
+
+/// A TLS connection to `addr`, `host:port`, whose certificate must name
+/// the host.
+pub fn connect(
+    addr: &str,
+    config: &Arc<ClientConfig>,
+) -> io::Result<Stream<ClientConnection, TcpStream>> {
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
+    let mut tcp = None;
+    for sock in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sock, Duration::from_secs(5)) {
+            Ok(t) => {
+                tcp = Some(t);
+                break;
+            }
+            Err(e) => last = e,
+        }
+    }
+    let tcp = tcp.ok_or(last)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+    let conn = ClientConnection::new(config.clone(), host)
+        .map_err(|e| io::Error::other(format!("{e:?}")))?;
+    let mut stream = Stream::new(conn, tcp);
+    stream.handshake()?;
+    Ok(stream)
+}
+
 impl Client {
     /// `addr` is `host:port`; the server's certificate must name `host`
     /// and come from `ca`, and `cert` and `key` are what etcd's
     /// `--trusted-ca-file` accepts, as the API server's are.
     pub fn new(addr: &str, ca: &Path, cert: &Path, key: &Path) -> Result<Client, String> {
-        let read =
-            |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()));
-        let mut roots = RootStore::new();
-        let (ok, _) = roots
-            .add_pem(&read(ca)?)
-            .map_err(|e| format!("{}: {e:?}", ca.display()))?;
-        if ok == 0 {
-            return Err(format!("{}: no CA certificate", ca.display()));
-        }
-        let chain = pem::decode_all(&read(cert)?, "CERTIFICATE")
-            .map_err(|e| format!("{}: {e}", cert.display()))?;
-        let key =
-            PrivateKey::from_pem(&read(key)?).map_err(|e| format!("{}: {e}", key.display()))?;
-        let mut config = ClientConfig::new(roots);
-        config.set_client_certificate(chain, key);
-        config.set_alpn(&[b"h2"]);
-        let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
         Ok(Client {
             addr: addr.to_string(),
-            host: host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string(),
-            config: Arc::new(config),
+            config: Arc::new(client_config(ca, Some((cert, key)), &[b"h2"])?),
         })
     }
 
     fn call<Q: Message, R: Message>(&self, method: &str, req: &Q) -> Result<R, Status> {
-        let unavailable = |e: String| Status::new(14, format!("{}: {e}", self.addr));
-        let mut last = "no address".to_string();
-        let mut tcp = None;
-        for sock in self
-            .addr
-            .to_socket_addrs()
-            .map_err(|e| unavailable(e.to_string()))?
-        {
-            match TcpStream::connect_timeout(&sock, Duration::from_secs(5)) {
-                Ok(t) => {
-                    tcp = Some(t);
-                    break;
-                }
-                Err(e) => last = e.to_string(),
-            }
-        }
-        let tcp = tcp.ok_or_else(|| unavailable(last))?;
-        tcp.set_read_timeout(Some(Duration::from_secs(60)))
-            .map_err(|e| unavailable(e.to_string()))?;
-        let conn = ClientConnection::new(self.config.clone(), &self.host)
-            .map_err(|e| unavailable(format!("{e:?}")))?;
-        let mut stream = Stream::new(conn, tcp);
-        stream.handshake().map_err(|e| unavailable(e.to_string()))?;
+        let stream = connect(&self.addr, &self.config)
+            .map_err(|e| Status::new(14, format!("{}: {e}", self.addr)))?;
         let body = quantycore::grpc::call(stream, method, &req.encode())?;
         R::decode(&body).map_err(|e| Status::new(13, format!("{method}: {e:?}")))
     }
