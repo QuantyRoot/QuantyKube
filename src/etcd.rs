@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What `Status` reports. The API server only uses watch progress requests
@@ -35,6 +35,99 @@ pub struct Etcd<B: Backend> {
     /// EVENTS_PER_RESPONSE and INBOX, shortened by tests.
     events_per_response: AtomicUsize,
     inbox: AtomicUsize,
+    /// Set when this store is one node of several (ADR-034).
+    cluster: OnceLock<Cluster>,
+}
+
+struct Cluster {
+    id: u64,
+    host: Arc<crate::raft::host::Host>,
+    lease_seq: AtomicU64,
+    leading: std::sync::atomic::AtomicBool,
+}
+
+/// How long a write or a linearizable read waits for the cluster.
+const CLUSTER_WAIT: Duration = Duration::from_secs(5);
+
+/// The methods that change the store go through the Raft log; every
+/// node applies them in the same order and gets the same answer.
+fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "/etcdserverpb.KV/Put"
+            | "/etcdserverpb.KV/DeleteRange"
+            | "/etcdserverpb.KV/Txn"
+            | "/etcdserverpb.KV/Compact"
+            | "/etcdserverpb.Lease/LeaseGrant"
+            | "/etcdserverpb.Lease/LeaseRevoke"
+            | "/quantykube.History/Restore"
+    )
+}
+
+fn encode_command(origin: u64, req: u64, method: &str, body: &[u8], unix_ms: i64) -> Vec<u8> {
+    use quantycore::proto::{put_bytes, put_int, put_uint};
+    let mut out = Vec::new();
+    put_uint(&mut out, 1, origin);
+    put_uint(&mut out, 2, req);
+    put_bytes(&mut out, 3, method.as_bytes());
+    put_bytes(&mut out, 4, body);
+    put_int(&mut out, 5, unix_ms);
+    out
+}
+
+fn encode_answer(r: &Result<Vec<u8>, Status>) -> Vec<u8> {
+    use quantycore::proto::{put_bytes, put_message, put_uint};
+    let mut out = Vec::new();
+    match r {
+        Ok(body) => put_message(&mut out, 1, body),
+        Err(s) => {
+            put_uint(&mut out, 2, u64::from(s.code));
+            put_bytes(&mut out, 3, s.message.as_bytes());
+        }
+    }
+    out
+}
+
+fn decode_answer(buf: &[u8]) -> Result<Vec<u8>, Status> {
+    let (mut body, mut code, mut message) = (None, 0, String::new());
+    let mut r = quantycore::proto::Reader::new(buf);
+    while let Some((n, v)) = r.next_field().map_err(bad_request)? {
+        match n {
+            1 => body = Some(v.bytes(n).map_err(bad_request)?.to_vec()),
+            2 => code = v.uint(n).map_err(bad_request)? as u32,
+            3 => message = String::from_utf8_lossy(v.bytes(n).map_err(bad_request)?).into(),
+            _ => {}
+        }
+    }
+    match body {
+        Some(b) if code == 0 => Ok(b),
+        _ => Err(Status::new(code, message)),
+    }
+}
+
+/// Applies committed commands to the store it belongs to.
+struct Applier<B: Backend>(Weak<Etcd<B>>);
+
+impl<B: Backend> crate::raft::host::Machine for Applier<B> {
+    fn apply(&self, data: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let etcd = self.0.upgrade()?;
+        let (mut origin, mut req, mut method, mut body, mut unix_ms) =
+            (0, 0, String::new(), Vec::new(), 0);
+        let mut r = quantycore::proto::Reader::new(data);
+        while let Ok(Some((n, v))) = r.next_field() {
+            match n {
+                1 => origin = v.uint(n).unwrap_or(0),
+                2 => req = v.uint(n).unwrap_or(0),
+                3 => method = String::from_utf8_lossy(v.bytes(n).unwrap_or_default()).into(),
+                4 => body = v.bytes(n).unwrap_or_default().to_vec(),
+                5 => unix_ms = v.int(n).unwrap_or(0),
+                _ => {}
+            }
+        }
+        let answer = etcd.serve(&method, &body, unix_ms);
+        let mine = etcd.cluster.get().is_some_and(|c| c.id == origin);
+        mine.then(|| (req, encode_answer(&answer)))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +245,7 @@ impl<B: Backend> Etcd<B> {
             progress_ms: AtomicU64::new(PROGRESS_EVERY.as_millis() as u64),
             events_per_response: AtomicUsize::new(EVENTS_PER_RESPONSE),
             inbox: AtomicUsize::new(INBOX),
+            cluster: OnceLock::new(),
         });
         let weak = Arc::downgrade(&etcd);
         std::thread::spawn(move || {
@@ -164,10 +258,14 @@ impl<B: Backend> Etcd<B> {
         Ok(etcd)
     }
 
+    fn member_id(&self) -> u64 {
+        self.cluster.get().map_or(MEMBER_ID, |c| MEMBER_ID + c.id)
+    }
+
     fn header(&self, rev: i64) -> Option<ResponseHeader> {
         Some(ResponseHeader {
             cluster_id: CLUSTER_ID,
-            member_id: MEMBER_ID,
+            member_id: self.member_id(),
             revision: rev,
             raft_term: 1,
         })
@@ -398,11 +496,11 @@ impl<B: Backend> Etcd<B> {
         Ok(v)
     }
 
-    fn lease_grant(&self, req: &LeaseGrantRequest) -> Result<LeaseGrantResponse, Status> {
+    fn lease_grant(&self, req: &LeaseGrantRequest, now: i64) -> Result<LeaseGrantResponse, Status> {
         let ttl = req.ttl.max(1);
         let lease = Lease {
             ttl,
-            expires_ms: now_ms() + ttl * 1000,
+            expires_ms: now + ttl * 1000,
         };
         // the id is taken before the write, so two grants never share it
         let id = {
@@ -413,7 +511,7 @@ impl<B: Backend> Etcd<B> {
                 }
                 req.id
             } else {
-                let mut id = (now_ms() << 16) & i64::MAX;
+                let mut id = (now << 16) & i64::MAX;
                 while id == 0 || leases.contains_key(&id) {
                     id += 1;
                 }
@@ -476,6 +574,25 @@ impl<B: Backend> Etcd<B> {
 
     fn expire_leases(&self) {
         let now = now_ms();
+        if let Some(c) = self.cluster.get() {
+            // only the leader decides that a lease ran out, and says so
+            // through the log; a new leader first gives every lease its
+            // full TTL again, as etcd does
+            let leading = c
+                .host
+                .status()
+                .is_ok_and(|s| s.role == crate::raft::Role::Leader);
+            if !leading {
+                c.leading.store(false, Ordering::Relaxed);
+                return;
+            }
+            if !c.leading.swap(true, Ordering::Relaxed) {
+                for l in self.leases.lock().unwrap().values_mut() {
+                    l.expires_ms = now + l.ttl * 1000;
+                }
+                return;
+            }
+        }
         let due: Vec<i64> = self
             .leases
             .lock()
@@ -485,7 +602,19 @@ impl<B: Backend> Etcd<B> {
             .map(|(id, _)| *id)
             .collect();
         for id in due {
-            let _ = self.revoke(id);
+            match self.cluster.get() {
+                Some(c) => {
+                    let body = LeaseRevokeRequest { id }.encode();
+                    let method = "/etcdserverpb.Lease/LeaseRevoke";
+                    let _ = c.host.propose(
+                        |r| encode_command(c.id, r, method, &body, now),
+                        CLUSTER_WAIT,
+                    );
+                }
+                None => {
+                    let _ = self.revoke(id);
+                }
+            }
         }
     }
 
@@ -1036,6 +1165,90 @@ impl<B: Backend> Service for Etcd<B> {
     }
 
     fn unary(&self, method: &str, body: &[u8]) -> Result<Vec<u8>, Status> {
+        let Some(c) = self.cluster.get() else {
+            return self.serve(method, body, now_ms());
+        };
+        let timed_out = |_| status(code::UNAVAILABLE, "etcdserver: request timed out");
+        if is_write(method) {
+            let mut body = body.to_vec();
+            if method == "/etcdserverpb.Lease/LeaseGrant" {
+                // the node that takes the request picks the id, so that
+                // every node grants the same lease
+                let mut req = LeaseGrantRequest::decode(&body).map_err(bad_request)?;
+                if req.id == 0 {
+                    let seq = c.lease_seq.fetch_add(1, Ordering::Relaxed) & 0xff;
+                    req.id =
+                        ((now_ms() << 16) | ((c.id as i64 & 0xff) << 8) | seq as i64) & i64::MAX;
+                    body = req.encode();
+                }
+            }
+            let now = now_ms();
+            let answer = c
+                .host
+                .propose(
+                    |r| encode_command(c.id, r, method, &body, now),
+                    CLUSTER_WAIT,
+                )
+                .map_err(timed_out)?;
+            return decode_answer(&answer);
+        }
+        let serializable = method == "/etcdserverpb.KV/Range"
+            && RangeRequest::decode(body).is_ok_and(|r| r.serializable);
+        let local_only = matches!(
+            method,
+            "/etcdserverpb.Maintenance/Status"
+                | "/etcdserverpb.Maintenance/Alarm"
+                | "/etcdserverpb.Cluster/MemberList"
+                | "/grpc.health.v1.Health/Check"
+        );
+        if !serializable && !local_only {
+            c.host.read_barrier(CLUSTER_WAIT).map_err(timed_out)?;
+        }
+        self.serve(method, body, now_ms())
+    }
+
+    fn stream(&self, method: &str, requests: Receiver<Vec<u8>>, mut out: Responder) {
+        match method {
+            "/etcdserverpb.Watch/Watch" => self.watch(requests, &mut out),
+            "/etcdserverpb.Lease/LeaseKeepAlive" => {
+                for r in requests {
+                    let Ok(req) = LeaseKeepAliveRequest::decode(&r) else {
+                        return out
+                            .finish(Status::new(code::INVALID_ARGUMENT, "malformed request"));
+                    };
+                    if !out.send(&self.keep_alive(req.id).encode()) {
+                        return;
+                    }
+                }
+            }
+            _ => out.finish(Status::new(code::UNIMPLEMENTED, "not a streaming method")),
+        }
+    }
+}
+
+impl<B: Backend> Etcd<B> {
+    /// Makes this store node `id` of a cluster whose Raft host is built
+    /// by `start` around the machine that applies its commands here.
+    pub fn join(
+        self: &Arc<Self>,
+        id: u64,
+        start: impl FnOnce(
+            Arc<dyn crate::raft::host::Machine>,
+        ) -> std::io::Result<Arc<crate::raft::host::Host>>,
+    ) -> std::io::Result<()> {
+        let host = start(Arc::new(Applier(Arc::downgrade(self))))?;
+        let _ = self.cluster.set(Cluster {
+            id,
+            host,
+            lease_seq: AtomicU64::new(0),
+            leading: std::sync::atomic::AtomicBool::new(false),
+        });
+        Ok(())
+    }
+
+    /// Answers a request from this node's store alone; in a cluster,
+    /// writes come here only as committed commands.
+    fn serve(&self, method: &str, body: &[u8], unix_ms: i64) -> Result<Vec<u8>, Status> {
         let service = method
             .trim_start_matches('/')
             .split('/')
@@ -1096,7 +1309,7 @@ impl<B: Backend> Service for Etcd<B> {
             }
             ("etcdserverpb.Lease", "LeaseGrant") => {
                 let req = LeaseGrantRequest::decode(body).map_err(bad_request)?;
-                self.lease_grant(&req).map(|r| r.encode())
+                self.lease_grant(&req, unix_ms).map(|r| r.encode())
             }
             ("etcdserverpb.Lease", "LeaseRevoke") => {
                 let req = LeaseRevokeRequest::decode(body).map_err(bad_request)?;
@@ -1130,7 +1343,7 @@ impl<B: Backend> Service for Etcd<B> {
             ("etcdserverpb.Cluster", "MemberList") => Ok(MemberListResponse {
                 header: self.header(self.store.head()),
                 members: vec![Member {
-                    id: MEMBER_ID,
+                    id: self.member_id(),
                     name: "quantykube".into(),
                     peer_urls: vec![self.endpoint.clone()],
                     client_urls: vec![self.endpoint.clone()],
@@ -1141,15 +1354,26 @@ impl<B: Backend> Service for Etcd<B> {
             ("etcdserverpb.Maintenance", "Status") => {
                 let head = self.store.head();
                 let (size, in_use) = self.store.size().map_err(store_error)?;
+                let (leader, term, index, applied) = match self.cluster.get() {
+                    None => (MEMBER_ID, 1, head as u64, head as u64),
+                    Some(c) => {
+                        let s = c
+                            .host
+                            .status()
+                            .map_err(|_| status(code::UNAVAILABLE, "raft"))?;
+                        let leader = s.leader.map_or(0, |l| MEMBER_ID + l);
+                        (leader, s.term, s.commit, s.applied)
+                    }
+                };
                 Ok(StatusResponse {
                     header: self.header(head),
                     version: ETCD_VERSION.into(),
                     db_size: size,
                     db_size_in_use: in_use,
-                    leader: MEMBER_ID,
-                    raft_index: head as u64,
-                    raft_term: 1,
-                    raft_applied_index: head as u64,
+                    leader,
+                    raft_index: index,
+                    raft_term: term,
+                    raft_applied_index: applied,
                     ..Default::default()
                 }
                 .encode())
@@ -1170,24 +1394,6 @@ impl<B: Backend> Service for Etcd<B> {
                 code::UNIMPLEMENTED,
                 format!("{method} is not supported by QuantyKube"),
             )),
-        }
-    }
-
-    fn stream(&self, method: &str, requests: Receiver<Vec<u8>>, mut out: Responder) {
-        match method {
-            "/etcdserverpb.Watch/Watch" => self.watch(requests, &mut out),
-            "/etcdserverpb.Lease/LeaseKeepAlive" => {
-                for r in requests {
-                    let Ok(req) = LeaseKeepAliveRequest::decode(&r) else {
-                        return out
-                            .finish(Status::new(code::INVALID_ARGUMENT, "malformed request"));
-                    };
-                    if !out.send(&self.keep_alive(req.id).encode()) {
-                        return;
-                    }
-                }
-            }
-            _ => out.finish(Status::new(code::UNIMPLEMENTED, "not a streaming method")),
         }
     }
 }
@@ -1954,5 +2160,133 @@ mod tests {
             },
         );
         assert_eq!(r.count, 1);
+    }
+
+    type Hosts = Arc<Mutex<HashMap<u64, Weak<crate::raft::host::Host>>>>;
+    type Down = Arc<Mutex<Vec<u64>>>;
+
+    struct Loopback(Hosts, Down);
+
+    impl crate::raft::host::Wire for Loopback {
+        fn send(&self, m: crate::raft::Message) {
+            let down = self.1.lock().unwrap().clone();
+            if down.contains(&m.from) || down.contains(&m.to) {
+                return;
+            }
+            let to = self.0.lock().unwrap().get(&m.to).and_then(Weak::upgrade);
+            if let Some(h) = to {
+                h.step(m);
+            }
+        }
+    }
+
+    /// Three store nodes in one process, joined by Raft.
+    fn three() -> (Vec<Arc<Etcd<Quanty<quantydb_core::MemStorage>>>>, Down) {
+        let hosts: Hosts = Arc::default();
+        let down: Down = Arc::default();
+        let ids = [1, 2, 3];
+        let nodes = ids
+            .iter()
+            .map(|id| {
+                let e = etcd();
+                let (hosts2, down2) = (hosts.clone(), down.clone());
+                e.join(*id, |machine| {
+                    let wire = Box::new(Loopback(hosts2, down2));
+                    let log = Box::<crate::raft::host::MemLog>::default();
+                    crate::raft::host::Host::start(*id, &ids, log, wire, machine, None)
+                })
+                .unwrap();
+                let host = e.cluster.get().unwrap().host.clone();
+                hosts.lock().unwrap().insert(*id, Arc::downgrade(&host));
+                e
+            })
+            .collect();
+        (nodes, down)
+    }
+
+    fn get(e: &Etcd<impl Backend>, k: &str) -> Option<KeyValue> {
+        let r: RangeResponse = call(
+            e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: k.into(),
+                ..Default::default()
+            },
+        );
+        r.kvs.into_iter().next()
+    }
+
+    // writes through any node, linearizable reads on every node, the
+    // same revisions everywhere, and a watch that sees a write made
+    // through another node
+    #[test]
+    fn three_store_nodes_act_as_one() {
+        let (nodes, down) = three();
+        let w = WatchClient::open(&nodes[1]);
+        w.create("/c/", "/c0", 0);
+        w.until("created", |g| g.iter().any(|r| r.created));
+        for (i, e) in nodes.iter().enumerate() {
+            put(e, &format!("/c/{i}"), "v", 0);
+        }
+        for e in &nodes {
+            for i in 0..3 {
+                let kv = get(e, &format!("/c/{i}")).expect("written through another node");
+                assert_eq!(
+                    kv.mod_revision,
+                    get(&nodes[0], &format!("/c/{i}")).unwrap().mod_revision
+                );
+            }
+        }
+        w.until("three events", |g| revisions(g).len() == 3);
+
+        // a lease granted through a follower ends on every node when the
+        // leader lets it run out
+        let grant: LeaseGrantResponse = call(
+            &nodes[2],
+            "/etcdserverpb.Lease/LeaseGrant",
+            LeaseGrantRequest { id: 0, ttl: 1 },
+        );
+        put(&nodes[0], "/c/leased", "v", grant.id);
+        assert!(get(&nodes[1], "/c/leased").is_some());
+        let mut gone = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if nodes.iter().all(|e| get(e, "/c/leased").is_none()) {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "the lease did not run out");
+
+        // the cluster goes on without its leader
+        let status: StatusResponse = call(
+            &nodes[0],
+            "/etcdserverpb.Maintenance/Status",
+            StatusRequest {},
+        );
+        let leader = status.leader - MEMBER_ID;
+        down.lock().unwrap().push(leader);
+        let rest: Vec<&Arc<Etcd<_>>> = nodes
+            .iter()
+            .filter(|e| e.cluster.get().unwrap().id != leader)
+            .collect();
+        let mut done = false;
+        for _ in 0..10 {
+            let r = rest[0].unary(
+                "/etcdserverpb.KV/Put",
+                &PutRequest {
+                    key: "/c/after".into(),
+                    value: "v".into(),
+                    ..Default::default()
+                }
+                .encode(),
+            );
+            if r.is_ok() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "no write without the leader");
+        assert!(get(rest[1], "/c/after").is_some());
     }
 }

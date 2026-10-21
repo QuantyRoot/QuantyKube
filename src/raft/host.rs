@@ -438,6 +438,10 @@ mod tests {
             .read_barrier(Duration::from_secs(10))
             .unwrap();
         assert!(applied >= 40);
+        // and the other one, before its list is taken
+        hosts[alive[0]]
+            .read_barrier(Duration::from_secs(10))
+            .unwrap();
         let want: Vec<u64> = machines[alive[0]].values.lock().unwrap().clone();
         assert!((0..40).all(|v| want.contains(&v)), "{want:?}");
         assert_eq!(*machines[alive[1]].values.lock().unwrap(), want);
