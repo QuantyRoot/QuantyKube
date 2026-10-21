@@ -740,3 +740,54 @@ fn containers_of_a_pod_can_share_one_pid_namespace() {
     );
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_container_inherits_no_open_files_and_no_capabilities_to_pass_on() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    let base = scratch("inherit");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    // a file this process holds open without close-on-exec
+    let held = fs::File::open("/proc/self/status").unwrap();
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&held);
+    assert_eq!(unsafe { fcntl(fd, 2, 0) }, 0);
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "inherit".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let probe = format!(
+        "[ -e /proc/self/fd/{fd} ] && echo fd {fd} open; \
+         while read -r k v; do [ $k = CapInh: ] && echo $k $v; done \
+         < /proc/self/status"
+    );
+    let id = rt
+        .create_container(&pod, spec("inherit", &[&format!("{probe}; sleep 60")]))
+        .unwrap();
+    rt.start_container(&id).unwrap();
+    let want = "CapInh: 0000000000000000\n";
+    let exec = rt
+        .exec_sync(&id, &["sh".into(), "-c".into(), probe], None)
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&exec.stdout), want, "{exec:?}");
+    rt.stop_container(&id, Duration::ZERO).unwrap();
+    let log: String = fs::read_to_string(logs.join("inherit.log"))
+        .unwrap()
+        .lines()
+        .map(|l| format!("{}\n", l.splitn(4, ' ').nth(3).unwrap_or("")))
+        .collect();
+    assert_eq!(log, want);
+    drop(held);
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}

@@ -56,6 +56,7 @@ const SYS_PIVOT_ROOT: c_long = 155;
 const SYS_MKNODAT: c_long = 259;
 const SYS_OPEN_TREE: c_long = 428;
 const SYS_CLOSE_RANGE: c_long = 436;
+const CLOSE_RANGE_CLOEXEC: c_uint = 4;
 const SYS_MOVE_MOUNT: c_long = 429;
 const OPEN_TREE_CLONE: c_uint = 1;
 const AT_RECURSIVE: c_uint = 0x8000;
@@ -1424,7 +1425,7 @@ impl Spawn {
 
     /// Bounding set first, which needs CAP_SETPCAP still held, then the
     /// sets the command starts with, then no_new_privs so a setuid binary
-    /// cannot gain back what was dropped.
+    /// cannot gain back what was dropped, then no open file passed on.
     unsafe fn drop_capabilities(&self) {
         let fail = || -> ! { _exit(Step::Capabilities as c_int) };
         for cap in 0..64u64 {
@@ -1449,12 +1450,18 @@ impl Spawn {
         }
         let header = [LINUX_CAPABILITY_VERSION_3, 0u32];
         let (lo, hi) = (caps as u32, (caps >> 32) as u32);
-        // effective, permitted, inheritable; low 32 bits, then high
-        let data = [lo, lo, lo, hi, hi, hi];
+        // effective, permitted, inheritable; low 32 bits, then high. None
+        // inheritable, as containerd since CVE-2022-24769.
+        let data = [lo, lo, 0, hi, hi, 0];
         if syscall(SYS_CAPSET, header.as_ptr(), data.as_ptr()) != 0 {
             fail();
         }
         if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            fail();
+        }
+        // whatever the runtime holds open without O_CLOEXEC ends at
+        // execve; the pipe that reports the execve is already marked
+        if syscall(SYS_CLOSE_RANGE, 3, c_uint::MAX, CLOSE_RANGE_CLOEXEC) != 0 {
             fail();
         }
     }
