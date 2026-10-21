@@ -275,6 +275,85 @@ fn range_end(end: &[u8]) -> Option<Option<&[u8]>> {
     }
 }
 
+/// etcd's limit on compares and on operations in each branch of a txn.
+const MAX_TXN_OPS: usize = 128;
+
+fn empty_key() -> Status {
+    status(code::INVALID_ARGUMENT, "etcdserver: key is not provided")
+}
+
+/// Refuses what etcd refuses before running a txn: too many operations,
+/// an empty key, a key put twice, or a key both put and deleted in one
+/// branch. Puts in either branch of a nested txn count for the outer one.
+fn check_txn(req: &TxnRequest) -> Result<(), Status> {
+    check_branch(req, &req.success)?;
+    check_branch(req, &req.failure)?;
+    Ok(())
+}
+
+type Keys = (Vec<Vec<u8>>, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn check_branch(req: &TxnRequest, ops: &[RequestOp]) -> Result<Keys, Status> {
+    let too_many = |n: usize| n > MAX_TXN_OPS;
+    if too_many(req.compare.len()) || too_many(req.success.len()) || too_many(req.failure.len()) {
+        return Err(status(
+            code::INVALID_ARGUMENT,
+            "etcdserver: too many operations in txn request",
+        ));
+    }
+    let dup = || {
+        status(
+            code::INVALID_ARGUMENT,
+            "etcdserver: duplicate key given in txn request",
+        )
+    };
+    let (mut puts, mut dels): Keys = (Vec::new(), Vec::new());
+    for op in ops {
+        match &op.request {
+            Some(OpRequest::Range(r)) if r.key.is_empty() => return Err(empty_key()),
+            Some(OpRequest::Range(_)) | None => {}
+            Some(OpRequest::Put(p)) => {
+                if p.key.is_empty() {
+                    return Err(empty_key());
+                }
+                if puts.contains(&p.key) {
+                    return Err(dup());
+                }
+                puts.push(p.key.clone());
+            }
+            Some(OpRequest::DeleteRange(d)) => {
+                if d.key.is_empty() {
+                    return Err(empty_key());
+                }
+                dels.push((d.key.clone(), d.range_end.clone()));
+            }
+            Some(OpRequest::Txn(t)) => {
+                let (sp, sd) = check_branch(t, &t.success)?;
+                let (fp, fd) = check_branch(t, &t.failure)?;
+                let mut inner = sp;
+                for k in fp {
+                    if !inner.contains(&k) {
+                        inner.push(k);
+                    }
+                }
+                if inner.iter().any(|k| puts.contains(k)) {
+                    return Err(dup());
+                }
+                puts.extend(inner);
+                dels.extend(sd);
+                dels.extend(fd);
+            }
+        }
+    }
+    if dels
+        .iter()
+        .any(|(start, end)| puts.iter().any(|k| in_range(k, start, end)))
+    {
+        return Err(dup());
+    }
+    Ok((puts, dels))
+}
+
 fn in_range(key: &[u8], start: &[u8], end: &[u8]) -> bool {
     match range_end(end) {
         None => key == start,
@@ -456,7 +535,7 @@ impl<B: Backend> Etcd<B> {
 
     fn put(&self, tx: &mut dyn Tx, req: &PutRequest) -> Result<PutResponse, Status> {
         if req.key.is_empty() {
-            return Err(status(code::INVALID_ARGUMENT, "key is not provided"));
+            return Err(empty_key());
         }
         let prev = tx.get(&req.key).map_err(store_error)?;
         if (req.ignore_value || req.ignore_lease) && prev.is_none() {
@@ -1357,6 +1436,9 @@ impl<B: Backend> Etcd<B> {
         match (service, method_name(method)) {
             ("etcdserverpb.KV", "Range") => {
                 let req = RangeRequest::decode(body).map_err(bad_request)?;
+                if req.key.is_empty() {
+                    return Err(empty_key());
+                }
                 let mut resp = None;
                 let at = self.etcd_read(req.revision, &mut |v| {
                     resp = Some(self.range(&req, v)?);
@@ -1382,6 +1464,9 @@ impl<B: Backend> Etcd<B> {
             }
             ("etcdserverpb.KV", "DeleteRange") => {
                 let req = DeleteRangeRequest::decode(body).map_err(bad_request)?;
+                if req.key.is_empty() {
+                    return Err(empty_key());
+                }
                 self.run_write(
                     |tx| self.delete(tx, &req),
                     |r, rev| r.header = self.header(rev),
@@ -1390,6 +1475,7 @@ impl<B: Backend> Etcd<B> {
             }
             ("etcdserverpb.KV", "Txn") => {
                 let req = TxnRequest::decode(body).map_err(bad_request)?;
+                check_txn(&req)?;
                 self.run_write(
                     |tx| self.txn(tx, &req),
                     |r, rev| set_txn_headers(r, &self.header(rev)),
@@ -1711,6 +1797,79 @@ mod tests {
             panic!("expected a range response");
         };
         assert_eq!(got.kvs[0].value, b"v1");
+    }
+
+    #[test]
+    fn txns_etcd_refuses_change_nothing() {
+        let e = etcd();
+        let put_op = |k: &str| RequestOp {
+            request: Some(OpRequest::Put(PutRequest {
+                key: k.into(),
+                ..Default::default()
+            })),
+        };
+        let del_op = |k: &str, end: &str| RequestOp {
+            request: Some(OpRequest::DeleteRange(DeleteRangeRequest {
+                key: k.into(),
+                range_end: end.into(),
+                ..Default::default()
+            })),
+        };
+        let txn = |success: Vec<RequestOp>, failure: Vec<RequestOp>| TxnRequest {
+            success,
+            failure,
+            ..Default::default()
+        };
+        let nested = |t: TxnRequest| RequestOp {
+            request: Some(OpRequest::Txn(t)),
+        };
+        let refused = |t: TxnRequest, why: &str| {
+            let head = e.store.head();
+            let err = e.unary("/etcdserverpb.KV/Txn", &t.encode()).unwrap_err();
+            assert!(err.message.contains(why), "{}", err.message);
+            assert_eq!(e.store.head(), head);
+        };
+        let dup = "duplicate key";
+        refused(txn(vec![put_op("/a"), put_op("/a")], vec![]), dup);
+        refused(txn(vec![put_op("/a/1"), del_op("/a/", "/a0")], vec![]), dup);
+        refused(
+            txn(
+                vec![put_op("/a"), nested(txn(vec![], vec![put_op("/a")]))],
+                vec![],
+            ),
+            dup,
+        );
+        refused(txn(vec![put_op("")], vec![]), "key is not provided");
+        refused(
+            txn(
+                (0..=MAX_TXN_OPS)
+                    .map(|i| put_op(&format!("/n/{i}")))
+                    .collect(),
+                vec![],
+            ),
+            "too many operations",
+        );
+        // the same key may appear once in each branch, and twice deleted
+        let ok: TxnResponse = call(
+            &e,
+            "/etcdserverpb.KV/Txn",
+            txn(
+                vec![put_op("/a"), del_op("/b", ""), del_op("/b", "")],
+                vec![put_op("/a")],
+            ),
+        );
+        assert!(ok.succeeded);
+        let many: TxnResponse = call(
+            &e,
+            "/etcdserverpb.KV/Txn",
+            txn(
+                (0..MAX_TXN_OPS)
+                    .map(|i| put_op(&format!("/n/{i}")))
+                    .collect(),
+                vec![],
+            ),
+        );
+        assert_eq!(many.responses.len(), MAX_TXN_OPS);
     }
 
     #[test]
