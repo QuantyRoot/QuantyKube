@@ -388,7 +388,9 @@ fn serve(args: &[String]) -> Result<(), String> {
         Path::new(required(args, "--key")?),
         Path::new(required(args, "--client-ca")?),
     )?;
-    config.set_alpn(&[b"h2", b"http/1.1"]);
+    // HTTP/1.1 first: kubeadm offers both and speaks only HTTP/1.1,
+    // gRPC clients offer only h2
+    config.set_alpn(&[b"http/1.1", b"h2"]);
     let tcp = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
     let unix = server.clone();
     std::thread::spawn(move || unix.serve_unix(listener));

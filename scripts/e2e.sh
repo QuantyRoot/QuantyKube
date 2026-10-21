@@ -144,6 +144,10 @@ h() {
 expect "{\"etcdserver\":\"3.6.5\",\"etcdcluster\":\"3.6.5\"}" h /version
 expect '{"health":"true","reason":""}' h /health
 expect "404 page not found" h /metrics
+# kubeadm and curl offer h2 as well and still speak HTTP/1.1
+expect '{"health":"true","reason":""}' curl -s --cacert "$pki/ca.pem" \
+    --cert "$pki/client.pem" --key "$pki/client.key" \
+    "https://127.0.0.1:$tls_port/health"
 echo "etcdctl over TLS: ok"
 
 if [ -n "${KUBE_APISERVER:-}" ]; then

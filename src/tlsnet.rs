@@ -21,6 +21,8 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 pub struct TlsSocket {
     tcp: TcpStream,
     conn: Arc<Mutex<ServerConnection>>,
+    /// Plaintext already read by [`TlsSocket::peek`], read again first.
+    peeked: Arc<Mutex<Vec<u8>>>,
 }
 
 fn tls_error(e: quantycore::tls::Error) -> io::Error {
@@ -36,6 +38,7 @@ impl TlsSocket {
         let mut s = TlsSocket {
             tcp,
             conn: Arc::new(Mutex::new(ServerConnection::new(config))),
+            peeked: Arc::default(),
         };
         while s.lock().is_handshaking() {
             s.pump()?;
@@ -51,9 +54,19 @@ impl TlsSocket {
         Ok(s)
     }
 
-    /// The application protocol the handshake settled on.
-    pub fn alpn(&self) -> Option<Vec<u8>> {
-        self.lock().alpn_protocol().map(<[u8]>::to_vec)
+    /// The first `n` bytes of plaintext, which reading then returns again.
+    pub fn peek(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let mut got = Vec::new();
+        while got.len() < n {
+            let mut buf = vec![0; n - got.len()];
+            let k = self.read(&mut buf)?;
+            if k == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..k]);
+        }
+        *self.peeked.lock().unwrap_or_else(|e| e.into_inner()) = got.clone();
+        Ok(got)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ServerConnection> {
@@ -88,6 +101,15 @@ impl TlsSocket {
 
 impl Read for TlsSocket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        {
+            let mut p = self.peeked.lock().unwrap_or_else(|e| e.into_inner());
+            if !p.is_empty() {
+                let n = buf.len().min(p.len());
+                buf[..n].copy_from_slice(&p[..n]);
+                p.drain(..n);
+                return Ok(n);
+            }
+        }
         loop {
             {
                 let mut conn = self.lock();
@@ -126,6 +148,7 @@ impl Socket for TlsSocket {
         Ok(TlsSocket {
             tcp: self.tcp.try_clone()?,
             conn: self.conn.clone(),
+            peeked: self.peeked.clone(),
         })
     }
 
@@ -172,9 +195,10 @@ pub fn server_config(cert: &Path, key: &Path, client_ca: &Path) -> Result<Server
 }
 
 /// Accepts TLS connections forever on `listener`, one thread each. A
-/// client that asks for HTTP/1.1 gets what etcd serves on the same port
+/// client that speaks HTTP/1.1 gets what etcd serves on the same port
 /// besides gRPC: `/version`, which kubeadm checks before it uses an
-/// external etcd, and `/health`.
+/// external etcd, and `/health`. kubeadm offers h2 in the handshake and
+/// then speaks HTTP/1.1, so the first bytes tell, not the handshake.
 pub fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
@@ -185,10 +209,11 @@ pub fn serve(
         let Ok(tcp) = tcp else { continue };
         let (config, server, service) = (config.clone(), server.clone(), service.clone());
         std::thread::spawn(move || {
-            let Ok(socket) = TlsSocket::accept(tcp, config) else {
+            let Ok(mut socket) = TlsSocket::accept(tcp, config) else {
                 return;
             };
-            if socket.alpn().as_deref() == Some(b"http/1.1") {
+            // gRPC starts with the HTTP/2 preface whatever was agreed
+            if socket.peek(4).is_ok_and(|p| p != b"PRI ") {
                 serve_http(socket, service.as_ref());
             } else {
                 server.serve_connection(socket);

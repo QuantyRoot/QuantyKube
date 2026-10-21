@@ -979,10 +979,12 @@ lock on the whole cluster's data whenever the store is reached over a
 network. Until the review, a store reachable over a network should
 also be fenced in by the network itself.
 
-*Added on 21 October:* a client that offers only HTTP/1.1 in the
-handshake gets `/version` and `/health` as etcd answers them; gRPC
-clients offer h2 and get gRPC. Nothing else is served over HTTP/1.1,
-and the client certificate is required the same way.
+*Added on 21 October:* a client that speaks HTTP/1.1 gets `/version`
+and `/health` as etcd answers them, and a client that starts with the
+HTTP/2 preface gets gRPC. The first bytes decide, not the handshake:
+kubeadm offers h2 there and then speaks HTTP/1.1. Nothing else is
+served over HTTP/1.1, and the client certificate is required the same
+way.
 
 ## ADR-032: Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 
