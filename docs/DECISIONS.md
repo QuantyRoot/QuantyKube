@@ -1171,9 +1171,13 @@ their lease among them.
 **The cost:** the API server is down for the copy and its restart,
 seconds for a cluster of the usual size. Its clients' watches are told
 to list again, as after any restart of the API server, since its watch
-cache starts anew. History in QuantyKube begins at the move. Writes
-made after the move are not in etcd, so going back after a while
-needs them copied back, which is not built yet.
+cache starts anew. History in QuantyKube begins at the move. The way back copies
+every key from the store into etcd, which numbers writes itself: it
+is first written to until its revision passes the store's, so no
+client is left holding a resourceVersion etcd has not reached. That
+costs one write per revision the store went past etcd, and the copy
+into etcd is not atomic; the API server stays stopped until it is
+done, and stays on the store if it fails.
 
 *How a node is moved:* `quantykube install store`, as root on a
 kubeadm control plane node, does it from files alone. It keeps the API

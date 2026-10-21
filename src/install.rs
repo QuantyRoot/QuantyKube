@@ -306,9 +306,57 @@ pub fn install(l: &Layout) -> Result<(), String> {
     }
 }
 
-/// Puts the API server back on etcd as the journal recorded it. Writes
-/// made on QuantyKube since the move are not in etcd; the store file
-/// stays, renamed, so nothing is deleted.
+/// The keys written on the store since the move, copied into the etcd
+/// the original manifest names; nothing when the API server never ran
+/// on the store or nothing changed there.
+fn copy_back(l: &Layout, original: &str, at: &str) -> Result<(), String> {
+    let ran = matches!(at, "starting the API server on the store" | "done");
+    let recorded: Option<i64> = fs::read_to_string(l.journal().join("revision"))
+        .ok()
+        .and_then(|r| r.trim().parse().ok());
+    let (true, Some(recorded)) = (ran, recorded) else {
+        return Ok(());
+    };
+    let store = crate::etcdclient::Client::new(
+        &format!("127.0.0.1:{}", l.port),
+        &l.pki("etcd/ca.crt"),
+        &l.pki("apiserver-etcd-client.crt"),
+        &l.pki("apiserver-etcd-client.key"),
+    )?;
+    let copy = store
+        .copy()
+        .map_err(|s| format!("reading the store: {}", s.message))?;
+    if copy.revision == recorded {
+        return Ok(());
+    }
+    let path = |f: &str| -> Result<PathBuf, String> {
+        flag(original, f)
+            .map(PathBuf::from)
+            .ok_or(format!("no --{f} in the original manifest"))
+    };
+    let servers = flag(original, "etcd-servers").ok_or("no --etcd-servers")?;
+    let endpoint = servers
+        .strip_prefix("https://")
+        .ok_or("--etcd-servers is not https")?;
+    let etcd = crate::etcdclient::Client::new(
+        endpoint,
+        &path("etcd-cafile")?,
+        &path("etcd-certfile")?,
+        &path("etcd-keyfile")?,
+    )?;
+    etcd.replace_all(&copy)
+        .map_err(|s| format!("writing into etcd: {}", s.message))?;
+    eprintln!(
+        "quantykube: copied {} keys back into etcd, {} revisions written on the store",
+        copy.records.len(),
+        copy.revision - recorded
+    );
+    Ok(())
+}
+
+/// Puts the API server back on etcd as the journal recorded it, with
+/// what was written on the store since copied into etcd first. The
+/// store's file stays, renamed, so nothing is deleted.
 pub fn undo(l: &Layout) -> Result<(), String> {
     let Some(at) = current_step(l) else {
         return Err(format!(
@@ -319,10 +367,19 @@ pub fn undo(l: &Layout) -> Result<(), String> {
     let original = fs::read_to_string(l.original()).map_err(err(l.original().display()))?;
     eprintln!("quantykube: undoing the move recorded at step {at}");
     let parked = l.journal().join("kube-apiserver.parked");
-    if l.manifest().exists() {
+    let current = fs::read_to_string(l.manifest()).ok();
+    if current.is_some() {
         fs::rename(l.manifest(), &parked).map_err(err(l.manifest().display()))?;
     }
     wait("the API server stopping", 120, stopped)?;
+    if let Err(e) = copy_back(l, &original, &at) {
+        // nothing is lost: the API server goes back to the store
+        if let Some(c) = current {
+            fs::write(&parked, c).map_err(err(parked.display()))?;
+            fs::rename(&parked, l.manifest()).map_err(err(l.manifest().display()))?;
+        }
+        return Err(format!("{e}; the API server stays on the store"));
+    }
     fs::write(&parked, &original).map_err(err(parked.display()))?;
     fs::rename(&parked, l.manifest()).map_err(err(l.manifest().display()))?;
     wait("the API server becoming ready on etcd", 180, || {

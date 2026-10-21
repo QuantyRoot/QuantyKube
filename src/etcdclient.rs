@@ -2,8 +2,12 @@
 //! etcd into the store with their revisions (ADR-035). One connection per
 //! call: it makes a few hundred calls and is done.
 
+use crate::etcdpb::{
+    DeleteRangeRequest, DeleteRangeResponse, LeaseGrantRequest, LeaseGrantResponse,
+    LeaseRevokeRequest, LeaseRevokeResponse, OpRequest, PutRequest, PutResponse, RangeRequest,
+    RangeResponse, RequestOp, TxnRequest, TxnResponse,
+};
 use crate::etcdpb::{KeyValue, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, Message};
-use crate::etcdpb::{RangeRequest, RangeResponse};
 use crate::store::Record;
 use quantycore::grpc::Status;
 use quantycore::tls::x509::{pem, PrivateKey, RootStore};
@@ -17,6 +21,10 @@ use std::time::Duration;
 
 /// Keys per page while copying, so no single answer is large.
 const PAGE: i64 = 500;
+/// Written to move etcd's revision on; deleted with everything else.
+const SCRATCH: &[u8] = b"/quantykube/revision";
+/// etcd's limit on the operations of one txn.
+const TXN_OPS: usize = 128;
 
 pub struct Client {
     addr: String,
@@ -97,6 +105,18 @@ impl Client {
         })
     }
 
+    fn revision(&self) -> Result<i64, Status> {
+        let r: RangeResponse = self.call(
+            "/etcdserverpb.KV/Range",
+            &RangeRequest {
+                key: SCRATCH.to_vec(),
+                count_only: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(r.header.map_or(0, |h| h.revision))
+    }
+
     fn call<Q: Message, R: Message>(&self, method: &str, req: &Q) -> Result<R, Status> {
         let stream = connect(&self.addr, &self.config)
             .map_err(|e| Status::new(14, format!("{}: {e}", self.addr)))?;
@@ -152,6 +172,67 @@ impl Client {
             records,
             leases,
         })
+    }
+}
+
+impl Client {
+    /// Makes the etcd hold exactly `copy`'s keys and the leases they
+    /// hold. etcd numbers every write itself, so it is first written to
+    /// until its revision passes the copy's: every resourceVersion a
+    /// client holds is then older than what it finds. Not atomic; nothing
+    /// else may write meanwhile.
+    pub fn replace_all(&self, copy: &Copy) -> Result<(), Status> {
+        let mut at = self.revision()?;
+        while at < copy.revision {
+            let r: PutResponse = self.call(
+                "/etcdserverpb.KV/Put",
+                &PutRequest {
+                    key: SCRATCH.to_vec(),
+                    ..Default::default()
+                },
+            )?;
+            at = r.header.map_or(at + 1, |h| h.revision);
+        }
+        for (&id, &ttl) in &copy.leases {
+            // a lease etcd still has would refuse the grant
+            let _: Result<LeaseRevokeResponse, _> = self.call(
+                "/etcdserverpb.Lease/LeaseRevoke",
+                &LeaseRevokeRequest { id },
+            );
+            let _: LeaseGrantResponse = self.call(
+                "/etcdserverpb.Lease/LeaseGrant",
+                &LeaseGrantRequest { id, ttl },
+            )?;
+        }
+        let _: DeleteRangeResponse = self.call(
+            "/etcdserverpb.KV/DeleteRange",
+            &DeleteRangeRequest {
+                key: vec![0],
+                range_end: vec![0],
+                prev_kv: false,
+            },
+        )?;
+        for batch in copy.records.chunks(TXN_OPS) {
+            let success = batch
+                .iter()
+                .map(|r| RequestOp {
+                    request: Some(OpRequest::Put(PutRequest {
+                        key: r.key.clone(),
+                        value: r.value.clone(),
+                        lease: r.lease,
+                        ..Default::default()
+                    })),
+                })
+                .collect();
+            let _: TxnResponse = self.call(
+                "/etcdserverpb.KV/Txn",
+                &TxnRequest {
+                    success,
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(())
     }
 }
 

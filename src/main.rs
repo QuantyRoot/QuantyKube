@@ -67,7 +67,8 @@ install store, run as root on a kubeadm control plane node, moves its
 API server from etcd onto a QuantyKube store on 127.0.0.1, port 2479 by
 default, run by systemd: it stops the API server, migrates, starts the
 store and the API server on it, and goes back on any failure. undo
-store puts the API server back on etcd, which install never changes.
+store puts the API server back on etcd, which install never changes,
+with what was written on the store copied into it first.
 --kubernetes is /etc/kubernetes and --state /var/lib/quantykube unless
 given; the journal of each step is in <state>/install.
 

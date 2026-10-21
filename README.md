@@ -74,7 +74,7 @@ watches see the object return.
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |
 | Several store nodes (Raft): a simulator that finds planted bugs, three nodes under kube-apiserver with the leader killed, log compaction and snapshots ([ADR-032 to 034](docs/DECISIONS.md)) | built, runs in CI |
 | kubeadm with the store as its etcd ([scripts/kubeadm.sh](scripts/kubeadm.sh)) | runs in CI |
-| Moving a kubeadm cluster from etcd and back: `migrate`, `install store`, `undo store`, every object at its resourceVersion ([ADR-035](docs/DECISIONS.md)) | runs in CI; writes made on the store are not copied back on undo yet |
+| Moving a kubeadm cluster from etcd and back: `migrate`, `install store`, `undo store`, every object at its resourceVersion ([ADR-035](docs/DECISIONS.md)) | runs in CI |
 
 ## Trying it
 

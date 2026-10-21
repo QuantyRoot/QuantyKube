@@ -160,6 +160,8 @@ if [ "$mode" = move ]; then
     kubectl -n kube-system scale deploy coredns --replicas=3 >/dev/null
     kubectl -n kube-system rollout status deploy/coredns --timeout=120s \
         >/dev/null || fail "the controllers did not act on the store"
+    on_store=$(kubectl get configmap after-move \
+        -o jsonpath='{.metadata.resourceVersion}')
     echo "install store: ok"
 
     "$QK" undo store >"$work/undo.log" 2>&1 ||
@@ -168,9 +170,17 @@ if [ "$mode" = move ]; then
         fail "the manifest is not the original"
     v=$(kubectl get configmap before-20 -o jsonpath='{.data.v}')
     [ "$v" = 20 ] || fail "before-20 after the undo is '$v'"
-    # the price ADR-035 names: what was written on the store stays there
-    kubectl get configmap after-move >/dev/null 2>&1 &&
-        fail "after-move is in etcd, which the undo does not do"
+    # what was written on the store is copied back, under revisions
+    # past the store's, so no client holds a resourceVersion from the
+    # future
+    v=$(kubectl get configmap after-move -o jsonpath='{.data.v}')
+    [ "$v" = x ] || fail "after-move is not back in etcd: '$v'"
+    rv=$(kubectl get configmap after-move \
+        -o jsonpath='{.metadata.resourceVersion}')
+    [ "$rv" -gt "$on_store" ] ||
+        fail "after-move is at $rv in etcd, $on_store on the store"
+    n=$(kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.replicas}')
+    [ "$n" = 3 ] || fail "the scale on the store is not in etcd: $n"
     systemctl is-active -q quantykube-store && fail "the store still runs"
     echo "undo store: ok"
     exit 0
