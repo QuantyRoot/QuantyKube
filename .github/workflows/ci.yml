@@ -170,7 +170,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
-      - run: cargo test --release --lib raft:: -- --nocapture
+      - run: "cargo test --release --lib raft:: -- --nocapture"
         env:
           QUANTY_RAFT_SEEDS: "5000"
           # an index that runs past the log must fail here, not wrap
