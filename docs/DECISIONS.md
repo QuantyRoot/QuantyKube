@@ -1070,6 +1070,15 @@ applies the command itself. A follower passes commands to its leader
 inside Raft. Reads wait for a ReadIndex unless the client asked for a
 serializable read; watches are served from each node's own store.
 
+Every write a command makes carries the command's Raft index into the
+store, in the same commit, so that a node restarting knows exactly what
+it already applied and applies nothing twice. A command that writes
+nothing leaves no index behind; applied again after a crash it meets
+the same state it met the first time, since nothing changed in between,
+and does nothing again. The check in CI: the killed leader comes back
+with the same revisions as the others. Without the index it came back
+three revisions ahead.
+
 Leases follow etcd: the node that takes a grant picks the id, so every
 node grants the same lease; only the leader decides that a lease ran
 out, and revokes it through the log; a new leader first gives every

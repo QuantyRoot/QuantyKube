@@ -124,6 +124,18 @@ done
 expect $'/b\nwithout-leader' e "$n" get /b --consistency=s
 echo "the old leader caught up: ok"
 
+# and holds what the others hold, at the same revisions: nothing it had
+# applied before the kill was applied twice after it
+expect OK e "${rest[0]}" put /c after-restart
+rev() {
+    e "$1" get /c --consistency=s -w json 2>/dev/null | grep -o '"revision":[0-9]*' | head -1
+}
+want=$(rev "${rest[0]}")
+for _ in $(seq 50); do [ "$(rev "$n")" = "$want" ] && break; sleep 0.2; done
+expect "$want" rev "$n"
+expect "$want" rev "${rest[1]}"
+echo "the same revisions after the restart: ok"
+
 [ -n "${KUBE_APISERVER:-}" ] || exit 0
 openssl genrsa -out "$work/sa.key" 2048 2>/dev/null
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \

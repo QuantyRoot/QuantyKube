@@ -37,7 +37,12 @@ pub struct Etcd<B: Backend> {
     inbox: AtomicUsize,
     /// Set when this store is one node of several (ADR-034).
     cluster: OnceLock<Cluster>,
+    /// The Raft index of the command being applied, kept with every write
+    /// it makes; 0 outside a cluster.
+    applying: AtomicU64,
 }
+
+const RAFT_APPLIED: &[u8] = b"raft-applied";
 
 struct Cluster {
     id: u64,
@@ -109,7 +114,21 @@ fn decode_answer(buf: &[u8]) -> Result<Vec<u8>, Status> {
 struct Applier<B: Backend>(Weak<Etcd<B>>);
 
 impl<B: Backend> crate::raft::host::Machine for Applier<B> {
-    fn apply(&self, data: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn applied(&self) -> u64 {
+        let Some(etcd) = self.0.upgrade() else {
+            return 0;
+        };
+        let mut index = 0;
+        let _ = etcd.store.write(&mut |tx| {
+            if let Some(v) = tx.meta_get(RAFT_APPLIED)? {
+                index = v.try_into().map(u64::from_be_bytes).unwrap_or(0);
+            }
+            Ok(())
+        });
+        index
+    }
+
+    fn apply(&self, index: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
         let etcd = self.0.upgrade()?;
         let (mut origin, mut req, mut method, mut body, mut unix_ms) =
             (0, 0, String::new(), Vec::new(), 0);
@@ -124,7 +143,13 @@ impl<B: Backend> crate::raft::host::Machine for Applier<B> {
                 _ => {}
             }
         }
+        etcd.applying.store(index, Ordering::Relaxed);
         let answer = etcd.serve(&method, &body, unix_ms);
+        if method == "/etcdserverpb.KV/Compact" {
+            // compaction writes through the store, not through a command
+            let _ = etcd.write(&mut |_| Ok(()));
+        }
+        etcd.applying.store(0, Ordering::Relaxed);
         let mine = etcd.cluster.get().is_some_and(|c| c.id == origin);
         mine.then(|| (req, encode_answer(&answer)))
     }
@@ -246,6 +271,7 @@ impl<B: Backend> Etcd<B> {
             events_per_response: AtomicUsize::new(EVENTS_PER_RESPONSE),
             inbox: AtomicUsize::new(INBOX),
             cluster: OnceLock::new(),
+            applying: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&etcd);
         std::thread::spawn(move || {
@@ -275,7 +301,17 @@ impl<B: Backend> Etcd<B> {
         &self,
         f: &mut dyn FnMut(&mut dyn Tx) -> store::Result<()>,
     ) -> store::Result<Option<i64>> {
-        Ok(self.store.write(f)?.map(|(rev, _)| rev))
+        let index = self.applying.load(Ordering::Relaxed);
+        let mut with_index = |tx: &mut dyn Tx| {
+            f(tx)?;
+            // in the same commit as what the command wrote, so that a
+            // restart knows exactly where to go on from
+            if index > 0 {
+                tx.meta_put(RAFT_APPLIED, &index.to_be_bytes())?;
+            }
+            Ok(())
+        };
+        Ok(self.store.write(&mut with_index)?.map(|(rev, _)| rev))
     }
 
     fn range(&self, req: &RangeRequest, view: &dyn View) -> store::Result<RangeResponse> {

@@ -65,7 +65,12 @@ impl Wire for super::transport::Transport {
 /// What the host does with a committed command: applies it, and says
 /// which caller it answers, if one on this node waits for it.
 pub trait Machine: Send + Sync {
-    fn apply(&self, data: &[u8]) -> Option<(u64, Vec<u8>)>;
+    /// Applies the command at log index `index`. The machine must keep
+    /// the index of what it applied with what it applied, atomically, so
+    /// that after a restart nothing is applied twice.
+    fn apply(&self, index: u64, data: &[u8]) -> Option<(u64, Vec<u8>)>;
+    /// The last index applied, as kept by `apply`.
+    fn applied(&self) -> u64;
 }
 
 enum Input {
@@ -114,7 +119,18 @@ impl Host {
     ) -> io::Result<Arc<Host>> {
         let (hard, snap, entries) = log.load()?;
         let seed = id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ now_nanos();
-        let node = Node::new(id, peers, Config::default(), hard, snap, entries, 0, seed);
+        // what the machine already holds is not applied again
+        let applied = machine.applied().min(hard.commit.max(snap.index));
+        let node = Node::new(
+            id,
+            peers,
+            Config::default(),
+            hard,
+            snap,
+            entries,
+            applied,
+            seed,
+        );
         let (input, rx) = mpsc::channel();
         if let Some(inbound) = inbound {
             let input = input.clone();
@@ -126,7 +142,7 @@ impl Host {
                 }
             });
         }
-        std::thread::spawn(move || run(node, log, wire, machine, rx));
+        std::thread::spawn(move || run(node, applied, log, wire, machine, rx));
         Ok(Arc::new(Host {
             input,
             next: Mutex::new(0),
@@ -230,7 +246,7 @@ impl State {
             if e.data.is_empty() {
                 continue;
             }
-            if let Some((req, answer)) = self.machine.apply(&e.data) {
+            if let Some((req, answer)) = self.machine.apply(e.index, &e.data) {
                 if let Some((tx, _)) = self.proposals.remove(&req) {
                     let _ = tx.send(answer);
                 }
@@ -257,12 +273,13 @@ impl State {
 
 fn run(
     node: Node,
+    applied: u64,
     log: Box<dyn LogStore>,
     wire: Box<dyn Wire>,
     machine: Arc<dyn Machine>,
     rx: Receiver<Input>,
 ) {
-    let applied = node.snapshot().index;
+    let applied = applied.max(node.snapshot().index);
     let mut s = State {
         node,
         log,
@@ -367,7 +384,11 @@ mod tests {
     }
 
     impl Machine for Listing {
-        fn apply(&self, data: &[u8]) -> Option<(u64, Vec<u8>)> {
+        fn applied(&self) -> u64 {
+            0
+        }
+
+        fn apply(&self, _: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
             let f = |i: usize| u64::from_be_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
             let mut v = self.values.lock().unwrap();
             v.push(f(2));
