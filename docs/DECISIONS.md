@@ -883,6 +883,14 @@ control plane, for the reason above.
 that the API server must reach, and a restore is now something RBAC
 can grant, so the default roles must not grant it.
 
+*Built on 21 October* as described in docs/HISTORY.md: the History
+service's own protobuf messages over HTTP/1.1, which the store offers
+by ALPN so that kube-apiserver does not ask for HTTP/2; reads as `get`
+on `logs` and `objects`, a restore as `create` on `restores`. In CI an
+unmodified kube-apiserver forwards to it, `kubectl-quanty` lists a
+ConfigMap's history and brings it back, and a user without a role is
+refused.
+
 ## ADR-029: The demonstration and the installer target kubeadm
 
 The cluster on stage is upstream Kubernetes set up with kubeadm, on

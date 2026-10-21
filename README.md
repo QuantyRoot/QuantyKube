@@ -14,9 +14,10 @@ through, with no shim and no pause container per pod.
 ## Read this first
 
 QuantyKube is not a general etcd replacement. It implements the part of
-the etcd v3 API that the Kubernetes API server uses, on a single node,
-without clustering. Other etcd clients may call things that are not
-there ([ADR-001](docs/DECISIONS.md)); kine makes the same choice.
+the etcd v3 API that the Kubernetes API server uses, on one node or on
+several joined by Raft with a membership fixed at start. Other etcd
+clients may call things that are not there
+([ADR-001](docs/DECISIONS.md)); kine makes the same choice.
 
 It is early. Everything marked built below is exercised in CI against the
 real `etcdctl`, an unmodified `kube-apiserver` and a k3s control plane
@@ -70,7 +71,7 @@ watches see the object return.
 | Node runtime: layer unpacking and a hardened sandbox ([docs/RUNTIME.md](docs/RUNTIME.md)) | built, measured against runc |
 | A k3s node on the store and the runtime together ([scripts/cluster.sh](scripts/cluster.sh)) | runs in CI |
 | Node runtime: the CRI service, pods and containers with crictl | built with volumes, limits, stats, exec probes, CNI, pulls over HTTPS; pod start measured against containerd |
-| Several store nodes (Raft) | in progress, cut off 7 November ([ADR-027](docs/DECISIONS.md)) |
+| Several store nodes (Raft): a simulator that finds planted bugs, three nodes under kube-apiserver with the leader killed ([ADR-032 to 034](docs/DECISIONS.md)) | built, runs in CI; no log compaction yet |
 
 ## Trying it
 

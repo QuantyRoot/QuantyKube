@@ -35,13 +35,32 @@ openssl req -x509 -new -key "$pki/ca.key" -subj /CN=e2e-ca -days 1 \
     -out "$pki/ca.pem" 2>/dev/null
 cert server $'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth'
 cert client 'extendedKeyUsage=clientAuth'
+# the history API is served under the name kube-apiserver gives it, to
+# the front proxy certificate kube-apiserver holds
+cert api $'subjectAltName=DNS:quantykube.kube-system.svc\nextendedKeyUsage=serverAuth'
+mv "$pki/ca.pem" "$pki/main-ca.pem"
+mv "$pki/ca.key" "$pki/main-ca.key"
+openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key" 2>/dev/null
+openssl req -x509 -new -key "$pki/ca.key" -subj /CN=front-proxy-ca -days 1 \
+    -out "$pki/ca.pem" 2>/dev/null
+cert front-proxy-client 'extendedKeyUsage=clientAuth'
+mv "$pki/ca.pem" "$pki/front-proxy-ca.pem"
+mv "$pki/ca.key" "$pki/front-proxy-ca.key"
+mv "$pki/main-ca.pem" "$pki/ca.pem"
+mv "$pki/main-ca.key" "$pki/ca.key"
 tls_port=23790
+api_port=23791
+# an endpoint of a Service may not be a loopback address
+api_ip=$(hostname -I | awk '{print $1}')
 
 start() {
     rm -f "$sock"
     "$QK" serve --data "$work/db" --socket "$sock" \
         --listen "127.0.0.1:$tls_port" --cert "$pki/server.pem" \
-        --key "$pki/server.key" --client-ca "$pki/ca.pem" 2>>"$work/qk.log" &
+        --key "$pki/server.key" --client-ca "$pki/ca.pem" \
+        --api-listen "$api_ip:$api_port" --api-cert "$pki/api.pem" \
+        --api-key "$pki/api.key" --api-client-ca "$pki/front-proxy-ca.pem" \
+        2>>"$work/qk.log" &
     qk=$!
     pids+=("$qk")
     for _ in $(seq 50); do [ -S "$sock" ] && return; sleep 0.1; done
@@ -125,7 +144,19 @@ if [ -n "${KUBE_APISERVER:-}" ]; then
         -addext subjectAltName=IP:127.0.0.1 \
         -keyout "$work/tls.key" -out "$work/tls.crt" 2>/dev/null
     echo "e2e-token,admin,admin,system:masters" >"$work/tokens.csv"
-    "$KUBE_APISERVER" --etcd-servers="https://127.0.0.1:$tls_port" \
+    echo "viewer-token,viewer,viewer" >>"$work/tokens.csv"
+    # its calls to the history API must not go through a proxy the
+    # machine may have for the outside world
+    env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+        "$KUBE_APISERVER" --etcd-servers="https://127.0.0.1:$tls_port" \
+        --requestheader-client-ca-file="$pki/front-proxy-ca.pem" \
+        --requestheader-allowed-names=front-proxy-client \
+        --requestheader-username-headers=X-Remote-User \
+        --requestheader-group-headers=X-Remote-Group \
+        --requestheader-extra-headers-prefix=X-Remote-Extra- \
+        --proxy-client-cert-file="$pki/front-proxy-client.pem" \
+        --proxy-client-key-file="$pki/front-proxy-client.key" \
+        --enable-aggregator-routing=true \
         --etcd-cafile="$pki/ca.pem" --etcd-certfile="$pki/client.pem" \
         --etcd-keyfile="$pki/client.key" --etcd-prefix=/upstream \
         --bind-address=127.0.0.1 --secure-port=6555 \
@@ -154,8 +185,68 @@ if [ -n "${KUBE_APISERVER:-}" ]; then
     expect 25 bash -c "$(declare -f up); KUBECTL=$KUBECTL; up get configmaps --chunk-size=4 -o name | wc -l"
     up delete configmaps --all >/dev/null
     expect 0 bash -c "$(declare -f up); KUBECTL=$KUBECTL; up get configmaps -o name | wc -l"
-    kill "${pids[-1]}"
     echo "kube-apiserver over TLS: ok"
+
+    # history through the Kubernetes API (ADR-028)
+    cabundle=$(base64 -w0 <"$pki/ca.pem")
+    up apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Service
+metadata: {name: quantykube, namespace: kube-system}
+spec:
+  ports: [{port: 443, targetPort: $api_port}]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: quantykube
+  namespace: kube-system
+  labels: {kubernetes.io/service-name: quantykube}
+addressType: IPv4
+ports: [{port: $api_port}]
+endpoints: [{addresses: ["$api_ip"]}]
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata: {name: v1alpha1.quanty.quantyroot.io}
+spec:
+  group: quanty.quantyroot.io
+  version: v1alpha1
+  service: {namespace: kube-system, name: quantykube, port: 443}
+  caBundle: $cabundle
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+YAML
+    for _ in $(seq 60); do
+        up get apiservice v1alpha1.quanty.quantyroot.io \
+            -o 'jsonpath={.status.conditions[0].status}' 2>/dev/null | grep -q True && break
+        sleep 1
+    done
+    expect True up get apiservice v1alpha1.quanty.quantyroot.io \
+        -o 'jsonpath={.status.conditions[0].status}'
+    "$KUBECTL" config --kubeconfig="$work/kc" set-cluster e2e \
+        --server=https://127.0.0.1:6555 --insecure-skip-tls-verify=true >/dev/null
+    "$KUBECTL" config --kubeconfig="$work/kc" set-credentials admin --token=e2e-token >/dev/null
+    "$KUBECTL" config --kubeconfig="$work/kc" set-credentials viewer --token=viewer-token >/dev/null
+    "$KUBECTL" config --kubeconfig="$work/kc" set-context admin --cluster=e2e --user=admin >/dev/null
+    "$KUBECTL" config --kubeconfig="$work/kc" set-context viewer --cluster=e2e --user=viewer >/dev/null
+    "$KUBECTL" config --kubeconfig="$work/kc" use-context admin >/dev/null
+    plugin() { KUBECONFIG="$work/kc" KUBECTL="$KUBECTL" "${QKP:-target/release/kubectl-quanty}" "$@"; }
+    up create configmap hist --from-literal=v=1 >/dev/null
+    up patch configmap hist -p '{"data":{"v":"2"}}' >/dev/null
+    up delete configmap hist >/dev/null
+    key=/upstream/configmaps/default/hist
+    expect $'create\nupdate\ndelete' bash -c "$(declare -f plugin); work=$work KUBECTL=$KUBECTL; plugin history $key | awk '{print \$4}'"
+    rev=$(plugin history "$key" | awk '$4 == "update" {print $1}')
+    plugin restore --rev "$rev" "$key" >/dev/null
+    expect 2 up get configmap hist -o 'jsonpath={.data.v}'
+    # RBAC decides who may look: a user without a role may not
+    if KUBECONFIG="$work/kc" "$KUBECTL" --context viewer get --raw \
+        /apis/quanty.quantyroot.io/v1alpha1/logs?q= >/dev/null 2>&1; then
+        echo "FAIL: a user without a role read history"; exit 1
+    fi
+    kill "${pids[-1]}"
+    echo "history through the Kubernetes API: ok"
 fi
 
 [ -n "${K3S:-}" ] || exit 0

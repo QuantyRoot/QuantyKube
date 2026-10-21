@@ -84,11 +84,20 @@ fn connect(
 ) -> io::Result<Stream<ClientConnection, TcpStream>> {
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
     let host = host.trim_start_matches('[').trim_end_matches(']');
-    let sock = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?;
-    let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(3))?;
+    // a name may resolve to several addresses, and the peer may listen
+    // on only one of them, as localhost does on ::1 and 127.0.0.1
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
+    let mut tcp = None;
+    for sock in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sock, Duration::from_secs(3)) {
+            Ok(t) => {
+                tcp = Some(t);
+                break;
+            }
+            Err(e) => last = e,
+        }
+    }
+    let tcp = tcp.ok_or(last)?;
     tcp.set_nodelay(true)?;
     tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
     let conn = ClientConnection::new(client.clone(), host)

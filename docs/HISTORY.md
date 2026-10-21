@@ -41,3 +41,29 @@ sees it and the API server's cache follows. The response is that of
 that had one comes back without it.
 
 A revision older than the retention window answers OUT_OF_RANGE.
+
+## Through the Kubernetes API
+
+With `quantykube serve --api-listen`, the same three methods are an
+aggregated API that kube-apiserver forwards to (ADR-028). The messages
+are the ones above; a read carries its request base64url encoded:
+
+| Request | Method |
+| --- | --- |
+| `GET /apis/quanty.quantyroot.io/v1alpha1/logs?q=<request>` | Log |
+| `GET /apis/quanty.quantyroot.io/v1alpha1/objects?q=<request>` | Get |
+| `POST /apis/quanty.quantyroot.io/v1alpha1/restores`, the request as body | Restore |
+
+kube-apiserver authenticates the caller and checks RBAC before it
+forwards, so a role grants `get` on `logs` and `objects` and `create`
+on `restores` in the group `quanty.quantyroot.io`. The store takes only
+connections with kube-apiserver's front proxy certificate
+(`--api-client-ca`), and serves under the name of the Service it is
+registered as (`--api-cert`). Registering it takes three objects: a
+Service without a selector, an EndpointSlice with the store's address,
+and an APIService with the CA of `--api-cert` as its `caBundle`;
+`scripts/e2e.sh` has all three.
+
+`kubectl-quanty` (`crates/kubectl-quanty`) makes these requests through
+`kubectl get --raw` and `kubectl create --raw`, so it needs only the
+kubeconfig kubectl uses, and is built for Windows in CI.

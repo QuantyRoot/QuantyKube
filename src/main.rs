@@ -15,6 +15,8 @@ const USAGE: &str = "usage:
                       --client-ca <pem>]
                      [--node <id> --peers <id=host:port,...> --peer-cert <pem>
                       --peer-key <pem> --peer-ca <pem> [--peer-listen <addr>]]
+                     [--api-listen <addr:port> --api-cert <pem> --api-key <pem>
+                      --api-client-ca <pem>]
   quantykube history [--socket <path>] [--prefix] <key>
   quantykube get     [--socket <path>] (--rev <n> | --ago <duration>) <key>
   quantykube restore [--socket <path>] (--rev <n> | --ago <duration>) <key>
@@ -39,6 +41,9 @@ With --node it is that node of the Raft cluster --peers lists, its own
 entry included; the nodes talk on those addresses over TLS with
 certificates from --peer-ca (ADR-033), and the Raft log is kept next to
 --data with .raft appended.
+With --api-listen it serves history to kube-apiserver as the aggregated
+API quanty.quantyroot.io/v1alpha1, to clients with a certificate from
+--api-client-ca, the cluster's front proxy CA (docs/HISTORY.md).
 
 history, get and restore read that history through the server's socket,
 $QUANTYKUBE_SOCKET or /run/quantykube.sock unless --socket says otherwise.
@@ -355,6 +360,22 @@ fn serve(args: &[String]) -> Result<(), String> {
     });
     // whoever can connect can read and write every object in the cluster
     let listener = private_socket(&socket)?;
+    if let Some(addr) = value(args, "--api-listen") {
+        // only kube-apiserver, with its front proxy certificate, gets in;
+        // it has checked who asks and what RBAC allows them (ADR-028)
+        let mut config = quantykube::tlsnet::server_config(
+            Path::new(required(args, "--api-cert")?),
+            Path::new(required(args, "--api-key")?),
+            Path::new(required(args, "--api-client-ca")?),
+        )?;
+        // the history API speaks HTTP/1.1, which kube-apiserver also
+        // offers; without this it would be asked for HTTP/2
+        config.set_alpn(&[b"http/1.1"]);
+        let tcp = std::net::TcpListener::bind(addr).map_err(|e| format!("{addr}: {e}"))?;
+        let service: Arc<dyn quantycore::grpc::Service> = etcd.clone();
+        std::thread::spawn(move || quantykube::aggapi::serve(tcp, Arc::new(config), service));
+        eprintln!("quantykube: the history API on https://{addr}");
+    }
     let server = quantykube::tlsnet::grpc_server(etcd);
     let Some(addr) = value(args, "--listen") else {
         eprintln!("quantykube: serving {} on {endpoint}", data.display());

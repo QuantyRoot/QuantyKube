@@ -10,7 +10,7 @@ publish = false
 
 # Only QuantyRoot crates may appear here. See ADR-003 in docs/DECISIONS.md.
 [workspace]
-members = ["crates/quantykube-sys"]
+members = ["crates/quantykube-sys", "crates/kubectl-quanty"]
 
 [dependencies]
 quantykube-sys = { path = "crates/quantykube-sys" }

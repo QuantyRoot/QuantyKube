@@ -1,0 +1,11 @@
+[package]
+name = "kubectl-quanty"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "kubectl quanty: the history of a QuantyKube store, through the Kubernetes API"
+repository = "https://github.com/QuantyRoot/QuantyKube"
+publish = false
+
+[dependencies]

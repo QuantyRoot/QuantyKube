@@ -51,7 +51,7 @@ jobs:
           SUMS
           tar xzf etcd-v3.6.15-linux-amd64.tar.gz --strip-components=1 etcd-v3.6.15-linux-amd64/etcdctl
           chmod +x k3s etcdctl kube-apiserver kubectl
-      - run: cargo build --release
+      - run: cargo build --release --workspace
       - name: run
         run: |
           b=$RUNNER_TEMP/bin
@@ -175,6 +175,19 @@ jobs:
           QUANTY_RAFT_SEEDS: "5000"
           # an index that runs past the log must fail here, not wrap
           CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+
+  windows:
+    name: kubectl-quanty for Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: cargo test -p kubectl-quanty
+      - run: cargo build --release -p kubectl-quanty
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubectl-quanty-windows
+          path: target/release/kubectl-quanty.exe
 
   msrv:
     name: test on MSRV (1.89)
