@@ -870,7 +870,9 @@ fn a_pod_lets_any_user_bind_low_ports_and_the_host_does_not_change() {
                 ..Default::default()
             })
             .unwrap();
-        let id = rt.create_container(&pod, spec(name, &["sleep 60"])).unwrap();
+        let id = rt
+            .create_container(&pod, spec(name, &["sleep 60"]))
+            .unwrap();
         rt.start_container(&id).unwrap();
         let out = rt
             .exec_sync(&id, &["cat".into(), file.into()], None)
