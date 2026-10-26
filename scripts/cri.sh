@@ -103,5 +103,12 @@ fi
 ! grep -q "$work" /proc/self/mounts || fail "mount left behind"
 
 sed 's/"pid": 1/"network": 2, "pid": 1/' "$work/pod.json" >"$work/host.json"
-! c runp "$work/host.json" >/dev/null || fail "a host network pod ran"
+# kube-proxy and CNI daemons run on the host's network (ADR-036)
+hpod=$(c runp "$work/host.json") || fail "a host network pod"
+hctr=$(c create "$hpod" "$work/ctr.json" "$work/host.json") || fail "create on the host network"
+c start "$hctr" >/dev/null || fail "start on the host network"
+[ "$(c exec -s "$hctr" ls /sys/class/net)" = "$(ls /sys/class/net)" ] ||
+    fail "the host network pod does not see the host's interfaces"
+c rm -f "$hctr" >/dev/null && c stopp "$hpod" >/dev/null && c rmp "$hpod" >/dev/null ||
+    fail "removal on the host network"
 echo "cri: ok"
