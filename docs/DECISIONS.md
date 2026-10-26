@@ -1231,6 +1231,15 @@ Security Admission at `baseline` or stricter for every namespace but
 kube-system, as on any cluster with containerd. The runtime's own
 default for pods that ask for nothing is unchanged.
 
+*Added on 26 October:* as containerd 2 does by default, every pod with
+a network namespace of its own may bind ports below 1024 and send pings
+as any user (`net.ipv4.ip_unprivileged_port_start=0`,
+`ping_group_range` open): CoreDNS runs as a user other than root and
+binds port 53. The host's own settings are not touched. A pod on the
+host's network keeps the host's. Separately, the sandbox's status now
+names its namespaces: without that, the kubelet took every pod on the
+host's network for a changed one and replaced it as soon as it started.
+
 ## ADR-037: CI publishes a public image of every commit on main
 
 `kubectl apply` of the installer (ADR-009) can only bring QuantyKube

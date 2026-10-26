@@ -849,3 +849,38 @@ fn a_pod_on_the_host_network_and_a_privileged_container() {
     );
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_pod_lets_any_user_bind_low_ports_and_the_host_does_not_change() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("ports");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let file = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
+    let host = fs::read_to_string(file).unwrap();
+    let seen = |name: &str, host_network: bool| -> String {
+        let pod = rt
+            .run_pod(PodSpec {
+                name: name.into(),
+                host_network,
+                ..Default::default()
+            })
+            .unwrap();
+        let id = rt.create_container(&pod, spec(name, &["sleep 60"])).unwrap();
+        rt.start_container(&id).unwrap();
+        let out = rt
+            .exec_sync(&id, &["cat".into(), file.into()], None)
+            .unwrap();
+        rt.stop_container(&id, Duration::ZERO).unwrap();
+        rt.remove_pod(&pod).unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(seen("own", false), "0\n");
+    assert_eq!(seen("host", true), host);
+    assert_eq!(fs::read_to_string(file).unwrap(), host);
+    fs::remove_dir_all(&base).unwrap();
+}

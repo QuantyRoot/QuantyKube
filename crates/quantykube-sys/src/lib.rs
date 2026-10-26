@@ -1611,6 +1611,27 @@ pub fn hold_pid_namespace() -> io::Result<i32> {
     Ok(pid as i32)
 }
 
+/// What containerd sets in each pod's own network namespace
+/// (`enable_unprivileged_ports` and `_icmp`): a user other than root may
+/// bind any port and send pings, as a DNS server that runs as nobody
+/// binds port 53. Nothing of the host's changes.
+unsafe fn unprivileged_ports() -> bool {
+    [
+        (c"/proc/sys/net/ipv4/ip_unprivileged_port_start", &b"0"[..]),
+        (c"/proc/sys/net/ipv4/ping_group_range", &b"0 2147483647"[..]),
+    ]
+    .iter()
+    .all(|(path, value)| {
+        let fd = open(path.as_ptr(), O_WRONLY | O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        let n = write(fd, value.as_ptr().cast(), value.len());
+        close(fd);
+        n == value.len() as isize
+    })
+}
+
 /// Brings up `lo` in the caller's network namespace, which a new one
 /// starts without: a pod's containers talk to each other over it.
 unsafe fn loopback_up() -> bool {
@@ -1665,7 +1686,9 @@ pub fn hold_namespaces(
     if pid == 0 {
         unsafe {
             let ok = host_network
-                || (sethostname(name.as_ptr(), name.as_bytes().len()) == 0 && loopback_up());
+                || (sethostname(name.as_ptr(), name.as_bytes().len()) == 0
+                    && loopback_up()
+                    && unprivileged_ports());
             let mut b = 0u8;
             read(fds[0], (&mut b as *mut u8).cast(), 1);
             _exit(if ok { 0 } else { 1 });
