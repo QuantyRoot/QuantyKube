@@ -152,12 +152,6 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
     }
     let ns = sc.and_then(|s| s.namespace_options.clone());
     if let Some(ns) = ns {
-        if ns.network == cripb::NamespaceMode::Node {
-            return Err(unsupported("a pod on the host network"));
-        }
-        if ns.pid == cripb::NamespaceMode::Node || ns.ipc == cripb::NamespaceMode::Node {
-            return Err(unsupported("a pod in the host's namespaces"));
-        }
         if ns.pid == cripb::NamespaceMode::Target {
             return Err(unsupported("joining another container's PID namespace"));
         }
@@ -213,12 +207,14 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
             host_ip: p.host_ip.clone(),
         });
     }
-    let share_pid = config
+    let ns = config
         .linux
         .as_ref()
         .and_then(|l| l.security_context.as_ref())
-        .and_then(|s| s.namespace_options.as_ref())
-        .is_some_and(|ns| ns.pid == cripb::NamespaceMode::Pod);
+        .and_then(|s| s.namespace_options.clone())
+        .unwrap_or_default();
+    let share_pid = ns.pid == cripb::NamespaceMode::Pod;
+    let node = cripb::NamespaceMode::Node;
     let dir = std::path::Path::new(&config.log_directory);
     if !config.log_directory.is_empty()
         && (!dir.is_absolute()
@@ -237,6 +233,10 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
     let meta = config.metadata.unwrap_or_default();
     Ok(PodSpec {
         share_pid,
+        // as the kubelet asks for kube-proxy and CNI daemons (ADR-036)
+        host_network: ns.network == node,
+        host_ipc: ns.ipc == node,
+        host_pid: ns.pid == node,
         cgroup_parent,
         ports,
         resolv_conf: resolv_conf.unwrap_or_default(),
@@ -295,10 +295,8 @@ const CAPABILITIES: [&str; 41] = [
     "CHECKPOINT_RESTORE",
 ];
 
-/// The kubelet's drops applied to the default set. Dropping is always
-/// honoured; adding is refused beyond the default set, since without a
-/// device filter or user namespace most added capabilities lead out of
-/// the container.
+/// The kubelet's drops and additions applied to the default set, as
+/// containerd applies them (ADR-036).
 fn capability_set(c: &cripb::Capability) -> Result<u64, Status> {
     let bit = |name: &str| -> Result<u64, Status> {
         let n = name.trim_start_matches("CAP_");
@@ -319,15 +317,11 @@ fn capability_set(c: &cripb::Capability) -> Result<u64, Status> {
         }
     }
     for name in &c.add_capabilities {
-        let add = if name.eq_ignore_ascii_case("ALL") {
-            u64::MAX
+        caps |= if name.eq_ignore_ascii_case("ALL") {
+            quantykube_sys::ALL_CAPS
         } else {
             bit(name)?
         };
-        if add & !quantykube_sys::DEFAULT_CAPS != 0 {
-            return Err(unsupported(&format!("adding capability {name}")));
-        }
-        caps |= add;
     }
     if !c.add_ambient_capabilities.is_empty() {
         return Err(unsupported("ambient capabilities"));
@@ -376,6 +370,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
     }
     let mut readonly_rootfs = false;
     let mut capabilities = None;
+    let mut privileged = false;
     let mut user = crate::user::Request::default();
     let mut limits = cgroup::Limits::default();
     let mut oom_score_adj = 0;
@@ -430,9 +425,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
                 return Err(unsupported("joining another container's PID namespace"));
             }
         }
-        if sc.privileged {
-            return Err(unsupported("a privileged container"));
-        }
+        privileged = sc.privileged;
         let id = |v: &Option<cripb::Int64Value>| -> Result<Option<u32>, Status> {
             v.as_ref()
                 .map(|v| {
@@ -482,6 +475,7 @@ fn container_spec(config: cripb::ContainerConfig) -> Result<ContainerSpec, Statu
         oom_score_adj,
         user,
         capabilities,
+        privileged,
     })
 }
 
@@ -1011,7 +1005,7 @@ mod tests {
         use NamespaceMode::*;
         assert!(pod_spec(pod(Pod, Container)).is_ok());
         assert!(pod_spec(PodSandboxConfig::default()).is_ok());
-        assert!(pod_spec(pod(Node, Container)).is_err());
+        assert!(pod_spec(pod(Node, Container)).unwrap().host_network);
         assert!(pod_spec(pod(Pod, Pod)).unwrap().share_pid);
         assert!(!pod_spec(pod(Pod, Container)).unwrap().share_pid);
 
@@ -1069,8 +1063,9 @@ mod tests {
             caps(drop_all("CAP_NET_BIND_SERVICE")).unwrap(),
             Some(1 << 10)
         );
-        assert!(caps(drop_all("SYS_ADMIN")).is_err());
-        assert!(caps(drop_all("MKNOD")).is_err());
+        // as containerd: what the pod adds it gets (ADR-036)
+        assert_eq!(caps(drop_all("SYS_ADMIN")).unwrap(), Some(1 << 21));
+        assert!(caps(drop_all("NO_SUCH_CAP")).is_err());
     }
 
     // fields a pod can set that this runtime does not apply: running the

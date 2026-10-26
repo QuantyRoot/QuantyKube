@@ -75,12 +75,15 @@ fn write(dir: &Path, file: &str, value: &str) -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.join(file).display())))
 }
 
-/// Creates the cgroup with its limits set, ready for a process.
-pub fn create(dir: &Path, limits: &Limits) -> io::Result<()> {
+/// Creates the cgroup with its limits set, ready for a process. Only a
+/// privileged container may open every device.
+pub fn create(dir: &Path, limits: &Limits, privileged: bool) -> io::Result<()> {
     let root = Path::new(ROOT);
     fs::create_dir_all(dir)?;
     // the device cgroup of cgroup v2, which runc installs the same way
-    quantykube_sys::restrict_devices(dir)?;
+    if !privileged {
+        quantykube_sys::restrict_devices(dir)?;
+    }
     // a limit takes effect only where every ancestor delegates the
     // controller; this is what the kubelet itself does for its cgroups
     let mut at = dir.parent();

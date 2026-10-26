@@ -97,6 +97,14 @@ start fewer per pod. A pod that asks for a shared PID namespace gets a
 small holder process, because a PID namespace dies with its first
 process.
 
+A pod on the host's network gets no network or UTS namespace of its
+own and no CNI call, one in the host's IPC or PID namespace none of
+those, as kube-proxy and CNI daemons ask (ADR-036). A privileged
+container gets every capability the runtime holds, no seccomp filter,
+no no_new_privs, `/sys` and its cgroup writable, nothing of `/proc`
+masked, every device of the host and no device filter: the same as
+under containerd, and as little confined.
+
 ## A container start, step by step
 
 1. Resolve the image to an unpacked root filesystem on the node:

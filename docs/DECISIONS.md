@@ -40,6 +40,7 @@ through and add a new entry, never silently edit history.
 - [ADR-033](#adr-033-store-nodes-talk-over-tls-in-frames-not-grpc-with-certificates-from-a-peer-ca) Store nodes talk over TLS in frames, not gRPC, with certificates from a peer CA
 - [ADR-034](#adr-034-the-store-on-raft-every-write-a-command-in-the-log-the-log-in-a-file-of-its-own) The store on Raft: every write a command in the log, the log in a file of its own
 - [ADR-035](#adr-035-a-cluster-moves-from-etcd-with-its-revisions-while-the-api-server-is-stopped) A cluster moves from etcd with its revisions, while the API server is stopped
+- [ADR-036](#adr-036-the-runtime-runs-what-a-kubeadm-node-needs-host-namespaces-added-capabilities-privileged) The runtime runs what a kubeadm node needs: host namespaces, added capabilities, privileged
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -598,6 +599,10 @@ refusing it could refuse every pod there. Profiles are being built; until they
 are applied, pods here run without the confinement containerd gives
 them on such hosts, and the comparison says so.
 
+*Superseded in part by ADR-036 on 26 October:* a pod on the host's
+network or in its IPC or PID namespace, added capabilities and a
+privileged container are now run, as containerd runs them.
+
 ## ADR-019: Volumes are attached after the pivot
 
 A volume is a host path the kubelet asks to see at a path inside the
@@ -1115,6 +1120,13 @@ applied to the store. Writing the log into the store's own file, so
 that applying and remembering the log share one commit (option b),
 waits for the measurement on the rented servers.
 
+*Decided on 26 October:* option a stays for 17 November. It is built,
+runs in CI under SIGKILL and snapshots, and keeps the store's file
+usable on its own. Option b is the optimisation to try once the
+servers show where a write's time goes; etcd itself keeps a WAL apart
+from its data file. The price: on a cluster every write costs two
+fsyncs, which the talk's numbers say.
+
 In CI three nodes run on one machine against the real `etcdctl` and an
 unmodified kube-apiserver given all three endpoints: writes through
 every node, reads and a watch through another, the same revision on
@@ -1193,3 +1205,28 @@ it back on etcd. `quantykube undo store` does that from the journal
 alone, without the API server, and keeps the store's file under a new
 name. The `kubectl apply` of ADR-009 is to run this command on the
 node; the command is what CI tests (`scripts/kubeadm.sh move`).
+
+## ADR-036: The runtime runs what a kubeadm node needs: host namespaces, added capabilities, privileged
+
+On a kubeadm node kube-proxy and the CNI's daemon run as DaemonSets on
+the host's network, kube-proxy as a privileged container, the CNI's
+with NET_ADMIN and NET_RAW added. k3s runs both inside its own process,
+which is why nothing asked for them before. Without them w1 has no
+Service network, and a pod there cannot resolve a name.
+
+The runtime now does what containerd does. A pod on the host's network
+gets no network or UTS namespace of its own and no CNI call; one in
+the host's IPC or PID namespace gets none of those. Capabilities a
+container adds are added. A privileged container gets every capability
+the runtime itself holds, no seccomp filter, no no_new_privs, `/sys`
+and its cgroup writable, nothing of `/proc` masked or made read only,
+and every character and block device of the host in its `/dev`, with
+no device filter in its cgroup. Ambient capabilities stay refused.
+
+**The cost:** a pod that asks for any of this is confined as little as
+under containerd, which is to say a privileged pod owns the node. What
+keeps ordinary workloads from asking is the cluster's admission, Pod
+Security Admission at `baseline` or stricter for every namespace but
+kube-system, as on any cluster with containerd. The runtime's own
+default for pods that ask for nothing is unchanged.
+

@@ -791,3 +791,61 @@ fn a_container_inherits_no_open_files_and_no_capabilities_to_pass_on() {
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn a_pod_on_the_host_network_and_a_privileged_container() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    let base = scratch("host");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let mut host: Vec<String> = fs::read_dir("/sys/class/net")
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    host.sort();
+    // the interfaces, the effective capabilities, and whether /sys is
+    // writable, as the container sees them
+    let probe = "ls /sys/class/net; \
+                 while read -r k v; do [ $k = CapEff: ] && echo $k $v; done \
+                 < /proc/self/status; \
+                 while read -r d m t o r; do \
+                   [ $m = /sys ] && case $o in rw,*) echo sys rw;; esac; \
+                 done < /proc/self/mounts; true";
+    let run = |name: &str, host_network: bool, privileged: bool| -> String {
+        let pod = rt
+            .run_pod(PodSpec {
+                name: name.into(),
+                host_network,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut c = spec(name, &["sleep 60"]);
+        c.privileged = privileged;
+        let id = rt.create_container(&pod, c).unwrap();
+        rt.start_container(&id).unwrap();
+        let out = rt
+            .exec_sync(&id, &["sh".into(), "-c".into(), probe.into()], None)
+            .unwrap();
+        rt.stop_container(&id, Duration::ZERO).unwrap();
+        rt.remove_pod(&pod).unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let caps = |c: u64| format!("CapEff: {c:016x}\n");
+    assert_eq!(
+        run("own", false, false),
+        format!("lo\n{}", caps(quantykube_sys::DEFAULT_CAPS))
+    );
+    assert_eq!(
+        run("host", true, true),
+        format!(
+            "{}\n{}sys rw\n",
+            host.join("\n"),
+            caps(quantykube_sys::privileged_caps())
+        )
+    );
+    fs::remove_dir_all(&base).unwrap();
+}

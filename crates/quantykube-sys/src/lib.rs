@@ -625,11 +625,80 @@ pub struct Spawn {
     user: Option<(u32, u32, Vec<u32>)>,
     caps: u64,
     seccomp: Vec<SockFilter>,
+    joined: bool,
+    host_pid: bool,
+    privileged: bool,
+    devices: Vec<Device>,
     path: CString,
     _argv: Vec<CString>,
     argv_ptrs: Vec<*const c_char>,
     _env: Vec<CString>,
     env_ptrs: Vec<*const c_char>,
+}
+
+/// A device node made in the container's /dev.
+struct Device {
+    /// The directories to make first, outermost first.
+    parents: Vec<CString>,
+    path: CString,
+    mode: c_uint,
+    rdev: c_uint,
+}
+
+/// Every capability the kernel has, up to CAP_CHECKPOINT_RESTORE.
+pub const ALL_CAPS: u64 = (1 << 41) - 1;
+
+/// Every capability the runtime itself holds: all of them on a host,
+/// fewer when the runtime runs in a container.
+pub fn privileged_caps() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("CapPrm:"))
+                .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        })
+        .map_or(DEFAULT_CAPS, |prm| prm & ALL_CAPS)
+}
+
+/// The host's character and block devices, as containerd lists them for
+/// a privileged container: without what each container gets its own of.
+fn host_devices() -> io::Result<Vec<Device>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    const OWN: [&str; 5] = ["pts", "shm", "fd", "mqueue", "console"];
+    let mut out = Vec::new();
+    let mut todo = vec![std::path::PathBuf::from("/dev")];
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || (dir.as_os_str() == "/dev" && OWN.contains(&&*name)) {
+                continue;
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            let kind = meta.file_type();
+            if kind.is_dir() {
+                todo.push(path);
+            } else if kind.is_char_device() || kind.is_block_device() {
+                let mut parents = Vec::new();
+                let mut at = path.parent();
+                while let Some(p) = at.filter(|p| p.as_os_str() != "/dev") {
+                    parents.push(cstr(p.as_os_str().as_encoded_bytes())?);
+                    at = p.parent();
+                }
+                parents.reverse();
+                out.push(Device {
+                    parents,
+                    path: cstr(path.as_os_str().as_encoded_bytes())?,
+                    mode: meta.mode(),
+                    rdev: meta.rdev() as c_uint,
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A host path mounted into the container. The child clones the source
@@ -788,6 +857,10 @@ impl Spawn {
             user: None,
             caps: DEFAULT_CAPS,
             seccomp: seccomp_program(),
+            joined: false,
+            host_pid: false,
+            privileged: false,
+            devices: Vec::new(),
             path: cstr(first)?,
             _argv: argv,
             argv_ptrs,
@@ -846,15 +919,39 @@ impl Spawn {
     }
 
     /// Joins the namespaces held at these paths (see [`hold_namespaces`])
-    /// instead of creating network, IPC and UTS namespaces of its own.
+    /// instead of creating network, IPC and UTS namespaces of its own; one
+    /// not held there is the host's.
     pub fn join(mut self, held: &std::path::Path) -> io::Result<Self> {
         for (name, kind) in [
             ("net", CLONE_NEWNET),
             ("ipc", CLONE_NEWIPC),
             ("uts", CLONE_NEWUTS),
         ] {
-            let f = std::fs::File::open(held.join(name))?;
-            self.join.push((f, kind as c_int));
+            match std::fs::File::open(held.join(name)) {
+                Ok(f) => self.join.push((f, kind as c_int)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.joined = true;
+        Ok(self)
+    }
+
+    /// Runs the command in the host's PID namespace.
+    pub fn host_pid(mut self, yes: bool) -> Self {
+        self.host_pid = yes;
+        self
+    }
+
+    /// What Kubernetes calls privileged: every capability, no seccomp
+    /// filter and no no_new_privs, /sys and the cgroup tree writable,
+    /// nothing of /proc masked, and every device of the host in /dev.
+    pub fn privileged(mut self, yes: bool) -> io::Result<Self> {
+        self.privileged = yes;
+        if yes {
+            self.caps = privileged_caps();
+            self.seccomp = Vec::new();
+            self.devices = host_devices()?;
         }
         Ok(self)
     }
@@ -976,14 +1073,14 @@ impl Spawn {
             }
             return Err(e);
         }
-        let own = if self.join.is_empty() {
+        let own = if !self.joined {
             CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET
         } else {
             0
         };
         let flags = if self.enter.is_some() {
             SIGCHLD
-        } else if self.join_pid.is_some() {
+        } else if self.join_pid.is_some() || self.host_pid {
             CLONE_NEWNS | own | SIGCHLD
         } else {
             CLONE_NEWNS | CLONE_NEWPID | own | SIGCHLD
@@ -1116,6 +1213,7 @@ impl Spawn {
                 fail(Step::EnterRoot);
             }
             let hardened = MS_NOSUID | MS_NODEV | MS_NOEXEC;
+            let ro = if self.privileged { 0 } else { MS_RDONLY };
             if mount(
                 c"proc".as_ptr(),
                 c"/proc".as_ptr(),
@@ -1130,7 +1228,7 @@ impl Spawn {
                 c"sysfs".as_ptr(),
                 c"/sys".as_ptr(),
                 c"sysfs".as_ptr(),
-                hardened | MS_RDONLY,
+                hardened | ro,
                 nodata,
             ) != 0
             {
@@ -1141,7 +1239,7 @@ impl Spawn {
                     c"cgroup2".as_ptr(),
                     c"/sys/fs/cgroup".as_ptr(),
                     c"cgroup2".as_ptr(),
-                    hardened | MS_RDONLY,
+                    hardened | ro,
                     nodata,
                 ) != 0
             {
@@ -1149,7 +1247,7 @@ impl Spawn {
             }
             self.make_dev();
             self.mount_binds();
-            for p in MASKED {
+            for p in MASKED.iter().filter(|_| !self.privileged) {
                 if mount(c"/dev/null".as_ptr(), p.as_ptr(), null, MS_BIND, nodata) != 0
                     && mount(
                         c"tmpfs".as_ptr(),
@@ -1163,7 +1261,7 @@ impl Spawn {
                     fail(Step::MaskPaths);
                 }
             }
-            for p in READ_ONLY {
+            for p in READ_ONLY.iter().filter(|_| !self.privileged) {
                 if mount(p.as_ptr(), p.as_ptr(), null, MS_BIND | MS_REC, nodata) != 0 {
                     if *__errno_location() == ENOENT {
                         continue;
@@ -1254,6 +1352,18 @@ impl Spawn {
         }
         for (target, link) in DEV_LINKS {
             if symlink(target.as_ptr(), link.as_ptr()) != 0 {
+                fail(Step::Devices);
+            }
+        }
+        for d in &self.devices {
+            for dir in &d.parents {
+                if mkdir(dir.as_ptr(), 0o755) != 0 && *__errno_location() != EEXIST {
+                    fail(Step::Devices);
+                }
+            }
+            if syscall(SYS_MKNODAT, AT_FDCWD, d.path.as_ptr(), d.mode, d.rdev) != 0
+                && *__errno_location() != EEXIST
+            {
                 fail(Step::Devices);
             }
         }
@@ -1456,7 +1566,7 @@ impl Spawn {
         if syscall(SYS_CAPSET, header.as_ptr(), data.as_ptr()) != 0 {
             fail();
         }
-        if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        if !self.privileged && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             fail();
         }
         // whatever the runtime holds open without O_CLOEXEC ends at
@@ -1467,10 +1577,6 @@ impl Spawn {
     }
 }
 
-/// Creates network, IPC and UTS namespaces and keeps them alive without a
-/// process, as files `net`, `ipc` and `uts` in `dir`: a short lived child
-/// makes them, the parent bind mounts them, the child exits. This is a
-/// pod sandbox without the pause container (docs/RUNTIME.md).
 /// Starts the first process of a new PID namespace, for a pod whose
 /// containers share one: it reaps whatever is orphaned into it and does
 /// nothing else. The namespace ends when it is killed.
@@ -1525,20 +1631,41 @@ unsafe fn loopback_up() -> bool {
     ok
 }
 
-pub fn hold_namespaces(dir: &std::path::Path, hostname: &[u8]) -> io::Result<()> {
+/// Creates network, IPC and UTS namespaces and keeps them alive without a
+/// process, as files `net`, `ipc` and `uts` in `dir`: a short lived child
+/// makes them, the parent bind mounts them, the child exits. This is a
+/// pod sandbox without the pause container (docs/RUNTIME.md). A pod on
+/// the host's network has the host's UTS namespace too, as in Kubernetes.
+pub fn hold_namespaces(
+    dir: &std::path::Path,
+    hostname: &[u8],
+    host_network: bool,
+    host_ipc: bool,
+) -> io::Result<()> {
+    let mut held = Vec::new();
+    if !host_network {
+        held.extend([("uts", CLONE_NEWUTS), ("net", CLONE_NEWNET)]);
+    }
+    if !host_ipc {
+        held.push(("ipc", CLONE_NEWIPC));
+    }
+    if held.is_empty() {
+        return Ok(());
+    }
     let name = cstr(hostname)?;
     let mut fds = [0 as c_int; 2];
     // SAFETY: fds is a valid two element array.
     if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let flags = CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | SIGCHLD;
+    let flags = held.iter().fold(SIGCHLD, |f, (_, k)| f | k);
     // SAFETY: as in Spawn::start; the child only sets its hostname and
     // blocks on the pipe, then exits.
     let pid = unsafe { syscall(SYS_CLONE, flags, 0usize, 0usize, 0usize, 0usize) };
     if pid == 0 {
         unsafe {
-            let ok = sethostname(name.as_ptr(), name.as_bytes().len()) == 0 && loopback_up();
+            let ok = host_network
+                || (sethostname(name.as_ptr(), name.as_bytes().len()) == 0 && loopback_up());
             let mut b = 0u8;
             read(fds[0], (&mut b as *mut u8).cast(), 1);
             _exit(if ok { 0 } else { 1 });
@@ -1550,7 +1677,7 @@ pub fn hold_namespaces(dir: &std::path::Path, hostname: &[u8]) -> io::Result<()>
         return Err(io::Error::last_os_error());
     }
     let mut result = Ok(());
-    for ns in ["uts", "ipc", "net"] {
+    for (ns, _) in held {
         let target = dir.join(ns);
         let made = std::fs::File::create(&target).and_then(|_| {
             let src = cstr(format!("/proc/{pid}/ns/{ns}").as_bytes())?;

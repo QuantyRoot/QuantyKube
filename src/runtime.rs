@@ -55,6 +55,10 @@ pub struct PodSpec {
     pub ports: Vec<cni::Port>,
     /// One PID namespace for all containers of the pod.
     pub share_pid: bool,
+    /// The host's network and UTS namespaces, without CNI.
+    pub host_network: bool,
+    pub host_ipc: bool,
+    pub host_pid: bool,
     pub labels: Vec<(String, String)>,
     pub annotations: Vec<(String, String)>,
 }
@@ -97,8 +101,9 @@ pub struct ContainerSpec {
     pub oom_score_adj: i64,
     pub user: user::Request,
     /// The capability set, sys::DEFAULT_CAPS unless the kubelet asked
-    /// for less.
+    /// for another.
     pub capabilities: Option<u64>,
+    pub privileged: bool,
 }
 
 /// A host file or directory mounted into the container.
@@ -652,8 +657,13 @@ impl Runtime {
         } else {
             &spec.hostname
         };
-        sys::hold_namespaces(&dir.join("ns"), hostname.as_bytes())?;
-        let network = match self.network() {
+        sys::hold_namespaces(
+            &dir.join("ns"),
+            hostname.as_bytes(),
+            spec.host_network,
+            spec.host_ipc,
+        )?;
+        let network = match self.network().filter(|_| !spec.host_network) {
             Some(cni) => match cni.add(&id, &dir.join("ns").join("net"), &spec.ports) {
                 Ok(result) => Some(result),
                 Err(e) => {
@@ -685,7 +695,7 @@ impl Runtime {
                 .collect();
             fs::write(dir.join("ports"), ports.join("\n"))?;
         }
-        let pid_holder = if spec.share_pid {
+        let pid_holder = if spec.share_pid && !spec.host_pid {
             let holder = sys::hold_pid_namespace()?;
             fs::write(
                 dir.join("holder"),
@@ -740,7 +750,7 @@ impl Runtime {
             self.stop_container(&c, grace)?;
         }
         let ns = self.dir.join("pods").join(id).join("ns");
-        if pod.state == PodState::Ready {
+        if pod.state == PodState::Ready && !pod.spec.host_network {
             if let Some(cni) = self.network() {
                 cni.del(id, &ns.join("net"), pod.network.as_ref(), &pod.spec.ports)?;
             }
@@ -884,7 +894,9 @@ impl Runtime {
             .user(u.uid, u.gid, &u.groups)
             .capabilities(c.spec.capabilities.unwrap_or(sys::DEFAULT_CAPS))
             .readonly(c.spec.readonly_rootfs)
-            .cgroup_namespace(cgroup::available());
+            .cgroup_namespace(cgroup::available())
+            .host_pid(self.pod(&c.pod_id)?.spec.host_pid)
+            .privileged(c.spec.privileged)?;
         if let Some(holder) = self.pod(&c.pod_id)?.pid_holder {
             spawn = spawn.join_pid_namespace(holder)?;
         }
@@ -920,7 +932,7 @@ impl Runtime {
             None
         };
         if let Some(dir) = &cgroup {
-            cgroup::create(dir, &c.spec.limits)?;
+            cgroup::create(dir, &c.spec.limits, c.spec.privileged)?;
         }
         let started = spawn.start()?;
         let pid = started.pid;
@@ -1052,6 +1064,7 @@ impl Runtime {
         let spawn = sys::Spawn::enter(c.pid, &argv_b, &env_b)?
             .user(u.uid, u.gid, &u.groups)
             .capabilities(c.spec.capabilities.unwrap_or(sys::DEFAULT_CAPS))
+            .privileged(c.spec.privileged)?
             .stdio(File::open("/dev/null")?, out_w, err_w)
             .cwd(working_dir(&c, &img).as_bytes())?;
         let started = spawn.start()?;
