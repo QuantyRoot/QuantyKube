@@ -72,8 +72,29 @@ fail() {
             echo "pod $pp container $cc"
             sleep 3
             printf '\n--- probe net=%s shares=%s: %s\n' $net $shares "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
-            head -c 300 "$work/p$net$shares/c.log" 2>&1
-        done; done) 2>&1
+            head -c 100 "$work/p$net$shares/c.log" 2>&1
+        done; done
+        # and the scheduler as its manifest says, mounts and all
+        python3 - "$work" <<'PY'
+import json, sys, yaml
+m = yaml.safe_load(open("/etc/kubernetes/manifests/kube-scheduler.yaml"))
+c = m["spec"]["containers"][0]
+vols = {v["name"]: v["hostPath"]["path"] for v in m["spec"]["volumes"]}
+mounts = [{"container_path": x["mountPath"], "host_path": vols[x["name"]],
+           "readonly": x.get("readOnly", False)} for x in c["volumeMounts"]]
+json.dump({"metadata": {"name": "real"}, "image": {"image": c["image"]},
+           "command": c["command"], "log_path": "real.log", "mounts": mounts},
+          open(sys.argv[1] + "/real.json", "w"))
+PY
+        printf '{"metadata":{"name":"preal","namespace":"d","uid":"ureal"},"log_directory":"%s/preal","linux":{"security_context":{"namespace_options":{"network":2}}}}' "$work" >"$work/preal.json"
+        pp=$(crictl -r "$cri" runp "$work/preal.json" 2>&1 | tail -1)
+        cc=$(crictl -r "$cri" create "$pp" "$work/real.json" "$work/preal.json" 2>&1 | tail -1)
+        crictl -r "$cri" start "$cc" 2>&1 | tail -1
+        sleep 3
+        printf '\n--- probe real: %s\n' "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
+        cut -c1-200 "$work/preal/real.log" | head -5
+        cat "$work/real.json"; echo
+        ) 2>&1
         # what the containers said, the API server's even when it is down
         for f in /var/log/pods/*/*/*.log; do
             [ -f "$f" ] || continue
