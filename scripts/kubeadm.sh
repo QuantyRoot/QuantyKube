@@ -61,18 +61,19 @@ fail() {
         # a probe: the scheduler's image asked for its help, in four
         # pods that differ in the host network and in cgroup limits
         img=$(crictl -r "$cri" images -q 2>/dev/null | head -1)
-        for net in 0 2; do for shares in 0 102; do
+        (set +e; for net in 0 2; do for shares in 0 102; do
             printf '{"metadata":{"name":"p%s%s","namespace":"d","uid":"u%s%s"},"log_directory":"%s","cgroup_parent":"/probe","linux":{"cgroup_parent":"/probe","security_context":{"namespace_options":{"network":%s}}}}' \
                 $net $shares $net $shares "$work/p$net$shares" $net >"$work/p.json"
             printf '{"metadata":{"name":"c"},"image":{"image":"%s"},"command":["kube-scheduler","--help"],"log_path":"c.log","linux":{"resources":{"cpu_shares":%s}}}' \
                 "$(crictl -r "$cri" images -o json 2>/dev/null | grep -o '"registry.k8s.io/kube-scheduler[^"]*"' | head -1 | tr -d '"')" $shares >"$work/c.json"
-            pp=$(crictl -r "$cri" runp "$work/p.json" 2>&1) &&
-                cc=$(crictl -r "$cri" create "$pp" "$work/c.json" "$work/p.json" 2>&1) &&
-                crictl -r "$cri" start "$cc" >/dev/null 2>&1
+            pp=$(crictl -r "$cri" runp "$work/p.json" 2>&1 | tail -1)
+            cc=$(crictl -r "$cri" create "$pp" "$work/c.json" "$work/p.json" 2>&1 | tail -1)
+            crictl -r "$cri" start "$cc" 2>&1 | tail -1
+            echo "pod $pp container $cc"
             sleep 3
             printf '\n--- probe net=%s shares=%s: %s\n' $net $shares "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
             head -c 300 "$work/p$net$shares/c.log" 2>&1
-        done; done
+        done; done) 2>&1
         # what the containers said, the API server's even when it is down
         for f in /var/log/pods/*/*/*.log; do
             [ -f "$f" ] || continue
