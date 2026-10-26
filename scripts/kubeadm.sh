@@ -94,6 +94,10 @@ PY
         printf '\n--- probe real: %s\n' "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
         cut -c1-200 "$work/preal/real.log" | head -5
         cat "$work/real.json"; echo
+        k=$(crictl -r "$cri" ps -a -q --name kube-scheduler 2>/dev/null | head -1)
+        printf '\n--- the kubelet'"'"'s scheduler\n'
+        crictl -r "$cri" inspect "$k" 2>&1 | head -80
+        ls -la /var/log/pods/*scheduler*/kube-scheduler/ 2>&1
         ) 2>&1
         # what the containers said, the API server's even when it is down
         for f in /var/log/pods/*/*/*.log; do
