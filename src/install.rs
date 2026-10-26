@@ -557,15 +557,25 @@ fn endpoint_of(flags: &str) -> Option<String> {
     Some(rest[..rest.find([' ', '"']).unwrap_or(rest.len())].to_string())
 }
 
-/// The kubelet's configuration with its cgroup driver set.
-fn with_cgroup_driver(config: &str, driver: &str) -> String {
+/// A top level field of the kubelet's configuration.
+fn config_field(config: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    config
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(|v| v.trim().to_string()))
+}
+
+/// The kubelet's configuration with a top level field set, in place or
+/// added at the end.
+fn with_config_field(config: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{key}:");
     let mut found = false;
     let mut out: String = config
         .split_inclusive('\n')
         .map(|l| {
-            if l.starts_with("cgroupDriver:") {
+            if l.starts_with(&prefix) {
                 found = true;
-                format!("cgroupDriver: {driver}\n")
+                format!("{key}: {value}\n")
             } else {
                 l.to_string()
             }
@@ -575,7 +585,7 @@ fn with_cgroup_driver(config: &str, driver: &str) -> String {
         if !out.ends_with('\n') && !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("cgroupDriver: {driver}\n"));
+        out.push_str(&format!("{key}: {value}\n"));
     }
     out
 }
@@ -605,15 +615,23 @@ pub fn install_runtime(l: &NodeLayout) -> Result<(), String> {
     }
     let flags = fs::read_to_string(l.flags()).map_err(err(l.flags().display()))?;
     let config = fs::read_to_string(l.config()).map_err(err(l.config().display()))?;
-    let old =
-        endpoint_of(&flags).ok_or("no --container-runtime-endpoint in the kubelet's flags")?;
+    // kubeadm writes the endpoint into the configuration since 1.27 and
+    // into the flags before
+    const FIELD: &str = "containerRuntimeEndpoint";
+    let old = config_field(&config, FIELD)
+        .or_else(|| endpoint_of(&flags))
+        .ok_or("the kubelet names no container runtime endpoint")?;
     let target = format!("unix://{RUNTIME_SOCKET}");
     if old == target {
         return Err("the kubelet already uses quantykube runtime".into());
     }
-    let new_flags = with_endpoint(&flags, &target).expect("the endpoint was found");
+    let new_flags = with_endpoint(&flags, &target).unwrap_or_else(|| flags.clone());
+    let mut new_config = config.clone();
+    if config_field(&config, FIELD).is_some() || endpoint_of(&flags).is_none() {
+        new_config = with_config_field(&new_config, FIELD, &target);
+    }
     // the runtime places containers by cgroupfs paths (RUNTIME.md)
-    let new_config = with_cgroup_driver(&config, "cgroupfs");
+    let new_config = with_config_field(&new_config, "cgroupDriver", "cgroupfs");
     fs::create_dir_all(l.journal()).map_err(err(l.journal().display()))?;
     fs::write(l.journal().join("kubeadm-flags.env"), &flags).map_err(err("journal"))?;
     fs::write(l.journal().join("config.yaml"), &config).map_err(err("journal"))?;
@@ -715,13 +733,18 @@ mod node_tests {
             )
         );
         assert_eq!(with_endpoint("X=1\n", "y"), None);
-        let config = "kind: KubeletConfiguration\ncgroupDriver: systemd\nfoo: 1\n";
+        let config = "kind: KubeletConfiguration\ncgroupDriver: systemd\n\
+                      containerRuntimeEndpoint: unix:///run/c.sock\nfoo: 1\n";
         assert_eq!(
-            with_cgroup_driver(config, "cgroupfs"),
+            config_field(config, "containerRuntimeEndpoint").as_deref(),
+            Some("unix:///run/c.sock")
+        );
+        assert_eq!(
+            with_config_field(config, "cgroupDriver", "cgroupfs"),
             config.replace("systemd", "cgroupfs")
         );
         assert_eq!(
-            with_cgroup_driver("kind: K", "cgroupfs"),
+            with_config_field("kind: K", "cgroupDriver", "cgroupfs"),
             "kind: K\ncgroupDriver: cgroupfs\n"
         );
     }

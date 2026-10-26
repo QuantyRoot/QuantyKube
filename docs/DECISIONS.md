@@ -1275,8 +1275,10 @@ The old runtime's pods are cleared, not left running: the kubelet on
 the new runtime does not know them and would start every static pod a
 second time beside its first, on the same ports. Pods that are not
 DaemonSets or static pods are drained first by whoever runs the
-command; the command itself only cordons nothing and evicts nothing,
-because the node's own credentials may not evict other pods.
+command; the command itself evicts nothing, because the node's own
+credentials may not evict other pods. kubeadm 1.27 and later keep the
+runtime's endpoint in `config.yaml`, earlier ones in the flags; both
+are read and changed.
 
 **The cost:** every pod left on the node restarts, the control plane's
 among them on a control plane node. The kubelet's cgroup driver changes
