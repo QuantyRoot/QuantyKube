@@ -57,6 +57,11 @@ fail() {
     kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=20 2>&1 || true
     if [ -n "$rt" ]; then
         printf '\n--- runtime\n'; tail -40 "$work/runtime.log"
+        # what the containers said, the API server's even when it is down
+        for f in /var/log/pods/*/*/*.log; do
+            [ -f "$f" ] || continue
+            printf '\n--- %s\n' "$f"; tail -15 "$f"
+        done
     fi
     printf '\n--- store\n'
     tail -40 "$work/qk.log" 2>/dev/null ||
