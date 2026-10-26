@@ -41,6 +41,7 @@ through and add a new entry, never silently edit history.
 - [ADR-034](#adr-034-the-store-on-raft-every-write-a-command-in-the-log-the-log-in-a-file-of-its-own) The store on Raft: every write a command in the log, the log in a file of its own
 - [ADR-035](#adr-035-a-cluster-moves-from-etcd-with-its-revisions-while-the-api-server-is-stopped) A cluster moves from etcd with its revisions, while the API server is stopped
 - [ADR-036](#adr-036-the-runtime-runs-what-a-kubeadm-node-needs-host-namespaces-added-capabilities-privileged) The runtime runs what a kubeadm node needs: host namespaces, added capabilities, privileged
+- [ADR-037](#adr-037-ci-publishes-a-public-image-of-every-commit-on-main) CI publishes a public image of every commit on main
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1229,4 +1230,21 @@ keeps ordinary workloads from asking is the cluster's admission, Pod
 Security Admission at `baseline` or stricter for every namespace but
 kube-system, as on any cluster with containerd. The runtime's own
 default for pods that ask for nothing is unchanged.
+
+## ADR-037: CI publishes a public image of every commit on main
+
+`kubectl apply` of the installer (ADR-009) can only bring QuantyKube
+to a node as a container image, so CI builds one on every push to main,
+once the tests and both kubeadm jobs have passed, and pushes it to
+`ghcr.io/quantyroot/quantykube`, tagged with the commit and `main`. It
+is public, so a cluster pulls it without credentials. The image is the
+release binary on distroless's `cc-debian13`: glibc and nothing else,
+no shell. The binary is built on the runner, whose glibc is older than
+the image's and the nodes', so `install store` can copy it onto the host
+from inside the container.
+
+**The cost:** every commit on main is public as a runnable image, not
+only as source. The manifest names an image by commit, never `main`,
+so a cluster runs what was tested. The base image is named by tag, not
+digest; pinning it is a follow-up.
 

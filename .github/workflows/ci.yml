@@ -261,6 +261,30 @@ jobs:
           name: kubectl-quanty-windows
           path: target/release/kubectl-quanty.exe
 
+  image:
+    # public, so that a cluster pulls it without credentials (ADR-037)
+    name: the image on ghcr.io
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, kubeadm]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: cargo build --release -p quantykube
+      - name: build and push
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          img=ghcr.io/quantyroot/quantykube
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t "$img:$GITHUB_SHA" -t "$img:main" .
+          docker run --rm "$img:$GITHUB_SHA" --version
+          docker push "$img:$GITHUB_SHA"
+          docker push "$img:main"
+
   msrv:
     name: test on MSRV (1.89)
     runs-on: ubuntu-latest
