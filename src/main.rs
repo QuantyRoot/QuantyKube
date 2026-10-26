@@ -24,6 +24,7 @@ const USAGE: &str = "usage:
                      --etcd-key <pem> --data <file>
   quantykube install store [--port <n>] [--kubernetes <dir>] [--state <dir>]
   quantykube undo store    [--kubernetes <dir>] [--state <dir>]
+  quantykube host    --root <dir> -- (install | undo) (store | runtime)
   quantykube install runtime [--kubelet <dir>] [--state <dir>]
   quantykube undo runtime    [--kubelet <dir>] [--state <dir>]
   quantykube unpack  --to <dir> <layer.tar.gz>...
@@ -78,6 +79,10 @@ its kubelet from its runtime onto quantykube runtime, run by systemd:
 it stops the kubelet and the old runtime's pods, starts the runtime,
 points the kubelet at it with the cgroupfs driver, and starts it again.
 undo runtime puts the kubelet back; --kubelet is /var/lib/kubelet.
+host runs one of those on the node from a privileged pod with the host's
+PID namespace and the host's / mounted at --root (ADR-039): it copies
+itself to /usr/local/bin there, enters the host's namespaces and runs
+the command as a systemd unit of its own, which outlives the pod.
 
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
@@ -112,6 +117,7 @@ fn main() {
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("migrate") => migrate(&args[1..]),
+        Some("host") => host(&args[1..]),
         Some(verb @ ("install" | "undo")) => {
             let undo = verb == "undo";
             match args.get(1).map(String::as_str) {
@@ -391,6 +397,34 @@ fn place_binary(binary: &Path) -> Result<(), String> {
         std::fs::rename(&tmp, binary).map_err(|e| format!("{}: {e}", binary.display()))?;
     }
     Ok(())
+}
+
+fn host(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(required(args, "--root")?);
+    let command: Vec<&String> = args.iter().skip_while(|a| *a != "--").skip(1).collect();
+    let allowed = matches!(
+        command.iter().map(|a| a.as_str()).collect::<Vec<_>>()[..],
+        ["install" | "undo", "store" | "runtime"]
+    );
+    if !allowed {
+        return Err(USAGE.to_string());
+    }
+    place_binary(&root.join("usr/local/bin/quantykube"))?;
+    quantykube_sys::enter_namespaces_of(1).map_err(|e| format!("entering the host: {e}"))?;
+    let unit = format!("quantykube-{}-{}", command[0], command[1]);
+    // its own unit, so that it outlives this pod, which a move of the
+    // node's runtime stops
+    let status = std::process::Command::new("systemd-run")
+        .args(["--unit", &unit, "--collect", "--wait", "--pipe", "--quiet"])
+        .arg("/usr/local/bin/quantykube")
+        .args(command.iter().map(|a| a.as_str()))
+        .status()
+        .map_err(|e| format!("systemd-run: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{unit}: {status}"))
+    }
 }
 
 fn install_runtime(args: &[String], undo: bool) -> Result<(), String> {

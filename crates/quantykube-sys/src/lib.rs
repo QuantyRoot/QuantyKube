@@ -1761,6 +1761,39 @@ pub fn release_namespaces(dir: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Moves the calling process into the namespaces of `pid`, the mount
+/// namespace last, and into its root: with `pid` 1 seen from the host's
+/// PID namespace, it then runs on the host. Children it starts afterwards
+/// are in the host's PID namespace too. Must be called while the process
+/// has one thread, as joining a mount namespace requires.
+pub fn enter_namespaces_of(pid: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let mut held = Vec::new();
+    for (name, kind) in [
+        ("cgroup", CLONE_NEWCGROUP),
+        ("ipc", CLONE_NEWIPC),
+        ("uts", CLONE_NEWUTS),
+        ("net", CLONE_NEWNET),
+        ("pid", CLONE_NEWPID),
+        ("mnt", CLONE_NEWNS),
+    ] {
+        held.push((std::fs::File::open(proc.join("ns").join(name))?, kind));
+    }
+    let root = std::fs::File::open(proc.join("root"))?;
+    for (f, kind) in &held {
+        // SAFETY: setns on a descriptor held open above.
+        if unsafe { setns(f.as_raw_fd(), *kind as c_int) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: fchdir and chroot on a descriptor and a static C string.
+    if unsafe { fchdir(root.as_raw_fd()) } != 0 || unsafe { chroot(c".".as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    std::env::set_current_dir("/")
+}
+
 pub fn signal(pid: i32, sig: i32) -> io::Result<()> {
     // SAFETY: kill takes two integers.
     if unsafe { kill(pid, sig) } == 0 {

@@ -43,6 +43,7 @@ through and add a new entry, never silently edit history.
 - [ADR-036](#adr-036-the-runtime-runs-what-a-kubeadm-node-needs-host-namespaces-added-capabilities-privileged) The runtime runs what a kubeadm node needs: host namespaces, added capabilities, privileged
 - [ADR-037](#adr-037-ci-publishes-a-public-image-of-every-commit-on-main) CI publishes a public image of every commit on main
 - [ADR-038](#adr-038-a-node-moves-onto-the-runtime-with-its-kubelet-stopped-and-its-old-pods-cleared) A node moves onto the runtime with its kubelet stopped and its old pods cleared
+- [ADR-039](#adr-039-kubectl-apply-reaches-a-node-through-a-privileged-pod-that-starts-a-systemd-unit) kubectl apply reaches a node through a privileged pod that starts a systemd unit
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1286,4 +1287,23 @@ from systemd to cgroupfs, as k3s runs it; a `kubeadm upgrade` rewrites
 `config.yaml` and needs the move done again. CI moves a one-node
 kubeadm cluster, control plane, etcd, kube-proxy and CoreDNS, onto the
 runtime and back (`scripts/kubeadm.sh node`).
+
+## ADR-039: kubectl apply reaches a node through a privileged pod that starts a systemd unit
+
+What `kubectl apply` can start is a pod. To run `install store` or
+`install runtime` (ADR-035, ADR-038) on a node, the installer starts a
+pod there from the public image (ADR-037) with the host's PID namespace,
+privileged, and the host's `/` mounted. `quantykube host` in it copies
+the binary to the host's `/usr/local/bin`, enters the namespaces of the
+host's PID 1 and runs the command with `systemd-run` as a unit of its
+own, waiting for it and passing on its output and result.
+
+The unit is what makes this work: moving a node's runtime stops every
+pod of the old runtime, the installer's own pod among them, and a
+command running inside that pod would die halfway. As a unit it runs
+to its end, or to its own undo, whatever happens to the pod.
+
+**The cost:** the installer's pod is root on the node, which is what
+ADR-009 says it has to be, and it is visible as such in the manifest.
+It runs only while a step runs, not as a DaemonSet that stays.
 

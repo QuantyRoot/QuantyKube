@@ -181,14 +181,15 @@ if [ "$mode" = node ]; then
     kubectl expose deployment web --port 80 --target-port 8080 >/dev/null
     kubectl rollout status deploy/web --timeout=120s >/dev/null ||
         fail "web is not ready on containerd"
-    # what a node of the cluster runs, by the name of its containers
+    # what a node of the cluster runs, by the name of its containers;
+    # the deployment named its container after its image
     running() {
         crictl -r "$1" ps -q --name "$2" 2>/dev/null | grep -q .
     }
     kubectl cordon "$(hostname)" >/dev/null
     "$QK" install runtime >"$work/install.log" 2>&1 ||
         { cat "$work/install.log"; fail "install runtime"; }
-    for c in kube-apiserver etcd kube-proxy coredns web; do
+    for c in kube-apiserver etcd kube-proxy coredns busybox; do
         retry 180 running "$ours" "$c"
     done
     retry 120 kubectl get --raw /readyz
@@ -211,7 +212,7 @@ if [ "$mode" = node ]; then
 
     "$QK" undo runtime >"$work/undo.log" 2>&1 ||
         { cat "$work/undo.log"; fail "undo runtime"; }
-    for c in kube-apiserver coredns web; do
+    for c in kube-apiserver coredns busybox; do
         retry 180 running "$containerd" "$c"
     done
     retry 120 kubectl get --raw /readyz
