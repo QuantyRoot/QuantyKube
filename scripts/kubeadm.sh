@@ -57,6 +57,12 @@ fail() {
     kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=20 2>&1 || true
     if [ -n "$rt" ]; then
         printf '\n--- runtime\n'; tail -40 "$work/runtime.log"
+        printf '\n--- containers\n'
+        crictl -r "$cri" ps -a 2>&1 | head -20
+        for c in $(crictl -r "$cri" ps -a -q --state exited 2>/dev/null | head -5); do
+            crictl -r "$cri" inspect "$c" 2>&1 |
+                grep -E '"(name|reason|message|exitCode)"' | head -6
+        done
         # what the containers said, the API server's even when it is down
         for f in /var/log/pods/*/*/*.log; do
             [ -f "$f" ] || continue

@@ -195,7 +195,10 @@ jobs:
           65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  kubectl
           ab3bda535f9d90766cccc90d3dddb5482003dd744d7f22bcf98186bf8eea8be6  cni.tgz
           SUMS
-          sudo install -m 755 kubeadm kubelet kubectl /usr/local/bin/
+          curl -fsSLo crictl.tgz https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.34.0/crictl-v1.34.0-linux-amd64.tar.gz
+          echo "a8ff2a3edb37a98daf3aba7c3b284fe0aa5bff24166d896ab9ef64c8913c9f51  crictl.tgz" | sha256sum -c -
+          tar -xzf crictl.tgz
+          sudo install -m 755 kubeadm kubelet kubectl crictl /usr/local/bin/
           sudo mkdir -p /opt/cni/bin && sudo tar -xzf cni.tgz -C /opt/cni/bin
       - name: prepare the machine as kubeadm expects it
         run: |
