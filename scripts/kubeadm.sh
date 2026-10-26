@@ -37,12 +37,7 @@ qk=
 rt=
 trap 'for p in $qk $rt; do kill "$p" 2>/dev/null || true; done' EXIT
 cri=unix:///run/containerd/containerd.sock
-if [ "$mode" = runtime ]; then
-    cri=unix:///run/quantykube-cri.sock
-    "$QK" runtime --root /var/lib/quantykube-runtime \
-        --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
-    rt=$!
-fi
+[ "$mode" = runtime ] && cri=unix:///run/quantykube-cri.sock
 
 fail() {
     printf 'FAIL: %s\n' "$*"
@@ -151,6 +146,14 @@ cat >/etc/cni/net.d/10-bridge.conflist <<'EOF'
   ]
 }
 EOF
+if [ "$mode" = runtime ]; then
+    # started once the network above is written: it takes the first
+    # configuration it finds, and the runner has podman's
+    "$QK" runtime --root /var/lib/quantykube-runtime \
+        --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
+    rt=$!
+    retry 30 test -S /run/quantykube-cri.sock
+fi
 kubeadm init --config "$work/kubeadm.yaml" >"$work/init.log" 2>&1 ||
     { cat "$work/init.log"; fail "kubeadm init"; }
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- >/dev/null
