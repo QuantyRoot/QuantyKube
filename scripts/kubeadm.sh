@@ -97,7 +97,7 @@ PY
         if [ -f "$work/strace" ]; then
             printf '\n--- strace of the scheduler\n'
             p=$(grep -m1 'execve("[^"]*kube-scheduler' "$work/strace" | cut -d' ' -f1)
-            grep "^$p " "$work/strace" | head -60
+            grep "^$p " "$work/strace" | sed -n "/execve/,\$p" | head -80
         fi
         k=$(crictl -r "$cri" ps -a -q --name kube-scheduler 2>/dev/null | head -1)
         printf '\n--- the kubelet'"'"'s scheduler\n'
