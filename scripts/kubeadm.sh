@@ -98,8 +98,8 @@ PY
             printf '\n--- strace of the scheduler\n'
             p=$(grep -m1 'execve("[^"]*kube-scheduler' "$work/strace" | cut -d' ' -f1)
             # its threads have pids of their own: everything after
-            sed -n "/^$p  *execve/,\$p" "$work/strace" |
-                grep -E "write\(|exit_group|openat|execve" | head -80
+            grep -m1 "^$p  *execve" "$work/strace" | cut -c1-3000
+            sed -n "/^$p  *execve/,\$p" "$work/strace" | grep "^$p " | head -60
         fi
         k=$(crictl -r "$cri" ps -a -q --name kube-scheduler 2>/dev/null | head -1)
         printf '\n--- the kubelet'"'"'s scheduler\n'
@@ -197,7 +197,7 @@ EOF
 if [ "$mode" = runtime ]; then
     # started once the network above is written: it takes the first
     # configuration it finds, and the runner has podman's
-    ${QK_TRACE:+strace -f -qq -o "$work/strace" -e trace=execve,exit_group,write,openat,mount -s 200} \
+    ${QK_TRACE:+strace -f -qq -v -o "$work/strace" -e trace=execve,exit_group,write,openat,mount -s 200} \
     "$QK" runtime --root /var/lib/quantykube-runtime \
         --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
     rt=$!
