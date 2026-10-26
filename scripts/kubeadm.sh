@@ -94,6 +94,11 @@ PY
         printf '\n--- probe real: %s\n' "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
         cut -c1-200 "$work/preal/real.log" | head -5
         cat "$work/real.json"; echo
+        if [ -f "$work/strace" ]; then
+            printf '\n--- strace of the scheduler\n'
+            p=$(grep -m1 'execve("[^"]*kube-scheduler' "$work/strace" | cut -d' ' -f1)
+            grep "^$p " "$work/strace" | head -60
+        fi
         k=$(crictl -r "$cri" ps -a -q --name kube-scheduler 2>/dev/null | head -1)
         printf '\n--- the kubelet'"'"'s scheduler\n'
         crictl -r "$cri" inspect "$k" 2>&1 | head -80
@@ -190,6 +195,7 @@ EOF
 if [ "$mode" = runtime ]; then
     # started once the network above is written: it takes the first
     # configuration it finds, and the runner has podman's
+    ${QK_TRACE:+strace -f -qq -o "$work/strace" -e trace=execve,exit_group,write,openat,mount -s 200} \
     "$QK" runtime --root /var/lib/quantykube-runtime \
         --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
     rt=$!

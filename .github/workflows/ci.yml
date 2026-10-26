@@ -237,7 +237,7 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable kubelet
       - run: cargo build --release
-      - run: sudo scripts/kubeadm.sh ${{ matrix.mode }}
+      - run: sudo env QK_TRACE=1 scripts/kubeadm.sh ${{ matrix.mode }}
 
   raft:
     name: Raft in the simulator, 5000 seeds per cluster size
