@@ -488,11 +488,7 @@ impl<B: Backend> Etcd<B> {
             }
             count += 1;
             if !req.count_only && kvs.len() < limit {
-                let mut k = kv(r);
-                if req.keys_only {
-                    k.value.clear();
-                }
-                kvs.push(k);
+                kvs.push(kv(r));
             }
             true
         };
@@ -520,6 +516,12 @@ impl<B: Backend> Etcd<B> {
             }
             if req.limit > 0 {
                 kvs.truncate(req.limit as usize);
+            }
+        }
+        // only now: a sort by value needs the values
+        if req.keys_only {
+            for k in &mut kvs {
+                k.value.clear();
             }
         }
         Ok(RangeResponse {
@@ -1907,6 +1909,29 @@ mod tests {
             ),
         );
         assert_eq!(many.responses.len(), MAX_TXN_OPS);
+    }
+
+    #[test]
+    fn keys_only_sorts_by_the_values_it_leaves_out() {
+        let e = etcd();
+        put(&e, "/s/a", "z", 0);
+        put(&e, "/s/b", "a", 0);
+        let r: RangeResponse = call(
+            &e,
+            "/etcdserverpb.KV/Range",
+            RangeRequest {
+                key: "/s/".into(),
+                range_end: "/s0".into(),
+                limit: 1,
+                keys_only: true,
+                sort_order: SortOrder::Ascend,
+                sort_target: SortTarget::Value,
+                ..Default::default()
+            },
+        );
+        assert_eq!(keys(&r), ["/s/b"]);
+        assert!(r.kvs[0].value.is_empty());
+        assert!(r.more);
     }
 
     #[test]
