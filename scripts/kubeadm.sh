@@ -16,6 +16,11 @@
 # resourceVersion, the cluster goes on, and `quantykube undo store` puts
 # it back on etcd.
 #
+# apply: kubeadm on containerd and its own etcd, then one `kubectl apply`
+# of deploy/quantykube.yaml with the image $IMAGE moves the store and the
+# labelled node onto QuantyKube, and setting the installation's undo
+# puts both back.
+#
 # node: kubeadm on containerd and its own etcd, `quantykube install
 # runtime` moves the kubelet onto QuantyKube's runtime, every pod of the
 # node starts again there, new pods reach a Service by name, and `quantykube
@@ -25,12 +30,12 @@
 # and kubectl on the PATH and the CNI plugins in /opt/cni/bin. It changes
 # this machine for good: for a CI runner or a server set up to be wiped.
 #
-#   [QK=target/release/quantykube] scripts/kubeadm.sh external|runtime|move|node
+#   [QK=target/release/quantykube] scripts/kubeadm.sh external|runtime|move|node|apply
 set -euo pipefail
 
-mode=${1:?external, runtime, move or node}
+mode=${1:?external, runtime, move, node or apply}
 
-QK=$(realpath "${QK:-target/release/quantykube}")
+QK=$(realpath -m "${QK:-target/release/quantykube}")
 pki=/etc/kubernetes/pki
 data=/var/lib/quantykube
 sock=/run/quantykube/store.sock
@@ -73,6 +78,10 @@ fail() {
         printf '\n--- quantykube-runtime\n'
         journalctl -u quantykube-runtime --no-pager | tail -30
     fi
+    printf '\n--- installation\n'
+    kubectl get installation quantykube -o yaml 2>&1 | sed -n '/^status:/,$p'
+    kubectl -n quantykube-system get pods -o wide 2>&1
+    kubectl -n quantykube-system logs deploy/quantykube-operator --tail=30 2>&1
     printf '\n--- store\n'
     tail -40 "$work/qk.log" 2>/dev/null ||
         journalctl -u quantykube-store --no-pager | tail -40
@@ -171,6 +180,66 @@ kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null ||
 kubectl -n kube-system rollout status deploy/coredns --timeout=180s \
     >/dev/null || fail "CoreDNS is not ready"
 echo "kubeadm init ($mode): ok"
+
+if [ "$mode" = apply ]; then
+    : "${IMAGE:?set IMAGE to the image to install}"
+    manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+    cp "$manifest" "$work/original.yaml"
+    node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+    runtime_of() {
+        kubectl get node "$node" \
+            -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}'
+    }
+    serve='mkdir -p /www && echo hello-from-web >/www/index.html &&
+        exec httpd -f -p 8080 -h /www'
+    kubectl create deployment web --image="$image" -- sh -c "$serve" >/dev/null
+    kubectl expose deployment web --port 80 --target-port 8080 >/dev/null
+    kubectl create configmap before --from-literal=v=1 >/dev/null
+    kubectl label node "$node" install.quantyroot.io/runtime=quantykube >/dev/null
+    sed "s|ghcr.io/quantyroot/quantykube:main|$IMAGE|g" deploy/quantykube.yaml |
+        kubectl apply -f - >/dev/null
+    # phase <wanted>: the API server is away for a while in between
+    phase() {
+        local p
+        for _ in $(seq 900); do
+            p=$(kubectl get installation quantykube \
+                -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            [ "$p" = "$1" ] && return 0
+            [ "$p" = Failed ] && fail "the installation failed"
+            sleep 1
+        done
+        fail "the installation did not reach $1 in 900s"
+    }
+    phase Done
+    grep -q -- '--etcd-servers=https://127.0.0.1:2479' "$manifest" ||
+        fail "the API server is not on the store"
+    case $(runtime_of) in quantykube://*) ;; *) fail "the node runs $(runtime_of)" ;; esac
+    [ "$(kubectl get configmap before -o jsonpath='{.data.v}')" = 1 ] ||
+        fail "a configmap from before the move"
+    kubectl rollout status deploy/web --timeout=180s >/dev/null ||
+        fail "web is not ready after the move"
+    kubectl run probe --image="$image" --restart=Never -- \
+        wget -qO- http://web.default.svc.cluster.local >/dev/null
+    kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe \
+        --timeout=120s >/dev/null || fail "the probe pod did not succeed"
+    [ "$(kubectl logs probe)" = hello-from-web ] || fail "the probe's answer"
+    kubectl delete pod probe >/dev/null
+    kubectl create configmap during --from-literal=v=2 >/dev/null
+    echo "kubectl apply: ok"
+
+    kubectl patch installation quantykube --type merge \
+        -p '{"spec":{"undo":true}}' >/dev/null
+    phase Undone
+    cmp -s "$manifest" "$work/original.yaml" ||
+        fail "the API server's manifest is not the original"
+    case $(runtime_of) in containerd://*) ;; *) fail "the node runs $(runtime_of)" ;; esac
+    [ "$(kubectl get configmap during -o jsonpath='{.data.v}')" = 2 ] ||
+        fail "what was written on the store is not in etcd"
+    kubectl rollout status deploy/web --timeout=180s >/dev/null ||
+        fail "web is not ready after the undo"
+    echo "undo: ok"
+    exit 0
+fi
 
 if [ "$mode" = node ]; then
     ours=unix:///run/quantykube-cri.sock

@@ -25,6 +25,7 @@ const USAGE: &str = "usage:
   quantykube install store [--port <n>] [--kubernetes <dir>] [--state <dir>]
   quantykube undo store    [--kubernetes <dir>] [--state <dir>]
   quantykube host    --root <dir> -- (install | undo) (store | runtime)
+  quantykube operator
   quantykube install runtime [--kubelet <dir>] [--state <dir>]
   quantykube undo runtime    [--kubelet <dir>] [--state <dir>]
   quantykube unpack  --to <dir> <layer.tar.gz>...
@@ -83,6 +84,11 @@ host runs one of those on the node from a privileged pod with the host's
 PID namespace and the host's / mounted at --root (ADR-039): it copies
 itself to /usr/local/bin there, enters the host's namespaces and runs
 the command as a systemd unit of its own, which outlives the pod.
+operator is what deploy/quantykube.yaml runs in the cluster (ADR-040):
+it moves the store and then the runtime of every node labelled
+install.quantyroot.io/runtime=quantykube, through such pods, and back
+when the installation's spec.undo is set. It reads IMAGE, POD_NAME and
+POD_NAMESPACE from its environment.
 
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
@@ -118,6 +124,7 @@ fn main() {
         Some("restore") => restore(&args[1..]),
         Some("migrate") => migrate(&args[1..]),
         Some("host") => host(&args[1..]),
+        Some("operator") => operator(),
         Some(verb @ ("install" | "undo")) => {
             let undo = verb == "undo";
             match args.get(1).map(String::as_str) {
@@ -425,6 +432,21 @@ fn host(args: &[String]) -> Result<(), String> {
     } else {
         Err(format!("{unit}: {status}"))
     }
+}
+
+fn operator() -> Result<(), String> {
+    let env = |k: &str| std::env::var(k).map_err(|_| format!("{k} is not set"));
+    let op = quantykube::operator::Operator {
+        kube: quantykube::kube::Kube::in_cluster()?,
+        image: env("IMAGE")?,
+        namespace: env("POD_NAMESPACE")?,
+        pod: env("POD_NAME")?,
+    };
+    eprintln!(
+        "quantykube operator: following installations.{}",
+        quantykube::operator::GROUP
+    );
+    op.run()
 }
 
 fn install_runtime(args: &[String], undo: bool) -> Result<(), String> {

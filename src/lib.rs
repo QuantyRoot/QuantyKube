@@ -11,6 +11,8 @@ pub mod etcdclient;
 pub mod etcdpb;
 pub mod image;
 pub mod install;
+pub mod kube;
+pub mod operator;
 pub mod raft;
 pub mod registry;
 pub mod runtime;

@@ -1,0 +1,171 @@
+# QuantyKube for a kubeadm cluster, in one kubectl apply (ADR-009,
+# ADR-040). The operator moves the API server from etcd onto QuantyKube's
+# store, then each node labelled install.quantyroot.io/runtime=quantykube
+# from its runtime onto QuantyKube's, and records every step in
+#
+#   kubectl get installation quantykube
+#
+# Back to how it was:
+#
+#   kubectl patch installation quantykube --type merge -p '{"spec":{"undo":true}}'
+#
+# The pods it starts on nodes are root there, as any runtime installer
+# is: read them below before applying.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quantykube-system
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: installations.install.quantyroot.io
+spec:
+  group: install.quantyroot.io
+  scope: Cluster
+  names:
+    kind: Installation
+    plural: installations
+    singular: installation
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Message
+          type: string
+          jsonPath: .status.message
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                store:
+                  type: boolean
+                  description: Move the API server onto QuantyKube's store.
+                runtimeSelector:
+                  type: string
+                  description: Nodes with this label get QuantyKube's runtime.
+                undo:
+                  type: boolean
+                  description: Put everything back as it was.
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: quantykube
+  namespace: quantykube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: quantykube-installer
+rules:
+  - apiGroups: [install.quantyroot.io]
+    resources: [installations, installations/status]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quantykube-installer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: quantykube-installer
+subjects:
+  - kind: ServiceAccount
+    name: quantykube
+    namespace: quantykube-system
+---
+# its agents, the privileged pods, only in its own namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: quantykube-agents
+  namespace: quantykube-system
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quantykube-agents
+  namespace: quantykube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: quantykube-agents
+subjects:
+  - kind: ServiceAccount
+    name: quantykube
+    namespace: quantykube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quantykube-operator
+  namespace: quantykube-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: quantykube-operator
+  template:
+    metadata:
+      labels:
+        app: quantykube-operator
+    spec:
+      serviceAccountName: quantykube
+      # it may have to wait out its own node's move
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: operator
+          image: ghcr.io/quantyroot/quantykube:main
+          args: [operator]
+          env:
+            - name: IMAGE
+              value: ghcr.io/quantyroot/quantykube:main
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: [ALL]

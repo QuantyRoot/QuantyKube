@@ -44,6 +44,7 @@ through and add a new entry, never silently edit history.
 - [ADR-037](#adr-037-ci-publishes-a-public-image-of-every-commit-on-main) CI publishes a public image of every commit on main
 - [ADR-038](#adr-038-a-node-moves-onto-the-runtime-with-its-kubelet-stopped-and-its-old-pods-cleared) A node moves onto the runtime with its kubelet stopped and its old pods cleared
 - [ADR-039](#adr-039-kubectl-apply-reaches-a-node-through-a-privileged-pod-that-starts-a-systemd-unit) kubectl apply reaches a node through a privileged pod that starts a systemd unit
+- [ADR-040](#adr-040-one-kubectl-apply-an-operator-that-records-every-step-in-an-installation) One kubectl apply: an operator that records every step in an Installation
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1306,4 +1307,38 @@ to its end, or to its own undo, whatever happens to the pod.
 **The cost:** the installer's pod is root on the node, which is what
 ADR-009 says it has to be, and it is visible as such in the manifest.
 It runs only while a step runs, not as a DaemonSet that stays.
+
+## ADR-040: One kubectl apply: an operator that records every step in an Installation
+
+`deploy/quantykube.yaml` is the one command of ADR-009. It holds a
+namespace, the `Installation` custom resource
+(`install.quantyroot.io/v1alpha1`, cluster scoped, its own group because
+`quanty.quantyroot.io` belongs to the history API), the operator's
+service account and RBAC, and the operator's Deployment. The operator
+creates the Installation named quantykube if there is none, asking for
+the store and for the runtime on every node labelled
+`install.quantyroot.io/runtime=quantykube`, so that labelling w1 and one
+`kubectl apply` are the whole demonstration.
+
+It works in passes a few seconds apart, each taking at most one step
+and writing it to the Installation's status before the next: the store
+through an agent pod on the control plane node (ADR-039), then each
+labelled node in turn, cordoned, drained as `kubectl drain` drains, its
+agent started, and done once the node is Ready on the runtime it should
+have, then uncordoned. `spec.undo` runs the same in reverse, nodes
+first. An operator that is restarted halfway, as it is when its own
+node changes runtime, reads the status and goes on. `kubectl get
+installation` shows the phase and what it is doing.
+
+It speaks to the API server with a small client of its own
+(`src/kube.rs`), JSON over HTTP/1.1 and TLS with the service account's
+token, as the store's other clients are its own.
+
+**The cost:** a node whose move neither finishes nor fails visibly is
+given ten minutes, then the installation is marked Failed and the node
+left as the agent's own undo left it. One control plane node is
+supported, as for the store. The manifest names the image `main`, which
+CI publishes only after every test passed; for the stage it is pinned
+to a commit. CI runs the whole thing against the image of every commit
+on main (job kubeadm-apply).
 
