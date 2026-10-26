@@ -21,8 +21,8 @@ needs a shell on a server.
 
 As kubeadm's documentation asks: swap off, `br_netfilter` loaded,
 `net.ipv4.ip_forward=1`, containerd with `SystemdCgroup = true`, and
-kubeadm, kubelet and kubectl v1.37.1. CI does the same on a runner
-(`.github/workflows/ci.yml`, job kubeadm).
+kubeadm, kubelet and kubectl v1.37.1: `scripts/kubeadm-node.sh`, which
+CI runs on its runners too.
 
 ## cp
 
@@ -35,30 +35,40 @@ kubectl apply -f <flannel manifest, pinned>
 The laptop gets `/etc/kubernetes/admin.conf` with the server address
 changed to cp's public one.
 
-Moving the store, on cp as root (ADR-035):
-
-```
-quantykube install store
-```
-
-It stops the API server, copies every key from etcd with its revisions,
-starts the store under systemd on 127.0.0.1:2479 and the API server on
-it. etcd keeps running untouched; `quantykube undo store` goes back to
-it. CI runs both on a one-node kubeadm cluster
-(`scripts/kubeadm.sh move`), and a cluster set up on the store from the
-start (`scripts/kubeadm.sh external`).
-
 ## w1 and w2
 
 ```
 kubeadm join <cp>:6443 --token <token> --discovery-token-ca-cert-hash <hash>
 ```
 
-w1 then moves its kubelet onto `quantykube runtime`. On a kubeadm node
-that means kube-proxy and the CNI's DaemonSet run under the runtime too,
-and both want the host's network, and kube-proxy a privileged
-container, which the runtime refuses today (ADR-018). Until that is
-decided and built, w1 stays on containerd.
+On w1, kube-proxy and the CNI's DaemonSet run on the runtime too, on
+the host's network, kube-proxy privileged (ADR-036).
+
+## Onto QuantyKube
+
+From the laptop, once w1 and w2 have joined (ADR-040):
+
+```
+kubectl label node w1 install.quantyroot.io/runtime=quantykube
+kubectl apply -f https://raw.githubusercontent.com/QuantyRoot/QuantyKube/<commit>/deploy/quantykube.yaml
+kubectl get installation quantykube -w
+```
+
+The operator moves the API server from etcd onto the store (ADR-035),
+then w1's kubelet from containerd onto `quantykube runtime` (ADR-038):
+cordon, drain, the move, Ready on the new runtime, uncordon. w2 is not
+labelled and stays on containerd. Back to how it was:
+
+```
+kubectl patch installation quantykube --type merge -p '{"spec":{"undo":true}}'
+```
+
+etcd and containerd keep running untouched the whole time; the undo
+copies what was written on the store back into etcd. CI runs all of it
+on a one-node kubeadm cluster with the published image of each commit
+(job kubeadm-apply), and the pieces on their own: the store as etcd
+from the start, every pod on the runtime, the store moved and back, the
+kubelet moved and back (`scripts/kubeadm.sh external|runtime|move|node`).
 
 ## What is measured
 

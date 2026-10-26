@@ -75,6 +75,8 @@ watches see the object return.
 | Several store nodes (Raft): a simulator that finds planted bugs, three nodes under kube-apiserver with the leader killed, log compaction and snapshots ([ADR-032 to 034](docs/DECISIONS.md)) | built, runs in CI |
 | kubeadm with the store as its etcd ([scripts/kubeadm.sh](scripts/kubeadm.sh)) | runs in CI |
 | Moving a kubeadm cluster from etcd and back: `migrate`, `install store`, `undo store`, every object at its resourceVersion ([ADR-035](docs/DECISIONS.md)) | runs in CI |
+| A kubeadm cluster with every pod on the runtime, kube-proxy and the control plane included ([ADR-036](docs/DECISIONS.md)) | runs in CI |
+| One `kubectl apply` ([deploy/quantykube.yaml](deploy/quantykube.yaml)): an operator moves the store and labelled nodes onto QuantyKube and back ([ADR-038 to 040](docs/DECISIONS.md)) | runs in CI on one node |
 
 ## Trying it
 

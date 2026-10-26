@@ -43,6 +43,11 @@ work=$(mktemp -d)
 export KUBECONFIG=/etc/kubernetes/admin.conf
 image=mirror.gcr.io/library/busybox@sha256:
 image+=b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+# what a client in a pod does: a lost DNS packet or a Service not yet
+# programmed is asked again, as a client asks again
+fetch='for i in $(seq 20); do
+    wget -qO- -T 5 http://web.default.svc.cluster.local && exit 0; sleep 2
+done; exit 1'
 qk=
 rt=
 trap 'for p in $qk $rt; do kill "$p" 2>/dev/null || true; done' EXIT
@@ -219,7 +224,7 @@ if [ "$mode" = apply ]; then
     kubectl rollout status deploy/web --timeout=180s >/dev/null ||
         fail "web is not ready after the move"
     kubectl run probe --image="$image" --restart=Never -- \
-        wget -qO- http://web.default.svc.cluster.local >/dev/null
+        sh -c "$fetch" >/dev/null
     kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe \
         --timeout=120s >/dev/null || fail "the probe pod did not succeed"
     [ "$(kubectl logs probe)" = hello-from-web ] || fail "the probe's answer"
@@ -270,7 +275,7 @@ if [ "$mode" = node ]; then
     kubectl rollout status deploy/web --timeout=120s >/dev/null ||
         fail "web is not ready on quantykube runtime"
     kubectl run probe --image="$image" --restart=Never -- \
-        wget -qO- http://web.default.svc.cluster.local >/dev/null
+        sh -c "$fetch" >/dev/null
     kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe \
         --timeout=120s >/dev/null || fail "the probe pod did not succeed"
     [ "$(kubectl logs probe)" = hello-from-web ] || fail "the probe's answer"
@@ -361,7 +366,7 @@ kubectl expose deployment web --port 80 --target-port 8080 >/dev/null
 kubectl rollout status deploy/web --timeout=120s >/dev/null ||
     fail "web is not ready"
 kubectl run probe --image="$image" --restart=Never -- \
-    wget -qO- http://web.default.svc.cluster.local >/dev/null
+    sh -c "$fetch" >/dev/null
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe \
     --timeout=120s >/dev/null || fail "the probe pod did not succeed"
 got=$(kubectl logs probe)
