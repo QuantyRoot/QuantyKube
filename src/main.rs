@@ -419,14 +419,24 @@ fn host(args: &[String]) -> Result<(), String> {
     place_binary(&root.join("usr/local/bin/quantykube"))?;
     quantykube_sys::enter_namespaces_of(1).map_err(|e| format!("entering the host: {e}"))?;
     let unit = format!("quantykube-{}-{}", command[0], command[1]);
+    let since = format!(
+        "@{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    );
     // its own unit, so that it outlives this pod, which a move of the
-    // node's runtime stops
+    // node's runtime stops. Its output goes to the journal: a pipe from
+    // this pod would keep the pod's runtime waiting for the pod to end.
     let status = std::process::Command::new("systemd-run")
-        .args(["--unit", &unit, "--collect", "--wait", "--pipe", "--quiet"])
+        .args(["--unit", &unit, "--collect", "--wait", "--quiet"])
         .arg("/usr/local/bin/quantykube")
         .args(command.iter().map(|a| a.as_str()))
         .status()
         .map_err(|e| format!("systemd-run: {e}"))?;
+    let _ = std::process::Command::new("journalctl")
+        .args(["-u", &unit, "--since", &since, "-o", "cat", "--no-pager"])
+        .status();
     if status.success() {
         Ok(())
     } else {

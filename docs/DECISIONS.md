@@ -1297,7 +1297,10 @@ pod there from the public image (ADR-037) with the host's PID namespace,
 privileged, and the host's `/` mounted. `quantykube host` in it copies
 the binary to the host's `/usr/local/bin`, enters the namespaces of the
 host's PID 1 and runs the command with `systemd-run` as a unit of its
-own, waiting for it and passing on its output and result.
+own, waits for it, then shows its journal and passes on its result.
+The unit writes to the journal, not to the pod: given the pod's output
+pipe, it held the pod open, and containerd, asked by the unit to stop
+that pod, waited for the pipe until the unit gave up.
 
 The unit is what makes this work: moving a node's runtime stops every
 pod of the old runtime, the installer's own pod among them, and a

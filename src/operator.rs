@@ -305,7 +305,7 @@ impl Operator {
                 return self.fail(&format!(
                     "{verb} runtime on {node} did not finish in {NODE_DEADLINE}s, \
                      the node runs {runtime}; journalctl -u quantykube-{verb}-runtime \
-                     on the node says why. {log}"
+                     on the node says why: {log}"
                 ));
             }
             return Err(WAIT.into());
