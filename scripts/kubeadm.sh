@@ -6,6 +6,11 @@
 # name, a deleted object restored from the history, and the store killed
 # with SIGKILL under the running cluster and started again.
 #
+# runtime: as external, and the kubelet starts every pod through
+# `quantykube runtime` instead of containerd: the control plane's static
+# pods, kube-proxy on the host's network and privileged, CoreDNS and the
+# test pods.
+#
 # move: kubeadm sets it up on its own etcd, `quantykube install store`
 # moves the API server onto QuantyKube with every object at its
 # resourceVersion, the cluster goes on, and `quantykube undo store` puts
@@ -15,10 +20,10 @@
 # and kubectl on the PATH and the CNI plugins in /opt/cni/bin. It changes
 # this machine for good: for a CI runner or a server set up to be wiped.
 #
-#   [QK=target/release/quantykube] scripts/kubeadm.sh external|move
+#   [QK=target/release/quantykube] scripts/kubeadm.sh external|runtime|move
 set -euo pipefail
 
-mode=${1:?external or move}
+mode=${1:?external, runtime or move}
 
 QK=$(realpath "${QK:-target/release/quantykube}")
 pki=/etc/kubernetes/pki
@@ -29,7 +34,15 @@ export KUBECONFIG=/etc/kubernetes/admin.conf
 image=mirror.gcr.io/library/busybox@sha256:
 image+=b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
 qk=
-trap '[ -z "$qk" ] || kill "$qk" 2>/dev/null || true' EXIT
+rt=
+trap 'for p in $qk $rt; do kill "$p" 2>/dev/null || true; done' EXIT
+cri=unix:///run/containerd/containerd.sock
+if [ "$mode" = runtime ]; then
+    cri=unix:///run/quantykube-cri.sock
+    "$QK" runtime --root /var/lib/quantykube-runtime \
+        --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
+    rt=$!
+fi
 
 fail() {
     printf 'FAIL: %s\n' "$*"
@@ -42,6 +55,9 @@ fail() {
     done
     printf '\n--- kube-proxy\n'
     kubectl -n kube-system logs -l k8s-app=kube-proxy --tail=20 2>&1 || true
+    if [ -n "$rt" ]; then
+        printf '\n--- runtime\n'; tail -40 "$work/runtime.log"
+    fi
     printf '\n--- store\n'
     tail -40 "$work/qk.log" 2>/dev/null ||
         journalctl -u quantykube-store --no-pager | tail -40
@@ -74,14 +90,14 @@ cat >"$work/kubeadm.yaml" <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
-  criSocket: unix:///run/containerd/containerd.sock
+  criSocket: $cri
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 networking:
   podSubnet: 10.244.0.0/16
 EOF
-if [ "$mode" = external ]; then
+if [ "$mode" != move ]; then
     cat >>"$work/kubeadm.yaml" <<EOF
 etcd:
   external:
@@ -95,6 +111,15 @@ EOF
     kubeadm init phase certs etcd-server
     kubeadm init phase certs apiserver-etcd-client
     start
+fi
+if [ "$mode" = runtime ]; then
+    # the runtime places containers in cgroupfs paths (RUNTIME.md)
+    cat >>"$work/kubeadm.yaml" <<EOF
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: cgroupfs
+EOF
 fi
 # one node, so a bridge is the whole pod network
 mkdir -p /etc/cni/net.d
