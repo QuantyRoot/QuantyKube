@@ -24,6 +24,8 @@ const USAGE: &str = "usage:
                      --etcd-key <pem> --data <file>
   quantykube install store [--port <n>] [--kubernetes <dir>] [--state <dir>]
   quantykube undo store    [--kubernetes <dir>] [--state <dir>]
+  quantykube install runtime [--kubelet <dir>] [--state <dir>]
+  quantykube undo runtime    [--kubelet <dir>] [--state <dir>]
   quantykube unpack  --to <dir> <layer.tar.gz>...
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
@@ -71,6 +73,11 @@ store puts the API server back on etcd, which install never changes,
 with what was written on the store copied into it first.
 --kubernetes is /etc/kubernetes and --state /var/lib/quantykube unless
 given; the journal of each step is in <state>/install.
+install runtime, as root on a kubeadm node that has been drained, moves
+its kubelet from its runtime onto quantykube runtime, run by systemd:
+it stops the kubelet and the old runtime's pods, starts the runtime,
+points the kubelet at it with the cgroupfs driver, and starts it again.
+undo runtime puts the kubelet back; --kubelet is /var/lib/kubelet.
 
 unpack and sandbox are the first pieces of the node runtime
 (docs/RUNTIME.md), here to be measured, not used: unpack applies image
@@ -105,11 +112,13 @@ fn main() {
         Some("history") => history(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("migrate") => migrate(&args[1..]),
-        Some("install") if args.get(1).map(String::as_str) == Some("store") => {
-            install(&args[2..], false)
-        }
-        Some("undo") if args.get(1).map(String::as_str) == Some("store") => {
-            install(&args[2..], true)
+        Some(verb @ ("install" | "undo")) => {
+            let undo = verb == "undo";
+            match args.get(1).map(String::as_str) {
+                Some("store") => install(&args[2..], undo),
+                Some("runtime") => install_runtime(&args[2..], undo),
+                _ => Err(USAGE.to_string()),
+            }
         }
         Some("sandbox") => sandbox(&args[1..]),
         Some("unpack") => unpack(&args[1..]),
@@ -369,14 +378,32 @@ fn install(args: &[String], undo: bool) -> Result<(), String> {
     if undo {
         return quantykube::install::undo(&layout);
     }
-    // the store outlives the command that installed it
+    place_binary(&binary)?;
+    quantykube::install::install(&layout)
+}
+
+/// Copies this program to `binary`: what it installs outlives it.
+fn place_binary(binary: &Path) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    if std::fs::canonicalize(&me).ok() != std::fs::canonicalize(&binary).ok() {
+    if std::fs::canonicalize(&me).ok() != std::fs::canonicalize(binary).ok() {
         let tmp = binary.with_extension("new");
         std::fs::copy(&me, &tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &binary).map_err(|e| format!("{}: {e}", binary.display()))?;
+        std::fs::rename(&tmp, binary).map_err(|e| format!("{}: {e}", binary.display()))?;
     }
-    quantykube::install::install(&layout)
+    Ok(())
+}
+
+fn install_runtime(args: &[String], undo: bool) -> Result<(), String> {
+    let layout = quantykube::install::NodeLayout {
+        kubelet: PathBuf::from(value(args, "--kubelet").unwrap_or("/var/lib/kubelet")),
+        state: PathBuf::from(value(args, "--state").unwrap_or("/var/lib/quantykube")),
+        binary: PathBuf::from("/usr/local/bin/quantykube"),
+    };
+    if undo {
+        return quantykube::install::undo_runtime(&layout);
+    }
+    place_binary(&layout.binary)?;
+    quantykube::install::install_runtime(&layout)
 }
 
 fn migrate(args: &[String]) -> Result<(), String> {

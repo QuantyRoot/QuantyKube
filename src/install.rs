@@ -434,3 +434,295 @@ mod tests {
         assert_eq!(with_flag(MANIFEST, "etcd-cafile", "x"), None);
     }
 }
+
+/// Where a kubeadm node keeps its kubelet's settings.
+pub struct NodeLayout {
+    pub kubelet: PathBuf,
+    pub state: PathBuf,
+    pub binary: PathBuf,
+}
+
+const RUNTIME_UNIT: &str = "/etc/systemd/system/quantykube-runtime.service";
+const RUNTIME_SOCKET: &str = "/run/quantykube-cri.sock";
+
+impl NodeLayout {
+    fn flags(&self) -> PathBuf {
+        self.kubelet.join("kubeadm-flags.env")
+    }
+    fn config(&self) -> PathBuf {
+        self.kubelet.join("config.yaml")
+    }
+    fn journal(&self) -> PathBuf {
+        self.state.join("install-runtime")
+    }
+}
+
+/// Answers nothing, as the CRI's stop and remove calls do.
+#[derive(Default)]
+struct Empty;
+
+impl crate::cripb::Message for Empty {
+    fn write(&self, _out: &mut Vec<u8>) {}
+    fn merge(&mut self, _buf: &[u8]) -> Result<(), quantycore::proto::DecodeError> {
+        Ok(())
+    }
+}
+
+fn cri_call<Q: crate::cripb::Message, R: crate::cripb::Message>(
+    endpoint: &str,
+    method: &str,
+    req: &Q,
+) -> Result<R, String> {
+    let path = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
+    let sock = std::os::unix::net::UnixStream::connect(path).map_err(err(path))?;
+    sock.set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(err(path))?;
+    let body = quantycore::grpc::call(sock, method, &req.encode())
+        .map_err(|s| format!("{endpoint} {method}: {}", s.message))?;
+    R::decode(&body).map_err(|e| format!("{endpoint} {method}: {e:?}"))
+}
+
+/// Stops and removes every pod of the runtime at `endpoint`, so that the
+/// kubelet, pointed at the other runtime, starts each once and not twice.
+fn clear_pods(endpoint: &str) -> Result<usize, String> {
+    use crate::cripb::{ListPodSandboxRequest, ListPodSandboxResponse};
+    use crate::cripb::{RemovePodSandboxRequest, StopPodSandboxRequest};
+    const RUNTIME: &str = "/runtime.v1.RuntimeService/";
+    let list: ListPodSandboxResponse = cri_call(
+        endpoint,
+        &format!("{RUNTIME}ListPodSandbox"),
+        &ListPodSandboxRequest::default(),
+    )?;
+    for p in &list.items {
+        let _: Empty = cri_call(
+            endpoint,
+            &format!("{RUNTIME}StopPodSandbox"),
+            &StopPodSandboxRequest {
+                pod_sandbox_id: p.id.clone(),
+            },
+        )?;
+        let _: Empty = cri_call(
+            endpoint,
+            &format!("{RUNTIME}RemovePodSandbox"),
+            &RemovePodSandboxRequest {
+                pod_sandbox_id: p.id.clone(),
+            },
+        )?;
+    }
+    Ok(list.items.len())
+}
+
+fn runtime_ready() -> Result<(), String> {
+    let _: crate::cripb::VersionResponse = cri_call(
+        RUNTIME_SOCKET,
+        "/runtime.v1.RuntimeService/Version",
+        &crate::cripb::VersionRequest::default(),
+    )?;
+    Ok(())
+}
+
+/// The kubelet's health endpoint answers ok.
+fn kubelet_healthy() -> Result<(), String> {
+    let tcp = std::net::TcpStream::connect("127.0.0.1:10248").map_err(err("kubelet"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(err("kubelet"))?;
+    let req = quantycore::http1::Request {
+        method: "GET",
+        target: "/healthz",
+        host: "127.0.0.1:10248",
+        headers: &[("Connection", "close")],
+    };
+    let resp = quantycore::http1::send(tcp, &req).map_err(|e| format!("kubelet: {e}"))?;
+    if resp.status == 200 {
+        Ok(())
+    } else {
+        Err(format!("kubelet /healthz: {}", resp.status))
+    }
+}
+
+/// The kubelet's flags with its runtime endpoint replaced.
+fn with_endpoint(flags: &str, endpoint: &str) -> Option<String> {
+    let key = "--container-runtime-endpoint=";
+    let start = flags.find(key)? + key.len();
+    let end = flags[start..]
+        .find([' ', '"'])
+        .map_or(flags.len(), |n| start + n);
+    Some(format!("{}{endpoint}{}", &flags[..start], &flags[end..]))
+}
+
+fn endpoint_of(flags: &str) -> Option<String> {
+    let key = "--container-runtime-endpoint=";
+    let start = flags.find(key)? + key.len();
+    let rest = &flags[start..];
+    Some(rest[..rest.find([' ', '"']).unwrap_or(rest.len())].to_string())
+}
+
+/// The kubelet's configuration with its cgroup driver set.
+fn with_cgroup_driver(config: &str, driver: &str) -> String {
+    let mut found = false;
+    let mut out: String = config
+        .split_inclusive('\n')
+        .map(|l| {
+            if l.starts_with("cgroupDriver:") {
+                found = true;
+                format!("cgroupDriver: {driver}\n")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("cgroupDriver: {driver}\n"));
+    }
+    out
+}
+
+fn write_file(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("quantykube-new");
+    fs::write(&tmp, text).map_err(err(tmp.display()))?;
+    fs::rename(&tmp, path).map_err(err(path.display()))
+}
+
+fn runtime_step(l: &NodeLayout, name: &str) -> Result<(), String> {
+    fs::write(l.journal().join("step"), format!("{name}\n")).map_err(err("journal"))?;
+    eprintln!("quantykube: {name}");
+    Ok(())
+}
+
+/// Moves this node's kubelet from its runtime onto `quantykube runtime`.
+/// The node is drained first, by whoever runs this: what still runs on
+/// it, DaemonSets and static pods, is stopped and started again on the
+/// new runtime. On any failure the kubelet goes back.
+pub fn install_runtime(l: &NodeLayout) -> Result<(), String> {
+    if l.journal().exists() {
+        return Err(format!(
+            "an install is recorded in {}; undo it first",
+            l.journal().display()
+        ));
+    }
+    let flags = fs::read_to_string(l.flags()).map_err(err(l.flags().display()))?;
+    let config = fs::read_to_string(l.config()).map_err(err(l.config().display()))?;
+    let old =
+        endpoint_of(&flags).ok_or("no --container-runtime-endpoint in the kubelet's flags")?;
+    let target = format!("unix://{RUNTIME_SOCKET}");
+    if old == target {
+        return Err("the kubelet already uses quantykube runtime".into());
+    }
+    let new_flags = with_endpoint(&flags, &target).expect("the endpoint was found");
+    // the runtime places containers by cgroupfs paths (RUNTIME.md)
+    let new_config = with_cgroup_driver(&config, "cgroupfs");
+    fs::create_dir_all(l.journal()).map_err(err(l.journal().display()))?;
+    fs::write(l.journal().join("kubeadm-flags.env"), &flags).map_err(err("journal"))?;
+    fs::write(l.journal().join("config.yaml"), &config).map_err(err("journal"))?;
+    let moved = (|| {
+        runtime_step(l, "stopping the kubelet")?;
+        systemctl(&["stop", "kubelet"])?;
+        runtime_step(l, "stopping the pods of the old runtime")?;
+        let n = clear_pods(&old)?;
+        eprintln!("quantykube: {n} pods stopped on {old}");
+        runtime_step(l, "starting quantykube runtime")?;
+        fs::write(RUNTIME_UNIT, runtime_unit(l)).map_err(err(RUNTIME_UNIT))?;
+        systemctl(&["daemon-reload"])?;
+        systemctl(&["enable", "--now", "quantykube-runtime.service"])?;
+        wait("the runtime starting", 60, runtime_ready)?;
+        runtime_step(l, "starting the kubelet on it")?;
+        write_file(&l.flags(), &new_flags)?;
+        write_file(&l.config(), &new_config)?;
+        systemctl(&["start", "kubelet"])?;
+        wait("the kubelet becoming healthy", 120, kubelet_healthy)
+    })();
+    match moved {
+        Ok(()) => {
+            runtime_step(l, "done")?;
+            println!("the kubelet runs on quantykube runtime; {old} is untouched");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("quantykube: {e}; putting the kubelet back");
+            undo_runtime(l).map_err(|u| format!("{e}; and the undo failed too: {u}"))?;
+            Err(e)
+        }
+    }
+}
+
+/// Puts the kubelet back on the runtime the journal recorded.
+pub fn undo_runtime(l: &NodeLayout) -> Result<(), String> {
+    if !l.journal().exists() {
+        return Err(format!(
+            "no install is recorded in {}",
+            l.journal().display()
+        ));
+    }
+    let flags =
+        fs::read_to_string(l.journal().join("kubeadm-flags.env")).map_err(err("journal"))?;
+    let config = fs::read_to_string(l.journal().join("config.yaml")).map_err(err("journal"))?;
+    eprintln!("quantykube: putting the kubelet back on its runtime");
+    systemctl(&["stop", "kubelet"])?;
+    if runtime_ready().is_ok() {
+        let n = clear_pods(&format!("unix://{RUNTIME_SOCKET}"))?;
+        eprintln!("quantykube: {n} pods stopped on quantykube runtime");
+    }
+    write_file(&l.flags(), &flags)?;
+    write_file(&l.config(), &config)?;
+    if Path::new(RUNTIME_UNIT).exists() {
+        let _ = systemctl(&["disable", "--now", "quantykube-runtime.service"]);
+        fs::remove_file(RUNTIME_UNIT).map_err(err(RUNTIME_UNIT))?;
+        let _ = systemctl(&["daemon-reload"]);
+    }
+    systemctl(&["start", "kubelet"])?;
+    wait("the kubelet becoming healthy", 120, kubelet_healthy)?;
+    fs::remove_dir_all(l.journal()).map_err(err(l.journal().display()))?;
+    println!("the kubelet runs on its own runtime again");
+    Ok(())
+}
+
+fn runtime_unit(l: &NodeLayout) -> String {
+    format!(
+        "[Unit]\n\
+         Description=QuantyKube runtime\n\
+         Before=kubelet.service\n\
+         [Service]\n\
+         ExecStart={bin} runtime --root /var/lib/quantykube-runtime --socket {RUNTIME_SOCKET}\n\
+         Restart=always\n\
+         RestartSec=1\n\
+         Delegate=yes\n\
+         KillMode=process\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        bin = l.binary.display(),
+    )
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+
+    #[test]
+    fn the_kubelet_s_endpoint_and_cgroup_driver_are_replaced_in_place() {
+        let flags = "KUBELET_KUBEADM_ARGS=\"--container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --pod-infra-container-image=x\"\n";
+        assert_eq!(
+            endpoint_of(flags).as_deref(),
+            Some("unix:///var/run/containerd/containerd.sock")
+        );
+        assert_eq!(
+            with_endpoint(flags, "unix:///run/q.sock").unwrap(),
+            flags.replace(
+                "unix:///var/run/containerd/containerd.sock",
+                "unix:///run/q.sock"
+            )
+        );
+        assert_eq!(with_endpoint("X=1\n", "y"), None);
+        let config = "kind: KubeletConfiguration\ncgroupDriver: systemd\nfoo: 1\n";
+        assert_eq!(
+            with_cgroup_driver(config, "cgroupfs"),
+            config.replace("systemd", "cgroupfs")
+        );
+        assert_eq!(
+            with_cgroup_driver("kind: K", "cgroupfs"),
+            "kind: K\ncgroupDriver: cgroupfs\n"
+        );
+    }
+}

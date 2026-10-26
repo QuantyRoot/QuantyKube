@@ -42,6 +42,7 @@ through and add a new entry, never silently edit history.
 - [ADR-035](#adr-035-a-cluster-moves-from-etcd-with-its-revisions-while-the-api-server-is-stopped) A cluster moves from etcd with its revisions, while the API server is stopped
 - [ADR-036](#adr-036-the-runtime-runs-what-a-kubeadm-node-needs-host-namespaces-added-capabilities-privileged) The runtime runs what a kubeadm node needs: host namespaces, added capabilities, privileged
 - [ADR-037](#adr-037-ci-publishes-a-public-image-of-every-commit-on-main) CI publishes a public image of every commit on main
+- [ADR-038](#adr-038-a-node-moves-onto-the-runtime-with-its-kubelet-stopped-and-its-old-pods-cleared) A node moves onto the runtime with its kubelet stopped and its old pods cleared
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1256,4 +1257,31 @@ from inside the container.
 only as source. The manifest names an image by commit, never `main`,
 so a cluster runs what was tested. The base image is named by tag, not
 digest; pinning it is a follow-up.
+
+## ADR-038: A node moves onto the runtime with its kubelet stopped and its old pods cleared
+
+`quantykube install runtime`, as root on a kubeadm node, moves its
+kubelet from containerd onto `quantykube runtime`, from files and
+systemd alone, as `install store` does for the API server (ADR-035).
+It keeps the kubelet's `kubeadm-flags.env` and `config.yaml` in a
+journal, stops the kubelet, stops and removes every pod of the old
+runtime over its CRI socket, starts the runtime as the systemd unit
+`quantykube-runtime`, points the kubelet at it with the cgroupfs driver
+the runtime places containers by, and starts the kubelet again. Any
+failure puts everything back; `quantykube undo runtime` does the same
+from the journal.
+
+The old runtime's pods are cleared, not left running: the kubelet on
+the new runtime does not know them and would start every static pod a
+second time beside its first, on the same ports. Pods that are not
+DaemonSets or static pods are drained first by whoever runs the
+command; the command itself only cordons nothing and evicts nothing,
+because the node's own credentials may not evict other pods.
+
+**The cost:** every pod left on the node restarts, the control plane's
+among them on a control plane node. The kubelet's cgroup driver changes
+from systemd to cgroupfs, as k3s runs it; a `kubeadm upgrade` rewrites
+`config.yaml` and needs the move done again. CI moves a one-node
+kubeadm cluster, control plane, etcd, kube-proxy and CoreDNS, onto the
+runtime and back (`scripts/kubeadm.sh node`).
 

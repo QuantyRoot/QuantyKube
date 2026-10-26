@@ -16,14 +16,19 @@
 # resourceVersion, the cluster goes on, and `quantykube undo store` puts
 # it back on etcd.
 #
+# node: kubeadm on containerd and its own etcd, `quantykube install
+# runtime` moves the kubelet onto QuantyKube's runtime, every pod of the
+# node starts again there, new pods reach a Service by name, and `quantykube
+# undo runtime` puts the kubelet back on containerd.
+#
 # Needs root, systemd, containerd with its CRI plugin, kubeadm, kubelet
 # and kubectl on the PATH and the CNI plugins in /opt/cni/bin. It changes
 # this machine for good: for a CI runner or a server set up to be wiped.
 #
-#   [QK=target/release/quantykube] scripts/kubeadm.sh external|runtime|move
+#   [QK=target/release/quantykube] scripts/kubeadm.sh external|runtime|move|node
 set -euo pipefail
 
-mode=${1:?external, runtime or move}
+mode=${1:?external, runtime, move or node}
 
 QK=$(realpath "${QK:-target/release/quantykube}")
 pki=/etc/kubernetes/pki
@@ -64,6 +69,10 @@ fail() {
             printf '\n--- %s\n' "$f"; tail -15 "$f"
         done
     fi
+    if [ -f /etc/systemd/system/quantykube-runtime.service ]; then
+        printf '\n--- quantykube-runtime\n'
+        journalctl -u quantykube-runtime --no-pager | tail -30
+    fi
     printf '\n--- store\n'
     tail -40 "$work/qk.log" 2>/dev/null ||
         journalctl -u quantykube-store --no-pager | tail -40
@@ -103,7 +112,7 @@ kind: ClusterConfiguration
 networking:
   podSubnet: 10.244.0.0/16
 EOF
-if [ "$mode" != move ]; then
+if [ "$mode" = external ] || [ "$mode" = runtime ]; then
     cat >>"$work/kubeadm.yaml" <<EOF
 etcd:
   external:
@@ -162,6 +171,56 @@ kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null ||
 kubectl -n kube-system rollout status deploy/coredns --timeout=180s \
     >/dev/null || fail "CoreDNS is not ready"
 echo "kubeadm init ($mode): ok"
+
+if [ "$mode" = node ]; then
+    ours=unix:///run/quantykube-cri.sock
+    containerd=unix:///run/containerd/containerd.sock
+    serve='mkdir -p /www && echo hello-from-web >/www/index.html &&
+        exec httpd -f -p 8080 -h /www'
+    kubectl create deployment web --image="$image" -- sh -c "$serve" >/dev/null
+    kubectl expose deployment web --port 80 --target-port 8080 >/dev/null
+    kubectl rollout status deploy/web --timeout=120s >/dev/null ||
+        fail "web is not ready on containerd"
+    # what a node of the cluster runs, by the name of its containers
+    running() {
+        crictl -r "$1" ps -q --name "$2" 2>/dev/null | grep -q .
+    }
+    kubectl cordon "$(hostname)" >/dev/null
+    "$QK" install runtime >"$work/install.log" 2>&1 ||
+        { cat "$work/install.log"; fail "install runtime"; }
+    for c in kube-apiserver etcd kube-proxy coredns web; do
+        retry 180 running "$ours" "$c"
+    done
+    retry 120 kubectl get --raw /readyz
+    kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null ||
+        fail "the node is not ready on quantykube runtime"
+    running "$containerd" kube-apiserver &&
+        fail "containerd still runs the API server"
+    kubectl uncordon "$(hostname)" >/dev/null
+    kubectl rollout status deploy/web --timeout=120s >/dev/null ||
+        fail "web is not ready on quantykube runtime"
+    kubectl run probe --image="$image" --restart=Never -- \
+        wget -qO- http://web.default.svc.cluster.local >/dev/null
+    kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe \
+        --timeout=120s >/dev/null || fail "the probe pod did not succeed"
+    [ "$(kubectl logs probe)" = hello-from-web ] || fail "the probe's answer"
+    kubectl delete pod probe >/dev/null
+    "$QK" install runtime >/dev/null 2>&1 &&
+        fail "a second install was not refused"
+    echo "install runtime: ok"
+
+    "$QK" undo runtime >"$work/undo.log" 2>&1 ||
+        { cat "$work/undo.log"; fail "undo runtime"; }
+    for c in kube-apiserver coredns web; do
+        retry 180 running "$containerd" "$c"
+    done
+    retry 120 kubectl get --raw /readyz
+    kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null ||
+        fail "the node is not ready on containerd again"
+    systemctl is-active -q quantykube-runtime && fail "the runtime still runs"
+    echo "undo runtime: ok"
+    exit 0
+fi
 
 if [ "$mode" = move ]; then
     manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
