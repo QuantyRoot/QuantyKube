@@ -58,54 +58,6 @@ fail() {
             crictl -r "$cri" inspect "$c" 2>&1 |
                 grep -E '"(name|reason|message|exitCode)"' | head -6
         done
-        # a probe: the scheduler's image asked for its help, in four
-        # pods that differ in the host network and in cgroup limits
-        img=$(crictl -r "$cri" images -q 2>/dev/null | head -1)
-        (set +e; for net in 0 2; do for shares in 0 102; do
-            printf '{"metadata":{"name":"p%s%s","namespace":"d","uid":"u%s%s"},"log_directory":"%s","cgroup_parent":"/probe","linux":{"cgroup_parent":"/probe","security_context":{"namespace_options":{"network":%s}}}}' \
-                $net $shares $net $shares "$work/p$net$shares" $net >"$work/p.json"
-            printf '{"metadata":{"name":"c"},"image":{"image":"%s"},"command":["kube-scheduler","--help"],"log_path":"c.log","linux":{"resources":{"cpu_shares":%s}}}' \
-                "$(crictl -r "$cri" images -o json 2>/dev/null | grep -o '"registry.k8s.io/kube-scheduler[^"]*"' | head -1 | tr -d '"')" $shares >"$work/c.json"
-            pp=$(crictl -r "$cri" runp "$work/p.json" 2>&1 | tail -1)
-            cc=$(crictl -r "$cri" create "$pp" "$work/c.json" "$work/p.json" 2>&1 | tail -1)
-            crictl -r "$cri" start "$cc" 2>&1 | tail -1
-            echo "pod $pp container $cc"
-            sleep 3
-            printf '\n--- probe net=%s shares=%s: %s\n' $net $shares "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
-            head -c 100 "$work/p$net$shares/c.log" 2>&1
-        done; done
-        # and the scheduler as its manifest says, mounts and all
-        python3 - "$work" <<'PY'
-import json, sys, yaml
-m = yaml.safe_load(open("/etc/kubernetes/manifests/kube-scheduler.yaml"))
-c = m["spec"]["containers"][0]
-vols = {v["name"]: v["hostPath"]["path"] for v in m["spec"]["volumes"]}
-mounts = [{"container_path": x["mountPath"], "host_path": vols[x["name"]],
-           "readonly": x.get("readOnly", False)} for x in c["volumeMounts"]]
-json.dump({"metadata": {"name": "real"}, "image": {"image": c["image"]},
-           "command": c["command"], "log_path": "real.log", "mounts": mounts},
-          open(sys.argv[1] + "/real.json", "w"))
-PY
-        printf '{"metadata":{"name":"preal","namespace":"d","uid":"ureal"},"log_directory":"%s/preal","linux":{"security_context":{"namespace_options":{"network":2}}}}' "$work" >"$work/preal.json"
-        pp=$(crictl -r "$cri" runp "$work/preal.json" 2>&1 | tail -1)
-        cc=$(crictl -r "$cri" create "$pp" "$work/real.json" "$work/preal.json" 2>&1 | tail -1)
-        crictl -r "$cri" start "$cc" 2>&1 | tail -1
-        sleep 3
-        printf '\n--- probe real: %s\n' "$(crictl -r "$cri" inspect "$cc" 2>&1 | grep -E '"(exitCode|reason)"' | tr -d ' \n')"
-        cut -c1-200 "$work/preal/real.log" | head -5
-        cat "$work/real.json"; echo
-        if [ -f "$work/strace" ]; then
-            printf '\n--- strace of the scheduler\n'
-            p=$(grep -m1 'execve("[^"]*kube-scheduler' "$work/strace" | cut -d' ' -f1)
-            # its threads have pids of their own: everything after
-            grep -m1 "^$p  *execve" "$work/strace" | cut -c1-3000
-            sed -n "/^$p  *execve/,\$p" "$work/strace" | grep "^$p " | head -60
-        fi
-        k=$(crictl -r "$cri" ps -a -q --name kube-scheduler 2>/dev/null | head -1)
-        printf '\n--- the kubelet'"'"'s scheduler\n'
-        crictl -r "$cri" inspect "$k" 2>&1 | head -80
-        ls -la /var/log/pods/*scheduler*/kube-scheduler/ 2>&1
-        ) 2>&1
         # what the containers said, the API server's even when it is down
         for f in /var/log/pods/*/*/*.log; do
             [ -f "$f" ] || continue
@@ -197,7 +149,6 @@ EOF
 if [ "$mode" = runtime ]; then
     # started once the network above is written: it takes the first
     # configuration it finds, and the runner has podman's
-    ${QK_TRACE:+strace -f -qq -v -o "$work/strace" -e trace=execve,exit_group,write,openat,mount -s 200} \
     "$QK" runtime --root /var/lib/quantykube-runtime \
         --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
     rt=$!

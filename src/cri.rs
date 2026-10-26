@@ -251,6 +251,22 @@ fn pod_spec(config: cripb::PodSandboxConfig) -> Result<PodSpec, Status> {
     })
 }
 
+fn namespace_options(spec: &PodSpec) -> cripb::NamespaceOption {
+    use cripb::NamespaceMode::{Container, Node, Pod};
+    cripb::NamespaceOption {
+        network: if spec.host_network { Node } else { Pod },
+        ipc: if spec.host_ipc { Node } else { Pod },
+        pid: if spec.host_pid {
+            Node
+        } else if spec.share_pid {
+            Pod
+        } else {
+            Container
+        },
+        ..Default::default()
+    }
+}
+
 const CAPABILITIES: [&str; 41] = [
     "CHOWN",
     "DAC_OVERRIDE",
@@ -528,6 +544,13 @@ impl Cri {
                 network: Some(cripb::PodSandboxNetworkStatus {
                     ip: p.ip.clone(),
                     ..Default::default()
+                }),
+                // the kubelet compares these with the pod's and replaces a
+                // sandbox that differs
+                linux: Some(cripb::LinuxPodSandboxStatus {
+                    namespaces: Some(cripb::Namespace {
+                        options: Some(namespace_options(&p.spec)),
+                    }),
                 }),
                 labels: map(&p.spec.labels),
                 annotations: map(&p.spec.annotations),
@@ -1006,6 +1029,12 @@ mod tests {
         assert!(pod_spec(pod(Pod, Container)).is_ok());
         assert!(pod_spec(PodSandboxConfig::default()).is_ok());
         assert!(pod_spec(pod(Node, Container)).unwrap().host_network);
+        // the status says what was asked, or the kubelet starts over
+        for (net, pid) in [(Node, Container), (Pod, Pod), (Pod, Node)] {
+            let spec = pod_spec(pod(net, pid)).unwrap();
+            let o = namespace_options(&spec);
+            assert_eq!((o.network, o.pid), (net, pid));
+        }
         assert!(pod_spec(pod(Pod, Pod)).unwrap().share_pid);
         assert!(!pod_spec(pod(Pod, Container)).unwrap().share_pid);
 
