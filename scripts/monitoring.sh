@@ -5,12 +5,14 @@
 #   node: node_exporter and process-exporter on this machine, which
 #         count memory and CPU per program: etcd against the store,
 #         containerd and its shims against the runtime.
-#   cp <name>=<address>...: also Prometheus, scraping those nodes, and Grafana
-#         with the dashboard from deploy/grafana, both reachable only
-#         from this machine (ssh -L 3000:localhost:3000).
+#   cp <domain> <name>=<address>...: also Prometheus, scraping those
+#         nodes, only on this machine, and Grafana with the dashboard
+#         from deploy/grafana, behind Caddy with HTTPS on <domain>, with
+#         a random admin password in /root/grafana-admin-password.
 #
 #   sudo scripts/monitoring.sh node
-#   sudo scripts/monitoring.sh cp cp=62.129.150.40 w1=62.129.150.64 w2=62.129.150.83
+#   sudo scripts/monitoring.sh cp grafana.knet1.quanty.systems \
+#       cp=62.129.150.40 w1=62.129.150.64 w2=62.129.150.83
 set -euo pipefail
 
 role=${1:?node or cp}
@@ -54,6 +56,8 @@ if [ "$role" = node ]; then
     exit 0
 fi
 [ "$role" = cp ] || { echo "node or cp"; exit 1; }
+domain=${1:?cp needs the domain for Grafana}
+shift
 [ $# -gt 0 ] || { echo "cp needs name=address for each node"; exit 1; }
 
 apt-get install -y -q prometheus >/dev/null
@@ -86,7 +90,20 @@ if ! command -v grafana-server >/dev/null; then
     apt-get update -q >/dev/null
     apt-get install -y -q grafana >/dev/null
 fi
-sed -i 's/^;\?http_addr =.*/http_addr = 127.0.0.1/' /etc/grafana/grafana.ini
+# reachable only through Caddy, which holds the certificate
+cat >/etc/grafana/grafana.ini <<CONF
+[server]
+http_addr = 127.0.0.1
+domain = $domain
+root_url = https://$domain/
+[users]
+allow_sign_up = false
+[auth.anonymous]
+enabled = false
+[analytics]
+reporting_enabled = false
+check_for_updates = false
+CONF
 mkdir -p /etc/grafana/provisioning/datasources /etc/grafana/provisioning/dashboards \
     /var/lib/grafana/dashboards
 cat >/etc/grafana/provisioning/datasources/prometheus.yaml <<'CONF'
@@ -110,5 +127,26 @@ cp "$here/deploy/grafana/quantykube.json" /var/lib/grafana/dashboards/
 chown -R grafana:grafana /var/lib/grafana/dashboards
 systemctl enable --now grafana-server >/dev/null 2>&1
 systemctl restart grafana-server
-echo "Prometheus on 127.0.0.1:9090, Grafana on 127.0.0.1:3000 (admin/admin,"
-echo "changed on first login); from the laptop: ssh -L 3000:localhost:3000 root@<cp>"
+# never admin/admin on a public address: a random password, once
+if [ ! -s /root/grafana-admin-password ]; then
+    head -c 24 /dev/urandom | base64 | tr -d '/+=' >/root/grafana-admin-password
+    chmod 600 /root/grafana-admin-password
+fi
+for _ in $(seq 30); do
+    curl -fs http://127.0.0.1:3000/api/health >/dev/null && break
+    sleep 1
+done
+grafana-cli --homepath /usr/share/grafana admin reset-admin-password \
+    "$(cat /root/grafana-admin-password)" >/dev/null
+
+apt-get install -y -q caddy >/dev/null
+cat >/etc/caddy/Caddyfile <<CONF
+$domain {
+    reverse_proxy 127.0.0.1:3000
+}
+CONF
+ufw allow 80/tcp >/dev/null
+ufw allow 443/tcp >/dev/null
+systemctl enable --now caddy >/dev/null 2>&1
+systemctl reload caddy
+echo "Grafana on https://$domain, user admin, password in /root/grafana-admin-password"

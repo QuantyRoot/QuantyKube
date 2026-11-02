@@ -7,11 +7,13 @@ What CI already runs on one machine is marked; the first pass on the
 servers turns the rest into commands that did, and DEMO.md takes them
 from there.
 
-| Machine | Runs |
-| --- | --- |
-| cp | the control plane, first on etcd, then on `quantykube-store` |
-| w1 | a worker, its kubelet moved onto `quantykube runtime` |
-| w2 | a worker with containerd, unchanged, for comparison |
+| Machine | Name | Runs |
+| --- | --- | --- |
+| cp | cp.knet1.quanty.systems | the control plane, first on etcd, then on `quantykube-store`; Prometheus and Grafana |
+| w1 | w1.knet1.quanty.systems | a worker, its kubelet moved onto `quantykube runtime` |
+| w2 | w2.knet1.quanty.systems | a worker with containerd, unchanged, for comparison |
+
+Grafana is at https://grafana.knet1.quanty.systems.
 
 The laptop runs Windows and holds only `kubectl.exe`, a kubeconfig for
 cp and `kubectl-quanty.exe` (HISTORY.md). Nothing in the demonstration
@@ -35,12 +37,13 @@ off, `br_netfilter` and `net.ipv4.ip_forward=1`. CI runs the same.
 ## cp
 
 ```
-scripts/kubeadm-cp.sh <public address of cp>
+scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quanty.systems
 ```
 
-kubeadm init with the public address in the API server's certificate,
-Flannel v0.28.9 pinned by hash, and `/root/laptop.kubeconfig` with
-that address in it, for the laptop. It prints the join command.
+kubeadm init with the public address and name in the API server's
+certificate, Flannel v0.28.9 pinned by hash, and
+`/root/laptop.kubeconfig` with the name in it, for the laptop. It
+prints the join command.
 
 ## w1 and w2
 
@@ -73,6 +76,22 @@ on a one-node kubeadm cluster with the published image of each commit
 (job kubeadm-apply), and the pieces on their own: the store as etcd
 from the start, every pod on the runtime, the store moved and back, the
 kubelet moved and back (`scripts/kubeadm.sh external|runtime|move|node`).
+
+## Monitoring
+
+Outside the cluster, so that moving the cluster does not move it:
+
+```
+scripts/monitoring.sh node                       # on every node
+scripts/monitoring.sh cp grafana.knet1.quanty.systems \
+    cp=62.129.150.40 w1=62.129.150.64 w2=62.129.150.83   # on cp
+```
+
+node_exporter and process-exporter on every node count memory and CPU
+per program; Prometheus on cp scrapes them every five seconds and
+listens only there; Grafana behind Caddy with HTTPS shows the dashboard
+from `deploy/grafana`, with a random admin password in
+`/root/grafana-admin-password` on cp.
 
 ## What is measured
 

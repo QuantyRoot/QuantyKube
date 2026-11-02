@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Sets up the control plane on this node, after scripts/kubeadm-node.sh:
-# kubeadm init with the public address in the API server's certificate,
-# Flannel at a pinned version as the pod network, and a kubeconfig for a
-# laptop with that address in it. Prints what the workers run to join.
+# kubeadm init with the public address and name in the API server's
+# certificate, Flannel at a pinned version as the pod network, and a
+# kubeconfig for a laptop with the name in it, or the address without
+# one. Prints what the workers run to join.
 #
-#   sudo scripts/kubeadm-cp.sh <public address of this node>
+#   sudo scripts/kubeadm-cp.sh <public address> [<name>]
+#   sudo scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quanty.systems
 set -euo pipefail
 
 public=${1:?the public address of this node}
+name=${2:-}
+sans=$public${name:+,$name}
 kubeadm init --pod-network-cidr 10.244.0.0/16 \
-    --apiserver-cert-extra-sans "$public" >/root/kubeadm-init.log
+    --apiserver-cert-extra-sans "$sans" >/root/kubeadm-init.log
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
 work=$(mktemp -d)
@@ -21,7 +25,7 @@ kubectl apply -f "$work/kube-flannel.yml" >/dev/null
 rm -rf "$work"
 
 # for the laptop: the same admin credentials, the public address
-sed "s|server: https://.*:6443|server: https://$public:6443|" \
+sed "s|server: https://.*:6443|server: https://${name:-$public}:6443|" \
     /etc/kubernetes/admin.conf >/root/laptop.kubeconfig
 chmod 600 /root/laptop.kubeconfig
 
