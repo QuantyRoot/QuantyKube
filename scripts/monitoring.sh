@@ -92,6 +92,11 @@ if ! command -v grafana-server >/dev/null; then
 fi
 # reachable only through Caddy, which holds the certificate
 cat >/etc/grafana/grafana.ini <<CONF
+[paths]
+data = /var/lib/grafana
+logs = /var/log/grafana
+plugins = /var/lib/grafana/plugins
+provisioning = /etc/grafana/provisioning
 [server]
 http_addr = 127.0.0.1
 domain = $domain
@@ -136,8 +141,14 @@ for _ in $(seq 30); do
     curl -fs http://127.0.0.1:3000/api/health >/dev/null && break
     sleep 1
 done
-grafana-cli --homepath /usr/share/grafana admin reset-admin-password \
-    "$(cat /root/grafana-admin-password)" >/dev/null
+# with the service's configuration and data, or it sets the password
+# in a database of its own that nothing reads
+grafana cli --homepath /usr/share/grafana --config /etc/grafana/grafana.ini \
+    --configOverrides cfg:default.paths.data=/var/lib/grafana \
+    admin reset-admin-password "$(cat /root/grafana-admin-password)" >/dev/null
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$(cat /root/grafana-admin-password)" \
+    http://127.0.0.1:3000/api/user)
+[ "$code" = 200 ] || { echo "the admin password did not take ($code)"; exit 1; }
 
 apt-get install -y -q caddy >/dev/null
 cat >/etc/caddy/Caddyfile <<CONF
