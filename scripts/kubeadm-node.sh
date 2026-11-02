@@ -2,10 +2,18 @@
 # Prepares this machine as kubeadm expects a node: kubeadm, kubelet,
 # kubectl and crictl at pinned versions, the CNI plugins, containerd with
 # the systemd cgroup driver, and the kubelet's unit as kubeadm's packages
-# install it. For a CI runner or a server set up to be wiped.
+# install it. For a fresh Ubuntu server, or a CI runner. Kept across a
+# reboot: swap off, the module and the sysctls.
 #
 #   sudo scripts/kubeadm-node.sh
 set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q >/dev/null
+# a CI runner has Docker's containerd, which Ubuntu's would replace
+pkgs="conntrack curl ca-certificates"
+command -v containerd >/dev/null || pkgs="$pkgs containerd"
+apt-get install -y -q $pkgs >/dev/null
 
 work=$(mktemp -d)
 cd "$work"
@@ -25,10 +33,15 @@ tar -xzf crictl.tgz
 install -m 755 kubeadm kubelet kubectl crictl /usr/local/bin/
 mkdir -p /opt/cni/bin && tar -xzf cni.tgz -C /opt/cni/bin
 
-apt-get install -y conntrack >/dev/null
 swapoff -a
+sed -i '/\sswap\s/s/^[^#]/#&/' /etc/fstab
+echo br_netfilter >/etc/modules-load.d/kubernetes.conf
 modprobe br_netfilter
-sysctl -qw net.ipv4.ip_forward=1 net.bridge.bridge-nf-call-iptables=1
+cat >/etc/sysctl.d/90-kubernetes.conf <<'CONF'
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+CONF
+sysctl -q --system
 # Docker on a CI runner drops forwarded packets, pods' among them
 iptables -P FORWARD ACCEPT
 mkdir -p /etc/containerd

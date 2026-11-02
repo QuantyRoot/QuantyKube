@@ -19,30 +19,34 @@ needs a shell on a server.
 
 ## Every node
 
-As kubeadm's documentation asks: swap off, `br_netfilter` loaded,
-`net.ipv4.ip_forward=1`, containerd with `SystemdCgroup = true`, and
-kubeadm, kubelet and kubectl v1.37.1: `scripts/kubeadm-node.sh`, which
-CI runs on its runners too.
+As root, on each fresh server:
+
+```
+hostnamectl set-hostname cp    # w1, w2 on the others
+git clone https://github.com/QuantyRoot/QuantyKube && cd QuantyKube
+scripts/kubeadm-node.sh
+```
+
+It installs what kubeadm's documentation asks for, kept across a
+reboot: containerd with `SystemdCgroup = true`, kubeadm, kubelet,
+kubectl and crictl v1.37.1 and the CNI plugins, pinned by hash, swap
+off, `br_netfilter` and `net.ipv4.ip_forward=1`. CI runs the same.
 
 ## cp
 
 ```
-kubeadm init --pod-network-cidr 10.244.0.0/16 \
-  --apiserver-cert-extra-sans <public address of cp>
-kubectl apply -f <flannel manifest, pinned>
+scripts/kubeadm-cp.sh <public address of cp>
 ```
 
-The laptop gets `/etc/kubernetes/admin.conf` with the server address
-changed to cp's public one.
+kubeadm init with the public address in the API server's certificate,
+Flannel v0.28.9 pinned by hash, and `/root/laptop.kubeconfig` with
+that address in it, for the laptop. It prints the join command.
 
 ## w1 and w2
 
-```
-kubeadm join <cp>:6443 --token <token> --discovery-token-ca-cert-hash <hash>
-```
-
-On w1, kube-proxy and the CNI's DaemonSet run on the runtime too, on
-the host's network, kube-proxy privileged (ADR-036).
+The join command cp printed, as root. On w1, once it is moved, kube-proxy
+and Flannel run on QuantyKube's runtime too, on the host's network,
+kube-proxy privileged and Flannel with NET_ADMIN (ADR-036).
 
 ## Onto QuantyKube
 
