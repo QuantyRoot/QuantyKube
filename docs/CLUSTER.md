@@ -9,11 +9,11 @@ from there.
 
 | Machine | Name | Runs |
 | --- | --- | --- |
-| cp | cp.knet1.quanty.systems | the control plane, first on etcd, then on `quantykube-store`; Prometheus and Grafana |
-| w1 | w1.knet1.quanty.systems | a worker, its kubelet moved onto `quantykube runtime` |
-| w2 | w2.knet1.quanty.systems | a worker with containerd, unchanged, for comparison |
+| cp | cp.knet1.quantyverse.net | the control plane, first on etcd, then on `quantykube-store`; Prometheus and Grafana |
+| w1 | w1.knet1.quantyverse.net | a worker, its kubelet moved onto `quantykube runtime` |
+| w2 | w2.knet1.quantyverse.net | a worker with containerd, unchanged, for comparison |
 
-Grafana is at https://grafana.knet1.quanty.systems.
+Grafana is at https://grafana.knet1.quantyverse.net.
 
 The laptop runs Windows and holds only `kubectl.exe`, a kubeconfig for
 cp and `kubectl-quanty.exe` (HISTORY.md). Nothing in the demonstration
@@ -37,7 +37,7 @@ off, `br_netfilter` and `net.ipv4.ip_forward=1`. CI runs the same.
 ## cp
 
 ```
-scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quanty.systems
+scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quantyverse.net
 ```
 
 kubeadm init with the public address and name in the API server's
@@ -83,7 +83,7 @@ Outside the cluster, so that moving the cluster does not move it:
 
 ```
 scripts/monitoring.sh node                       # on every node
-scripts/monitoring.sh cp grafana.knet1.quanty.systems \
+scripts/monitoring.sh cp grafana.knet1.quantyverse.net \
     cp=62.129.150.40 w1=62.129.150.64 w2=62.129.150.83   # on cp
 ```
 

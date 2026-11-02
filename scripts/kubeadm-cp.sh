@@ -6,7 +6,7 @@
 # one. Prints what the workers run to join.
 #
 #   sudo scripts/kubeadm-cp.sh <public address> [<name>]
-#   sudo scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quanty.systems
+#   sudo scripts/kubeadm-cp.sh 62.129.150.40 cp.knet1.quantyverse.net
 set -euo pipefail
 
 public=${1:?the public address of this node}

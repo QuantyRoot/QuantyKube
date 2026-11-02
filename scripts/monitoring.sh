@@ -11,7 +11,7 @@
 #         a random admin password in /root/grafana-admin-password.
 #
 #   sudo scripts/monitoring.sh node
-#   sudo scripts/monitoring.sh cp grafana.knet1.quanty.systems \
+#   sudo scripts/monitoring.sh cp grafana.knet1.quantyverse.net \
 #       cp=62.129.150.40 w1=62.129.150.64 w2=62.129.150.83
 set -euo pipefail
 
