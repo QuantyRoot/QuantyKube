@@ -151,10 +151,15 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$(cat /root/grafana-admi
 [ "$code" = 200 ] || { echo "the admin password did not take ($code)"; exit 1; }
 
 apt-get install -y -q caddy >/dev/null
+# other sites on this machine, like the QuantyVerse websites, put
+# their own file into /etc/caddy/sites, which this run leaves alone
+mkdir -p /etc/caddy/sites
 cat >/etc/caddy/Caddyfile <<CONF
 $domain {
     reverse_proxy 127.0.0.1:3000
 }
+
+import /etc/caddy/sites/*.caddy
 CONF
 ufw allow 80/tcp >/dev/null
 ufw allow 443/tcp >/dev/null
