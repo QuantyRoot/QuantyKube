@@ -13,6 +13,7 @@ pub mod image;
 pub mod install;
 pub mod kube;
 pub mod operator;
+pub mod podnet;
 pub mod raft;
 pub mod registry;
 pub mod runtime;

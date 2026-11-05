@@ -703,7 +703,8 @@ fn runtime_unit(l: &NodeLayout) -> String {
          Description=QuantyKube runtime\n\
          Before=kubelet.service\n\
          [Service]\n\
-         ExecStart={bin} runtime --root /var/lib/quantykube-runtime --socket {RUNTIME_SOCKET}\n\
+         ExecStart={bin} runtime --root /var/lib/quantykube-runtime --native-network \
+         --socket {RUNTIME_SOCKET}\n\
          Restart=always\n\
          RestartSec=1\n\
          Delegate=yes\n\

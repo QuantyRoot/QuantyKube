@@ -154,7 +154,9 @@ kind: KubeletConfiguration
 cgroupDriver: cgroupfs
 EOF
 fi
-# one node, so a bridge is the whole pod network
+# one node, so a bridge is the whole pod network; without masquerading,
+# which nothing here needs, so that the runtime sets it up itself
+# (ADR-042) where it runs the pods
 mkdir -p /etc/cni/net.d
 cat >/etc/cni/net.d/10-bridge.conflist <<'EOF'
 {
@@ -165,7 +167,6 @@ cat >/etc/cni/net.d/10-bridge.conflist <<'EOF'
       "type": "bridge",
       "bridge": "cni0",
       "isGateway": true,
-      "ipMasq": true,
       "isDefaultGateway": true,
       "ipam": {"type": "host-local", "ranges": [[{"subnet": "10.244.0.0/24"}]]}
     },
@@ -176,7 +177,7 @@ EOF
 if [ "$mode" = runtime ]; then
     # started once the network above is written: it takes the first
     # configuration it finds, and the runner has podman's
-    "$QK" runtime --root /var/lib/quantykube-runtime \
+    "$QK" runtime --root /var/lib/quantykube-runtime --native-network \
         --socket /run/quantykube-cri.sock 2>"$work/runtime.log" &
     rt=$!
     retry 30 test -S /run/quantykube-cri.sock

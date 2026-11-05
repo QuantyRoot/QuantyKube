@@ -1748,6 +1748,43 @@ pub fn hold_namespaces(
     }
 }
 
+/// A socket to the kernel's routing configuration (rtnetlink) of the
+/// network namespace held at `netns`, or of the caller's with None. The
+/// socket stays in the namespace it was made in, so a thread of its own
+/// enters the namespace, makes it and ends; the caller's thread never
+/// changes namespace. Read and write it as rtnetlink messages.
+pub fn route_socket(netns: Option<&std::path::Path>) -> io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    const AF_NETLINK: c_int = 16;
+    const SOCK_RAW: c_int = 3;
+    const NETLINK_ROUTE: c_int = 0;
+    let make = || -> io::Result<std::fs::File> {
+        // SAFETY: socket takes three integers; the descriptor is owned by
+        // the File from here on.
+        let fd = unsafe { socket(AF_NETLINK, SOCK_RAW | O_CLOEXEC, NETLINK_ROUTE) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    };
+    let Some(path) = netns else {
+        return make();
+    };
+    let ns = std::fs::File::open(path)?;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // SAFETY: setns on a descriptor held open above; only this
+            // thread changes namespace, and it ends right after.
+            if unsafe { setns(ns.as_raw_fd(), CLONE_NEWNET as c_int) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            make()
+        })
+        .join()
+        .map_err(|_| io::Error::other("netns thread panicked"))?
+    })
+}
+
 /// Undoes [`hold_namespaces`]; the namespaces end once no process is in
 /// them.
 pub fn release_namespaces(dir: &std::path::Path) -> io::Result<()> {

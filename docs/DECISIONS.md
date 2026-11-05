@@ -46,6 +46,7 @@ through and add a new entry, never silently edit history.
 - [ADR-039](#adr-039-kubectl-apply-reaches-a-node-through-a-privileged-pod-that-starts-a-systemd-unit) kubectl apply reaches a node through a privileged pod that starts a systemd unit
 - [ADR-040](#adr-040-one-kubectl-apply-an-operator-that-records-every-step-in-an-installation) One kubectl apply: an operator that records every step in an Installation
 - [ADR-041](#adr-041-a-commit-is-durable-in-a-log-of-pages-and-reaches-the-database-file-later) A commit is durable in a log of pages and reaches the database file later
+- [ADR-042](#adr-042-the-runtime-sets-up-a-pods-network-itself-where-it-knows-what-the-plugins-would-do) The runtime sets up a pod's network itself where it knows what the plugins would do
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1451,4 +1452,50 @@ times the development machine's. A store opened without the log still
 replays one it finds, so switching back is safe; a database file that
 is created new removes a log it finds, which can only belong to a
 database moved away, as an undo keeps the store it leaves.
+
+## ADR-042: The runtime sets up a pod's network itself where it knows what the plugins would do
+
+Measured on w1 of the rented cluster on 5 November with the times the
+runtime now writes to its journal (`scripts/podsteps.sh`): a pod
+started alone spends 45 ms in RunPodSandbox, 41 of them in the CNI
+plugins; with 100 pods started at once the plugins take 871 ms at the
+median and 1.7 s at the slowest, 95% of the sandbox's time. For each
+pod the runtime runs flannel's plugin, which runs `bridge`, which runs
+`host-local`, which takes a file lock to hand out an address: hundreds
+of short processes on two cores, queued at one lock.
+
+**What changes.** With `runtime --native-network` (`src/podnet.rs`),
+for a configuration whose effect is known, the runtime does what the
+plugins would have done, with rtnetlink messages and no process: a
+veth pair made with its pod end already in the pod's network namespace
+as eth0, the host end on the bridge with hairpin mode, an address,
+the link up, a default route through the bridge, the MTU. Addresses
+come from a mutex in memory and one file per address under the
+runtime's directory, as host-local keeps them, skipping the ones
+host-local still holds. The result is handed on in the shape a plugin
+returns, marked as the runtime's own, so that the pod is taken off the
+network the same way, after a restart too.
+
+Known are flannel's configuration, the subnet read from flanneld's
+`/run/flannel/subnet.env` for each pod, and the bridge plugin with one
+host-local subnet, the bridge as gateway and no masquerading, each
+followed by nothing but portmap. Anything else, and every pod with a
+host port, still goes through the plugins. Masquerading stays with
+flanneld, which does it for flannel.
+
+The rtnetlink socket of a pod's namespace is made on a thread of its
+own that enters the namespace and ends, so no thread of the runtime
+ever changes namespace (`quantykube_sys::route_socket`).
+
+**Tested** by two pods made in held namespaces on a test bridge that
+reach the gateway and each other with ping and lose each other when one
+is removed, against a parsed flannel configuration and the bridge
+configurations it must refuse, and by every kubeadm job in CI, whose
+bridge configuration it now stands in for.
+
+**The cost:** the runtime reimplements what three plugins do, for two
+configurations, and must follow them where they change; a configuration
+that is almost one of them goes through the plugins, which is correct
+but slow. It is the first part of QuantyKube's own network, which is
+meant to take over the rest of the node's network later.
 

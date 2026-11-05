@@ -32,7 +32,8 @@ const USAGE: &str = "usage:
   quantykube sandbox --rootfs <dir> [--hostname <name>] [--readonly]
                      [--cgroup <name> [--memory <bytes>] [--pids <n>]] -- <command>...
   quantykube runtime --root <dir> --socket <path>
-                     [--cni-conf <dir>] [--cni-bin <dir>] [--plain-http <host>]
+                     [--cni-conf <dir>] [--cni-bin <dir>] [--native-network]
+                     [--plain-http <host>]
                      [--max-image-size <bytes>]
   quantykube pull    --root <dir> [--plain-http <host>] [--max-image-size <bytes>]
                      <image>
@@ -100,7 +101,9 @@ namespaces with <dir> as its root and exits with its status.
 runtime serves the kubelet's Container Runtime Interface on the socket,
 keeping images and container state under --root. Pods get their network
 from the first CNI configuration in --cni-conf, /etc/cni/net.d by
-default, with plugins from --cni-bin, /opt/cni/bin. Images are pulled
+default, with plugins from --cni-bin, /opt/cni/bin; with
+--native-network a pod on flannel's network gets it from the runtime
+itself, without running the plugins (ADR-042). Images are pulled
 over HTTPS against the system's root certificates, through HTTPS_PROXY
 unless NO_PROXY names the host, or over plain HTTP from registries named
 with --plain-http (host or host:port, comma separated); pull does the
@@ -658,6 +661,7 @@ fn runtime(args: &[String]) -> Result<(), String> {
     let rt = quantykube::runtime::Runtime::with_network(&root, Some((conf.clone(), bin)))
         .map_err(|e| e.to_string())?;
     max_image_size(&rt, args)?;
+    rt.set_native_network(args.iter().any(|a| a == "--native-network"));
     match rt.network() {
         Some(c) => eprintln!("quantykube: pod network {}", c.name()),
         None => eprintln!("quantykube: no CNI configuration in {} yet", conf.display()),

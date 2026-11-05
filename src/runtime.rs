@@ -268,6 +268,10 @@ pub struct Runtime {
     /// runtime started is found without a restart.
     cni: Mutex<Option<Arc<Cni>>>,
     cni_dirs: Option<(PathBuf, PathBuf)>,
+    /// Whether pods on flannel's network get it from the runtime itself
+    /// instead of the CNI plugins (ADR-042).
+    native: std::sync::atomic::AtomicBool,
+    podnet: Mutex<Option<Arc<crate::podnet::PodNet>>>,
     /// The open log file of each running container, shared with the
     /// threads that write it.
     logs: Mutex<HashMap<String, Arc<Mutex<File>>>>,
@@ -421,6 +425,8 @@ impl Runtime {
             exited: Condvar::new(),
             cni: Mutex::new(None),
             cni_dirs,
+            native: std::sync::atomic::AtomicBool::new(false),
+            podnet: Mutex::new(None),
             logs: Mutex::new(HashMap::new()),
             max_image: AtomicU64::new(MAX_IMAGE),
             importing: Mutex::new(()),
@@ -470,15 +476,79 @@ impl Runtime {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let (Some(cni), Ok(text)) =
-                (self.network(), fs::read_to_string(dir.join("network.json")))
-            {
+            if let Ok(text) = fs::read_to_string(dir.join("network.json")) {
                 let result = json::parse(&text).ok();
                 let ports = read_ports(&dir);
-                let _ = cni.del(&id, &dir.join("ns").join("net"), result.as_ref(), &ports);
+                let _ = self.detach(&id, &dir.join("ns").join("net"), result.as_ref(), &ports);
             }
             let _ = sys::release_namespaces(&dir.join("ns"));
             let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Pods on flannel's network get it from the runtime itself, without
+    /// the CNI plugins, from now on (ADR-042).
+    pub fn set_native_network(&self, yes: bool) {
+        self.native.store(yes, Ordering::Relaxed);
+    }
+
+    /// The runtime's own pod network for `cni`'s configuration, if it
+    /// can stand in for it.
+    fn podnet(&self, cni: &Cni) -> io::Result<Option<Arc<crate::podnet::PodNet>>> {
+        let mut p = self.podnet.lock().unwrap();
+        if p.is_none() {
+            if let Some((bridge, source)) = crate::podnet::stand_in(cni.plugins()) {
+                let net = crate::podnet::PodNet::new(&self.dir, cni.name(), &bridge, source)?;
+                *p = Some(Arc::new(net));
+            }
+        }
+        Ok(p.clone())
+    }
+
+    /// Attaches a pod to the network: by the runtime itself where it
+    /// stands in for the plugins, through them otherwise. Pods with host
+    /// ports go through the plugins, which know portmap.
+    fn attach(
+        &self,
+        cni: &Cni,
+        id: &str,
+        netns: &Path,
+        ports: &[crate::cni::Port],
+    ) -> io::Result<Value> {
+        let started = Instant::now();
+        if self.native.load(Ordering::Relaxed) && ports.is_empty() {
+            if let Some(net) = self.podnet(cni)? {
+                let r = net.add(id, netns);
+                eprintln!("quantykube: network {} ms", started.elapsed().as_millis());
+                return r;
+            }
+        }
+        let r = cni.add(id, netns, ports);
+        eprintln!("quantykube: CNI add {} ms", started.elapsed().as_millis());
+        if r.is_err() {
+            // what the plugins before the failing one set up
+            let _ = cni.del(id, netns, None, ports);
+        }
+        r
+    }
+
+    /// Undoes [`Runtime::attach`] the way the pod was attached.
+    fn detach(
+        &self,
+        id: &str,
+        netns: &Path,
+        result: Option<&Value>,
+        ports: &[crate::cni::Port],
+    ) -> io::Result<()> {
+        let native = result
+            .and_then(|r| r.get("quantykube"))
+            .and_then(Value::as_bool);
+        if native == Some(true) {
+            return crate::podnet::detach_under(&self.dir, id);
+        }
+        match self.network() {
+            Some(cni) => cni.del(id, netns, result, ports),
+            None => Ok(()),
         }
     }
 
@@ -673,15 +743,10 @@ impl Runtime {
             spec.host_network,
             spec.host_ipc,
         )?;
-        let started = Instant::now();
         let network = match self.network().filter(|_| !spec.host_network) {
-            Some(cni) => match cni.add(&id, &dir.join("ns").join("net"), &spec.ports) {
-                Ok(result) => {
-                    eprintln!("quantykube: CNI add {} ms", started.elapsed().as_millis());
-                    Some(result)
-                }
+            Some(cni) => match self.attach(&cni, &id, &dir.join("ns").join("net"), &spec.ports) {
+                Ok(result) => Some(result),
                 Err(e) => {
-                    let _ = cni.del(&id, &dir.join("ns").join("net"), None, &spec.ports);
                     let _ = sys::release_namespaces(&dir.join("ns"));
                     let _ = fs::remove_dir_all(&dir);
                     return Err(e.into());
@@ -765,9 +830,7 @@ impl Runtime {
         }
         let ns = self.dir.join("pods").join(id).join("ns");
         if pod.state == PodState::Ready && !pod.spec.host_network {
-            if let Some(cni) = self.network() {
-                cni.del(id, &ns.join("net"), pod.network.as_ref(), &pod.spec.ports)?;
-            }
+            self.detach(id, &ns.join("net"), pod.network.as_ref(), &pod.spec.ports)?;
         }
         sys::release_namespaces(&ns)?;
         if let Some(holder) = pod.pid_holder.filter(|_| pod.state == PodState::Ready) {

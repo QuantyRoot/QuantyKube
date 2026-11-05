@@ -91,6 +91,10 @@ impl Cni {
         &self.name
     }
 
+    pub fn plugins(&self) -> &[Object] {
+        &self.plugins
+    }
+
     /// Attaches the pod and returns the last plugin's result.
     pub fn add(&self, id: &str, netns: &Path, ports: &[Port]) -> io::Result<Value> {
         let mut prev: Option<Value> = None;
