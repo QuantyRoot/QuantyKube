@@ -45,8 +45,12 @@ image=mirror.gcr.io/library/busybox@sha256:
 image+=b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
 # what a client in a pod does: a lost DNS packet or a Service not yet
 # programmed is asked again, as a client asks again
+# the log is what was fetched: a try that fails while cluster DNS is
+# still coming up says so on stderr, which would end up there too
 fetch='for i in $(seq 20); do
-    wget -qO- -T 5 http://web.default.svc.cluster.local && exit 0; sleep 2
+    wget -qO- -T 5 http://web.default.svc.cluster.local 2>/dev/null &&
+        exit 0
+    sleep 2
 done; exit 1'
 qk=
 rt=
