@@ -95,8 +95,18 @@ from `deploy/grafana`, with a random admin password in
 
 ## What is measured
 
-On both workers, with the same deployment pinned to each in turn: pod
-start from `kubectl apply` to Ready, the memory of the runtime and its
-shims per node at 10, 30 and 100 pods, and a cold image pull. The store
-benchmarks from BENCHMARKS.md run again on cp, against etcd on the same
-machine.
+On cp, as root, once before the move and once after:
+
+```
+scripts/measure.sh before
+scripts/measure.sh after
+```
+
+On both workers, with the same pods pinned to each in turn: pod start
+from `kubectl apply` to Ready, 20 pods one after another; then 10, 30
+and 100 pods at once, the time until all are Ready and the memory of
+the runtime and everything it starts besides the containers
+(containerd, its shims, runc and pause, or `quantykube runtime`), from
+Prometheus. And the store's memory on cp. Results go to
+`measure/<label>-<time>/summary.md`. The store benchmarks from
+BENCHMARKS.md run again on cp, against etcd on the same machine.
