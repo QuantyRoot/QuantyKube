@@ -220,6 +220,7 @@ impl Operator {
                "spec":{{"nodeName":{},"hostPID":true,"hostNetwork":true,
                  "restartPolicy":"Never","tolerations":[{{"operator":"Exists"}}],
                  "containers":[{{"name":"agent","image":{},
+                   "imagePullPolicy":"Always",
                    "args":["host","--root","/host","--",{},{}],
                    "securityContext":{{"privileged":true}},
                    "volumeMounts":[{{"name":"host","mountPath":"/host"}}]}}],

@@ -151,6 +151,9 @@ spec:
       containers:
         - name: operator
           image: ghcr.io/quantyroot/quantykube:main
+          # a tag that moves: without this a node keeps the first image
+          # it pulled, and its agents install that binary again
+          imagePullPolicy: Always
           args: [operator]
           env:
             - name: IMAGE

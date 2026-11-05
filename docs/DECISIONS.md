@@ -1346,6 +1346,13 @@ CI publishes only after every test passed; for the stage it is pinned
 to a commit. CI runs the whole thing against the image of every commit
 on main (job kubeadm-apply).
 
+**Addendum, 5 November.** On the rented cluster an undo and a second
+move installed the same runtime binary as the first, although `main`
+had moved on: Kubernetes pulls a tag other than `latest` only if the
+node does not have it yet, and w1 had it. The operator and its agents
+now pull `Always`. The servers pull, not the laptop, so a stage without
+network for the laptop is not affected.
+
 ## ADR-041: A commit is durable in a log of pages and reaches the database file later
 
 Measured on the rented cluster on 5 November: with the API server on
