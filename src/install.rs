@@ -200,7 +200,7 @@ fn store_unit(l: &Layout) -> String {
          Description=QuantyKube store\n\
          After=network-online.target\n\
          [Service]\n\
-         ExecStart={bin} serve --data {data} --socket /run/quantykube/store.sock \
+         ExecStart={bin} serve --data {data} --socket /run/quantykube/store.sock --wal \
          --listen 127.0.0.1:{port} --cert {cert} --key {key} --client-ca {ca}\n\
          RuntimeDirectory=quantykube\n\
          Restart=always\n\
@@ -395,7 +395,7 @@ pub fn undo(l: &Layout) -> Result<(), String> {
             .map_or(0, |d| d.as_secs());
         let kept = l.state.join(format!("store.db.undone-{secs}"));
         fs::rename(l.data(), &kept).map_err(err(l.data().display()))?;
-        for side in ["-wal", "-shm", ".raft"] {
+        for side in [".wal", ".raft"] {
             let mut from = l.data().into_os_string();
             from.push(side);
             let mut to = kept.clone().into_os_string();

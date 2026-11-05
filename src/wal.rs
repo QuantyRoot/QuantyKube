@@ -152,6 +152,11 @@ impl FileStore {
     pub fn open_file(path: &Path, enabled: bool) -> Result<(Self, bool)> {
         let created = !path.exists();
         let main = if created {
+            // a log without its database belongs to one that is gone
+            match std::fs::remove_file(log_path(path)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io(e)),
+                _ => {}
+            }
             FileStorage::create(path)?
         } else {
             FileStorage::open(path)?
@@ -689,6 +694,35 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*syncs.lock().unwrap() - before, 1);
+    }
+
+    #[test]
+    fn a_new_database_does_not_take_an_old_log() {
+        let dir = std::env::temp_dir().join(format!("qk-wal-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("db");
+        {
+            let q = Quanty::open_with(&db, true).unwrap();
+            q.write(&mut |tx| {
+                tx.put(b"old", b"1", 0)?;
+                Ok(())
+            })
+            .unwrap();
+            // gone without a checkpoint, as when the process is killed
+            std::mem::forget(q);
+        }
+        std::fs::rename(&db, dir.join("kept")).unwrap();
+        let q = Quanty::open_with(&db, true).unwrap();
+        let mut old = None;
+        q.read(0, &mut |v| {
+            old = v.get(b"old")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(old, None);
+        drop(q);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1425,8 +1425,11 @@ one, as on the rented servers, gains more.
 **The cost:** pages are written twice, once to the log and once at a
 checkpoint, and memory holds the pages written since the last one, up
 to the log's 64 MiB. A checkpoint happens inside the commit that crosses
-the line, so that commit waits for it. Until the measurements on the
-rented cluster are in, the log is off unless `serve --wal` asks for it;
-a store opened without it still replays a log it finds and empties it,
-so switching back is safe.
+the line, so that commit waits for it. `serve` keeps the file alone
+unless `--wal` asks for the log; the store the installer starts asks
+for it, because a sync on the rented servers takes about 1.1 ms, ten
+times the development machine's. A store opened without the log still
+replays one it finds, so switching back is safe; a database file that
+is created new removes a log it finds, which can only belong to a
+database moved away, as an undo keeps the store it leaves.
 
