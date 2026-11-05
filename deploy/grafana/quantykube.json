@@ -57,7 +57,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Runtime memory per worker",
+      "title": "Runtime memory per node",
       "description": "Resident memory of the container runtime: containerd, its shims, runc and pause containers on containerd; quantykube runtime on QuantyKube.",
       "datasource": {
         "type": "prometheus",
@@ -199,7 +199,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Runtime memory per worker",
+      "title": "Runtime memory per node",
       "description": "w1 moves to QuantyKube's runtime, w2 stays on containerd.",
       "datasource": {
         "type": "prometheus",
@@ -249,7 +249,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Runtime processes per worker",
+      "title": "Runtime processes per node",
       "description": "containerd starts a shim and a pause container per pod; QuantyKube's runtime neither.",
       "datasource": {
         "type": "prometheus",
