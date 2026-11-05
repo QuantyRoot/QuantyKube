@@ -86,6 +86,7 @@ pub fn connect(
         }
     }
     let tcp = tcp.ok_or(last)?;
+    tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
     let conn = ClientConnection::new(config.clone(), host)
         .map_err(|e| io::Error::other(format!("{e:?}")))?;

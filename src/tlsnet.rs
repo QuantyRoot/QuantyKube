@@ -33,6 +33,10 @@ impl TlsSocket {
     /// Runs the handshake on `tcp`, which must end with a client
     /// certificate the configuration accepts.
     pub fn accept(tcp: TcpStream, config: Arc<ServerConfig>) -> io::Result<TlsSocket> {
+        // a reply goes out as several writes, frames and TLS records;
+        // with Nagle's algorithm the later ones wait for the client's
+        // delayed ack of the first, about 40 ms on every request
+        tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(HANDSHAKE))?;
         tcp.set_write_timeout(Some(HANDSHAKE))?;
         let mut s = TlsSocket {

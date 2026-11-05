@@ -997,6 +997,25 @@ kubeadm offers h2 there and then speaks HTTP/1.1. Nothing else is
 served over HTTP/1.1, and the client certificate is required the same
 way.
 
+**Addendum, 5 November: Nagle.** On the rented cluster the API server
+measured 7.8 ms for an average read of a pod from the store and 14.5 ms
+for a create, against about 1 ms for small objects. Over TLS on
+loopback one client managed 31 writes a second: a reply leaves as
+several writes, HTTP/2 frames in TLS records, and with Nagle's
+algorithm on the socket every write after the first waited for the
+client's delayed acknowledgement, about 40 ms. The tests and the
+benchmarks of BENCHMARKS.md use the Unix socket, which has no such
+thing, so nothing showed it. The store's TLS sockets now set
+TCP_NODELAY, as the Raft transport already did. The same benchmark,
+TLS on loopback, client certificates, development machine, one run,
+the store with its log (ADR-041):
+
+| | etcd | before | now |
+| --- | --- | --- | --- |
+| put, 1 client | 609/s | 31/s | 940/s |
+| put, 16 clients | 3,976/s | 369/s | 3,883/s |
+| range, 1 client | 1,677/s | 33/s | 3,380/s |
+
 ## ADR-032: Raft is a state machine without I/O, tested by a simulator that finds planted bugs
 
 The Raft node (`src/raft/mod.rs`) never touches a disk, a clock or a
