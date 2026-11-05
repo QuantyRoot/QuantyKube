@@ -488,11 +488,13 @@ fn a_user_other_than_root_can_reopen_its_output() {
     let done = wait_exited(&rt, &id);
     let log = fs::read_to_string(logs.join("reopen.log")).unwrap();
     assert_eq!(done.exit_code, 0, "{log}");
-    let lines: Vec<&str> = log
+    // two pipes, two pumps: the lines arrive in either order
+    let mut lines: Vec<&str> = log
         .lines()
         .map(|l| l.splitn(4, ' ').nth(3).unwrap_or(""))
         .collect();
-    assert_eq!(lines, ["out", "err"], "{log}");
+    lines.sort();
+    assert_eq!(lines, ["err", "out"], "{log}");
     rt.remove_pod(&pod).unwrap();
     fs::remove_dir_all(&base).unwrap();
 }
