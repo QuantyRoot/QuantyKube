@@ -454,6 +454,50 @@ fn limits_hold_and_an_oom_kill_is_reported() {
 }
 
 #[test]
+fn a_user_other_than_root_can_reopen_its_output() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    // nginx opens /var/log/nginx/error.log, a link to /dev/stderr, that
+    // is /proc/self/fd/2: a second open of the pipe the runtime made,
+    // checked against its owner
+    let base = scratch("reopen");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "reopen".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut c = spec(
+        "reopen",
+        &["echo out >/proc/self/fd/1 && echo err >/proc/self/fd/2"],
+    );
+    c.user = quantykube::user::Request {
+        uid: Some(101),
+        gid: Some(101),
+        ..Default::default()
+    };
+    let id = rt.create_container(&pod, c).unwrap();
+    rt.start_container(&id).unwrap();
+    let done = wait_exited(&rt, &id);
+    let log = fs::read_to_string(logs.join("reopen.log")).unwrap();
+    assert_eq!(done.exit_code, 0, "{log}");
+    let lines: Vec<&str> = log
+        .lines()
+        .map(|l| l.splitn(4, ' ').nth(3).unwrap_or(""))
+        .collect();
+    assert_eq!(lines, ["out", "err"], "{log}");
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
 fn a_user_other_than_root_has_no_capabilities() {
     if !is_root() {
         eprintln!("not root, runtime test skipped");

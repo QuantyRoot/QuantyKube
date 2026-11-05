@@ -217,6 +217,16 @@ const MAX_LOG_LINE: usize = 16 * 1024;
 /// Copies a stream into the CRI log format the kubelet reads:
 /// `<time> <stream> <F|P> <text>`, F for a full line, P for a piece of a
 /// longer one.
+/// Gives the container's user the pipes behind its stdout and stderr,
+/// as runc does: a program that opens /dev/stderr opens
+/// /proc/self/fd/2 again, which is checked against the pipe's owner.
+fn own_stdio(pipes: &[&File], u: &user::User) -> io::Result<()> {
+    for p in pipes {
+        std::os::unix::fs::fchown(p, Some(u.uid), Some(u.gid))?;
+    }
+    Ok(())
+}
+
 fn pump(from: File, stream: &'static str, to: Arc<Mutex<File>>) {
     let mut r = BufReader::new(from);
     let mut line = Vec::new();
@@ -882,6 +892,7 @@ impl Runtime {
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
         let u = user::resolve(&lower, &img.config.user, &c.spec.user).map_err(Error::Invalid)?;
+        own_stdio(&[&out_w, &err_w], &u)?;
         let mut spawn = sys::Spawn::new(&bytes(&dir.join("rootfs")), &argv_b, &env_b)?
             .overlay(
                 &bytes(&lower),
@@ -1083,6 +1094,7 @@ impl Runtime {
         let (err_r, err_w) = pipe()?;
         let lower = self.dir.join("images").join(&img.id[7..]).join("rootfs");
         let u = user::resolve(&lower, &img.config.user, &c.spec.user).map_err(Error::Invalid)?;
+        own_stdio(&[&out_w, &err_w], &u)?;
         let spawn = sys::Spawn::enter(c.pid, &argv_b, &env_b)?
             .user(u.uid, u.gid, &u.groups)
             .capabilities(c.spec.capabilities.unwrap_or(sys::DEFAULT_CAPS))
