@@ -1,7 +1,7 @@
 use quantycore::proto::{put_bytes, put_int, Reader, Value};
-use quantydb_core::FileStorage;
 use quantykube::etcdpb::{KeyValue, Message};
 use quantykube::store::{self, Quanty};
+use quantykube::wal::FileStore;
 use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "usage:
-  quantykube serve   --data <file> --socket <path>
+  quantykube serve   --data <file> --socket <path> [--wal]
                      [--retain <duration>] [--snapshots <duration>]
                      [--listen <addr:port> --cert <pem> --key <pem>
                       --client-ca <pem>]
@@ -41,6 +41,8 @@ const USAGE: &str = "usage:
 serve is the store. --retain keeps history, 1h by default; --snapshots
 keeps QuantyDB snapshots, 1m by default, and older revisions are rebuilt
 from the history (ADR-014). Durations look like 90s, 15m, 2h or 7d.
+With --wal a write is durable once it is in a log next to --data, one
+sync instead of two, and reaches the file later (ADR-041).
 With --listen it also serves the etcd API over TLS on that address,
 only to clients with a certificate from the --client-ca PEM file, as an
 API server's --etcd-certfile gives it; --cert and --key are the
@@ -364,10 +366,14 @@ fn now_ms() -> i64 {
 
 /// A process killed a moment ago may still hold the file's lock while the
 /// kernel tears it down, and a supervisor restarts the next one at once.
-fn open(data: &Path) -> Result<Quanty<FileStorage>, store::Error> {
+fn open(data: &Path) -> Result<Quanty<FileStore>, store::Error> {
+    open_with(data, false)
+}
+
+fn open_with(data: &Path, wal: bool) -> Result<Quanty<FileStore>, store::Error> {
     let mut tries = 0;
     loop {
-        match Quanty::open(data) {
+        match Quanty::open_with(data, wal) {
             Err(store::Error::Engine(quantydb_core::Error::AlreadyOpen)) if tries < 50 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(100));
@@ -505,7 +511,8 @@ fn serve(args: &[String]) -> Result<(), String> {
     let socket = PathBuf::from(required(args, "--socket")?);
     let retain = duration(value(args, "--retain").unwrap_or("1h"))?;
     let snapshots = duration(value(args, "--snapshots").unwrap_or("1m"))?;
-    let store = Arc::new(open(&data).map_err(|e| format!("{}: {e}", data.display()))?);
+    let wal = args.iter().any(|a| a == "--wal");
+    let store = Arc::new(open_with(&data, wal).map_err(|e| format!("{}: {e}", data.display()))?);
     // as etcd: after a failed commit only a restart knows what is on disk
     // (ADR-030), and the API server reconnects to the restarted store
     store.on_stop(Box::new(|msg| {

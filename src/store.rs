@@ -11,7 +11,8 @@
 //! every change, because rebuilding them from snapshots would walk the
 //! commit chain once per event.
 
-use quantydb_core::{Db, FileStorage, MemStorage, Storage, SuspendedTx};
+use crate::wal::FileStore;
+use quantydb_core::{Db, MemStorage, Storage, SuspendedTx};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
@@ -213,13 +214,18 @@ pub struct Quanty<S: Storage + 'static> {
 
 pub type StopHook = Box<dyn Fn(&str) + Send + Sync>;
 
-impl Quanty<FileStorage> {
+impl Quanty<FileStore> {
+    /// The store at `path`, commits going straight to the file.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        if path.exists() {
-            Self::start(Db::open_file(path)?)
-        } else {
-            Self::start(Db::create_file(path)?)
-        }
+        Self::open_with(path, false)
+    }
+
+    /// The store at `path`; with `wal`, commits are durable in the log
+    /// next to it (ADR-041). A log left by an earlier run is replayed
+    /// either way.
+    pub fn open_with(path: &std::path::Path, wal: bool) -> Result<Self> {
+        let (storage, _) = FileStore::open_file(path, wal)?;
+        Self::with_storage(storage)
     }
 }
 
@@ -257,6 +263,16 @@ fn varint(v: i64) -> Vec<u8> {
 }
 
 impl<S: Storage + 'static> Quanty<S> {
+    /// A store on `storage`, created there if it holds nothing yet.
+    pub fn with_storage(storage: S) -> Result<Self> {
+        let options = quantydb_core::PagerOptions::default();
+        if storage.len()? == 0 {
+            Self::start(Db::create(storage, options)?)
+        } else {
+            Self::start(Db::open(storage, options)?)
+        }
+    }
+
     fn start(db: Db<S>) -> Result<Self> {
         if db.head_commit() == 0 {
             let mut tx = db.begin();

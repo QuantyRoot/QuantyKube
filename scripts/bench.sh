@@ -58,7 +58,8 @@ start_store() {
       --initial-cluster default=http://127.0.0.1:2380 > "$d/server.log" 2>&1 &
   else
     DATA=$d/qk.db; EP=unix://$d/qk.sock
-    "$QK" serve --data "$DATA" --socket "$d/qk.sock" > "$d/server.log" 2>&1 &
+    # shellcheck disable=SC2086
+    "$QK" serve --data "$DATA" --socket "$d/qk.sock" ${QK_ARGS:-} > "$d/server.log" 2>&1 &
   fi
   SPID=$!
   for _ in $(seq 1 100); do

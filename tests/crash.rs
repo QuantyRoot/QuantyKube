@@ -5,7 +5,8 @@
 //! landed; either is correct. Several writers at once, so that group
 //! commits hold more than one write.
 //!
-//! QUANTY_CRASH_ITERS sets the number of kills (default 20).
+//! QUANTY_CRASH_ITERS sets the number of kills (default 20);
+//! QUANTY_CRASH_WAL=1 runs the server with its write-ahead log (ADR-041).
 
 use quantycore::grpc::call;
 use quantykube::etcdpb::*;
@@ -32,11 +33,13 @@ impl Drop for Server {
 fn start(dir: &Path) -> Server {
     let sock = dir.join("s.sock");
     let _ = std::fs::remove_file(&sock);
+    let wal = std::env::var("QUANTY_CRASH_WAL").is_ok_and(|v| v == "1");
     let child = Command::new(env!("CARGO_BIN_EXE_quantykube"))
         .args(["serve", "--data"])
         .arg(dir.join("db"))
         .arg("--socket")
         .arg(&sock)
+        .args(wal.then_some("--wal"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

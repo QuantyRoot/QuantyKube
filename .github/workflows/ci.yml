@@ -90,15 +90,20 @@ jobs:
           env ETCDCTL=$b/etcdctl KUBE_APISERVER=$b/kube-apiserver KUBECTL=$b/kubectl scripts/raft.sh
 
   crash:
-    name: kill -9 the server under writes (200 kills)
+    name: kill -9 the server under writes (200 kills, ${{ matrix.storage }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        storage: [file, wal]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - run: cargo test --release --test crash -- --nocapture
         env:
           QUANTY_CRASH_ITERS: "200"
+          QUANTY_CRASH_WAL: ${{ matrix.storage == 'wal' && '1' || '' }}
 
   sandbox:
     name: sandbox, runtime and CRI, and start time against runc

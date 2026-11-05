@@ -19,3 +19,4 @@ pub mod runtime;
 pub mod store;
 pub mod tlsnet;
 pub mod user;
+pub mod wal;

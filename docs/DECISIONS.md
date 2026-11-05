@@ -45,6 +45,7 @@ through and add a new entry, never silently edit history.
 - [ADR-038](#adr-038-a-node-moves-onto-the-runtime-with-its-kubelet-stopped-and-its-old-pods-cleared) A node moves onto the runtime with its kubelet stopped and its old pods cleared
 - [ADR-039](#adr-039-kubectl-apply-reaches-a-node-through-a-privileged-pod-that-starts-a-systemd-unit) kubectl apply reaches a node through a privileged pod that starts a systemd unit
 - [ADR-040](#adr-040-one-kubectl-apply-an-operator-that-records-every-step-in-an-installation) One kubectl apply: an operator that records every step in an Installation
+- [ADR-041](#adr-041-a-commit-is-durable-in-a-log-of-pages-and-reaches-the-database-file-later) A commit is durable in a log of pages and reaches the database file later
 
 ## ADR-001: Kubernetes first: the etcd subset the API server uses
 
@@ -1344,4 +1345,81 @@ supported, as for the store. The manifest names the image `main`, which
 CI publishes only after every test passed; for the stage it is pinned
 to a commit. CI runs the whole thing against the image of every commit
 on main (job kubeadm-apply).
+
+## ADR-041: A commit is durable in a log of pages and reaches the database file later
+
+Measured on the rented cluster on 5 November: with the API server on
+the store, creating 100 pods on the node that stayed on containerd took
+23.1 s against 19.5 s on etcd. Writes are the difference. A QuantyDB
+commit syncs twice, once for its pages and once for the meta page that
+makes them current (ADR-012); etcd syncs once, its write-ahead log. A
+single client waits for both.
+
+**What changes.** The store's file is reached through a storage layer of
+QuantyKube's own (`src/wal.rs`), which QuantyDB already allows: it
+talks to a `Storage`, not to a file. The layer keeps every page a commit
+writes in memory and does not write it to the database file. When the
+commit reaches its commit point, the sync after the meta page, the
+layer appends all of the commit's pages to a log file as one frame,
+with its length and a SHA-256, and syncs the log once. That is when the
+write is acknowledged. The sync between pages and meta, which only
+orders them inside the file, costs nothing, since nothing goes to the
+file yet. Reads see the pages in memory before the file.
+
+The log file is written full of zeros up front, 68 MiB, and frames
+overwrite it from the start. A sync after an append has to record the
+file's new size and blocks; one after writing into blocks that exist
+does not, and measured half as long here (190 against 330 us). etcd
+preallocates its log for the same reason.
+
+When the log has grown past 64 MiB, and when the store is closed, a
+checkpoint writes the newest copy of every page in memory to the
+database file, syncs it, and only then starts the log over: a new
+header with the next generation, the old frames left behind it.
+
+**After a crash** the layer reads the log from the start and keeps every
+frame whose checksum holds, up to the first that does not: that one was
+being written when the machine stopped and was never acknowledged.
+Replaying a frame twice writes the same pages twice, so a crash during a
+checkpoint is replayed like any other. Frames carry the log's
+generation, so the frames of an earlier generation further along in the
+file are not taken for new ones.
+
+Nothing in QuantyDB changes, and nothing above the storage layer: a
+commit still looks to QuantyDB exactly as before, its revisions,
+history and snapshots included. A program that opens the store file
+offline, as the undo of a move does (ADR-035), opens it through the
+same layer and sees the log replayed. SQLite's WAL mode and etcd's WAL
+are the two models; this is closer to SQLite's, because it logs pages
+and needs to know nothing about what they hold.
+
+**Tested** with a simulated disk that keeps only what was synced, and
+can keep any prefix of what was written after the last sync: a writer
+commits, the disk is cut at every write and every sync, and each image
+must open with every acknowledged write in it. And by the kill -9 test
+of the server under writes (ADR-030), with the log.
+
+**Measured** with `scripts/bench.sh` on the development machine (2
+vCPU, fdatasync 60 to 330 us), three runs each, 256 byte puts:
+
+| | etcd | without the log | with the log |
+| --- | --- | --- | --- |
+| 1 client | 1,160 to 1,260/s | 740 to 880/s | 940 to 1,000/s |
+| 16 clients | 5,600 to 6,400/s | 3,630 to 3,830/s | 3,590 to 3,760/s |
+
+One client gains a fifth: it waited for two syncs and waits for one.
+Sixteen clients gain nothing, because they were never waiting for the
+disk: a profile of that run puts about 40% of the server's time in the
+kernel switching between its threads, the group commit waking every
+waiting writer after each commit, and most of the rest in allocation.
+That is the next thing to change. A disk with slower syncs than this
+one, as on the rented servers, gains more.
+
+**The cost:** pages are written twice, once to the log and once at a
+checkpoint, and memory holds the pages written since the last one, up
+to the log's 64 MiB. A checkpoint happens inside the commit that crosses
+the line, so that commit waits for it. Until the measurements on the
+rented cluster are in, the log is off unless `serve --wal` asks for it;
+a store opened without it still replays a log it finds and empties it,
+so switching back is safe.
 
