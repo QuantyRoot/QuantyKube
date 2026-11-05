@@ -970,6 +970,8 @@ impl Runtime {
                 cg.unwrap_or_default()
             ),
         )?;
+        let (pumped_tx, pumped) = std::sync::mpsc::channel::<()>();
+        let mut pumps = 0;
         if let Some(path) = self.log_path(&c) {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -985,8 +987,16 @@ impl Runtime {
                 .unwrap()
                 .insert(id.to_string(), log.clone());
             let l2 = log.clone();
-            std::thread::spawn(move || pump(out_r, "stdout", log));
-            std::thread::spawn(move || pump(err_r, "stderr", l2));
+            let (tx, tx2) = (pumped_tx.clone(), pumped_tx.clone());
+            std::thread::spawn(move || {
+                pump(out_r, "stdout", log);
+                let _ = tx.send(());
+            });
+            std::thread::spawn(move || {
+                pump(err_r, "stderr", l2);
+                let _ = tx2.send(());
+            });
+            pumps = 2;
         } else {
             // read and dropped, so a write to stdout never fails
             for mut r in [out_r, err_r] {
@@ -1003,8 +1013,20 @@ impl Runtime {
         }
         let rt = Arc::clone(self);
         let id = id.to_string();
+        drop(pumped_tx);
         std::thread::spawn(move || {
             let exit = sys::wait(pid);
+            // what the container wrote last is still in the pipes; the
+            // kubelet reads the log as soon as it sees the container
+            // exited. A child left behind may hold the pipes open, so
+            // not longer than two seconds.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for _ in 0..pumps {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if pumped.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
             let mut cs = rt.containers.lock().unwrap();
             if let Some(c) = cs.get_mut(&id) {
                 c.state = ContainerState::Exited;

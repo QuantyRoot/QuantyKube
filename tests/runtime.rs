@@ -650,6 +650,59 @@ fn seccomp_refuses_what_docker_refuses_and_nothing_a_program_needs() {
 }
 
 #[test]
+fn the_log_is_complete_when_the_container_is_exited() {
+    if !is_root() {
+        eprintln!("not root, runtime test skipped");
+        return;
+    }
+    // the kubelet reads the log as soon as the container is reported
+    // exited, so `kubectl logs` of a finished pod shows what is there
+    let base = scratch("lastline");
+    build_image(&base.join("image"));
+    let rt = Runtime::new(&base.join("state")).unwrap();
+    rt.import(&base.join("image"), "test/sh:1").unwrap();
+    let logs = base.join("logs");
+    let pod = rt
+        .run_pod(PodSpec {
+            name: "lastline".into(),
+            log_directory: logs.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap();
+    for run in 0..20 {
+        let name = format!("say{run}");
+        let id = rt
+            .create_container(
+                &pod,
+                // one write of 40 KiB just before the exit: most of it
+                // is still in the pipe when the process is gone
+                spec(
+                    &name,
+                    &["s='line\n'; for i in 1 2 3 4 5 6 7 8 9 10 \
+                    11 12 13; do s=$s$s; done; printf %s \"${s}last\n\""],
+                ),
+            )
+            .unwrap();
+        rt.start_container(&id).unwrap();
+        // as soon as it is exited, not 20 ms later as wait_exited looks
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rt.container(&id).unwrap().state != ContainerState::Exited {
+            assert!(Instant::now() < deadline, "{name} did not exit");
+            std::thread::yield_now();
+        }
+        let log = fs::read_to_string(logs.join(format!("{name}.log"))).unwrap();
+        assert!(
+            log.ends_with(" stdout F last\n"),
+            "run {run}: {} lines, ends {:?}",
+            log.lines().count(),
+            log.lines().last()
+        );
+    }
+    rt.remove_pod(&pod).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
 fn a_rotated_log_is_reopened() {
     if !is_root() {
         eprintln!("not root, runtime test skipped");
