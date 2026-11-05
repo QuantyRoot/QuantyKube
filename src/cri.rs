@@ -984,7 +984,21 @@ impl Service for Cri {
         let mut parts = path.trim_start_matches('/').splitn(2, '/');
         let service = parts.next().unwrap_or("");
         let method = parts.next().unwrap_or("");
-        self.call(service, method, body)
+        let start = std::time::Instant::now();
+        let result = self.call(service, method, body);
+        // what a pod's start is made of, in the journal: the kubelet
+        // calls these once per pod or container, the rest all the time
+        if matches!(
+            method,
+            "RunPodSandbox" | "CreateContainer" | "StartContainer" | "PullImage"
+        ) {
+            eprintln!(
+                "quantykube: {method} {} ms{}",
+                start.elapsed().as_millis(),
+                if result.is_err() { ", failed" } else { "" }
+            );
+        }
+        result
     }
 
     fn stream(&self, method: &str, _requests: Receiver<Vec<u8>>, responder: Responder) {

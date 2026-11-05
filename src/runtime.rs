@@ -673,9 +673,13 @@ impl Runtime {
             spec.host_network,
             spec.host_ipc,
         )?;
+        let started = Instant::now();
         let network = match self.network().filter(|_| !spec.host_network) {
             Some(cni) => match cni.add(&id, &dir.join("ns").join("net"), &spec.ports) {
-                Ok(result) => Some(result),
+                Ok(result) => {
+                    eprintln!("quantykube: CNI add {} ms", started.elapsed().as_millis());
+                    Some(result)
+                }
                 Err(e) => {
                     let _ = cni.del(&id, &dir.join("ns").join("net"), None, &spec.ports);
                     let _ = sys::release_namespaces(&dir.join("ns"));
