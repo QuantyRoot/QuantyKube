@@ -903,6 +903,23 @@ unmodified kube-apiserver forwards to it, `kubectl-quanty` lists a
 ConfigMap's history and brings it back, and a user without a role is
 refused.
 
+*Addendum, 16 November:* `install store` (ADR-035) registers it too;
+until now only the CI's own clusters did, so a cluster moved by the
+installer had a store without a history API. The installer makes a CA
+of its own and a certificate for `quantykube.kube-system.svc` once,
+under `/var/lib/quantykube/history`, and keeps them for the next move,
+so the CA the API server trusts does not change. The store serves on
+the node's `--advertise-address`, port 2480, to the front proxy CA
+from `--requestheader-client-ca-file` alone. After the API server is
+ready on the store, the installer applies the Service, its
+EndpointSlice and the APIService with the API server's kubelet client
+certificate. If that fails, the move stays and the installer says so:
+the cluster works without its history. The undo deletes the three
+before the store's keys go back to etcd, and drops them from the copy
+in any case, because an APIService with no server behind it makes
+every discovery by kubectl report an error. A cluster without a front
+proxy CA gets a store without the history API, as before.
+
 ## ADR-029: The demonstration and the installer target kubeadm
 
 The cluster on stage is upstream Kubernetes set up with kubeadm, on

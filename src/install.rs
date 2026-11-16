@@ -39,9 +39,206 @@ impl Layout {
     fn pki(&self, name: &str) -> PathBuf {
         self.kubernetes.join("pki").join(name)
     }
+    fn history(&self, name: &str) -> PathBuf {
+        self.state.join("history").join(name)
+    }
 }
 
 const UNIT: &str = "/etc/systemd/system/quantykube-store.service";
+
+/// Where the store serves the history API to kube-apiserver (ADR-028).
+const HISTORY_PORT: u16 = 2480;
+const APISERVICE: &str = "v1alpha1.quanty.quantyroot.io";
+/// What `install store` registers with the API server for the history
+/// API, as path and name; the undo deletes them before etcd gets the
+/// store's keys back, and never copies them back if that failed.
+const HISTORY_OBJECTS: [(&str, &str); 3] = [
+    ("/apis/apiregistration.k8s.io/v1/apiservices", APISERVICE),
+    (
+        "/apis/discovery.k8s.io/v1/namespaces/kube-system/endpointslices",
+        "quantykube",
+    ),
+    ("/api/v1/namespaces/kube-system/services", "quantykube"),
+];
+const HISTORY_KEYS: [&str; 3] = [
+    "/registry/apiregistration.k8s.io/apiservices/v1alpha1.quanty.quantyroot.io",
+    "/registry/endpointslices/kube-system/quantykube",
+    "/registry/services/specs/kube-system/quantykube",
+];
+
+/// How the store serves the history API: on the node's own address, to
+/// the API server's front proxy certificate only.
+struct History {
+    listen: String,
+    client_ca: PathBuf,
+}
+
+impl History {
+    fn of(manifest: &str) -> Option<History> {
+        let host = flag(manifest, "advertise-address")?;
+        let client_ca = flag(manifest, "requestheader-client-ca-file")?;
+        Some(History {
+            listen: format!("{host}:{HISTORY_PORT}"),
+            client_ca: PathBuf::from(client_ca),
+        })
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The history API's own CA and serving certificate, made on the first
+/// move and kept for the next, so that the CA the API server trusts for
+/// it stays the same. Returns the CA as PEM.
+fn history_pki(l: &Layout) -> Result<String, String> {
+    use quantycore::tls::crypto::ec::Curve;
+    use quantycore::tls::x509::build::{issue, Issuer, Params, SanEntry};
+    use quantycore::tls::x509::{pem, PrivateKey};
+    let (ca_file, cert_file, key_file) = (
+        l.history("ca.crt"),
+        l.history("server.crt"),
+        l.history("server.key"),
+    );
+    if let (Ok(ca), true, true) = (
+        fs::read_to_string(&ca_file),
+        cert_file.exists(),
+        key_file.exists(),
+    ) {
+        return Ok(ca);
+    }
+    let dir = l.state.join("history");
+    fs::create_dir_all(&dir).map_err(err(dir.display()))?;
+    let gen = |what: &str| {
+        PrivateKey::generate_ec(Curve::P256).map_err(|e| format!("a key for the {what}: {e:?}"))
+    };
+    let (from, until) = (now_secs() - 3600, now_secs() + 10 * 365 * 86400);
+    let ca_key = gen("history CA")?;
+    let ca = issue(
+        &Params::ca("quantykube history CA", from, until),
+        &ca_key.public_spki(),
+        None,
+        &ca_key,
+    )
+    .map_err(|e| format!("the history CA: {e:?}"))?;
+    let key = gen("history API")?;
+    let issuer = Issuer::from_certificate(&ca, &ca_key).map_err(|e| format!("{e:?}"))?;
+    let cert = issue(
+        &Params::end_entity(
+            "quantykube.kube-system.svc",
+            vec![SanEntry::Dns("quantykube.kube-system.svc".into())],
+            from,
+            until,
+        ),
+        &key.public_spki(),
+        Some(&issuer),
+        &key,
+    )
+    .map_err(|e| format!("the history API's certificate: {e:?}"))?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_file)
+            .map_err(err(key_file.display()))?;
+        io::Write::write_all(&mut f, key.to_pem().as_bytes()).map_err(err(key_file.display()))?;
+    }
+    fs::write(&cert_file, pem::encode("CERTIFICATE", &cert)).map_err(err(cert_file.display()))?;
+    let ca_pem = pem::encode("CERTIFICATE", &ca);
+    // last: its presence says the other two are complete
+    fs::write(&ca_file, &ca_pem).map_err(err(ca_file.display()))?;
+    Ok(ca_pem)
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The API server of this node, asked as a cluster admin with the
+/// certificate kubeadm gives it for its kubelets.
+fn kube(l: &Layout, manifest: &str) -> Result<crate::kube::Kube, String> {
+    let host = flag(manifest, "advertise-address").ok_or("no --advertise-address")?;
+    let port = flag(manifest, "secure-port").unwrap_or_else(|| "6443".into());
+    crate::kube::Kube::with_certificate(
+        &format!("{host}:{port}"),
+        &l.pki("ca.crt"),
+        &l.pki("apiserver-kubelet-client.crt"),
+        &l.pki("apiserver-kubelet-client.key"),
+    )
+}
+
+/// Registers the history API with the API server: a Service without
+/// pods, its EndpointSlice with the store's address, and the APIService.
+fn register_history(l: &Layout, manifest: &str, h: &History, ca: &str) -> Result<(), String> {
+    let k = kube(l, manifest)?;
+    let (ip, _) = h.listen.rsplit_once(':').ok_or("no port")?;
+    let q = |s: &str| quantycore::json::Value::String(s.to_string()).to_string();
+    let objects = [
+        format!(
+            r#"{{"apiVersion":"v1","kind":"Service","metadata":{{"name":"quantykube","namespace":"kube-system"}},"spec":{{"ports":[{{"port":443,"targetPort":{HISTORY_PORT}}}]}}}}"#
+        ),
+        format!(
+            r#"{{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{{"name":"quantykube","namespace":"kube-system","labels":{{"kubernetes.io/service-name":"quantykube"}}}},"addressType":"IPv4","ports":[{{"port":{HISTORY_PORT}}}],"endpoints":[{{"addresses":[{ip}]}}]}}"#,
+            ip = q(ip)
+        ),
+        format!(
+            r#"{{"apiVersion":"apiregistration.k8s.io/v1","kind":"APIService","metadata":{{"name":"{APISERVICE}"}},"spec":{{"group":"quanty.quantyroot.io","version":"v1alpha1","service":{{"namespace":"kube-system","name":"quantykube","port":443}},"caBundle":{ca},"groupPriorityMinimum":1000,"versionPriority":15}}}}"#,
+            ca = q(&base64(ca.as_bytes()))
+        ),
+    ];
+    let paths = [
+        "/api/v1/namespaces/kube-system/services/quantykube".to_string(),
+        "/apis/discovery.k8s.io/v1/namespaces/kube-system/endpointslices/quantykube".to_string(),
+        format!("/apis/apiregistration.k8s.io/v1/apiservices/{APISERVICE}"),
+    ];
+    for (path, body) in paths.iter().zip(&objects) {
+        let v = quantycore::json::parse(body).map_err(|e| format!("{path}: {e:?}"))?;
+        let r = k.apply(path, &v)?;
+        if !r.ok() {
+            return Err(format!("{path}: {}", r.message()));
+        }
+    }
+    // the API server takes its time to find the service
+    wait("the history API answering", 60, || {
+        let r = k.get("/apis/quanty.quantyroot.io/v1alpha1")?;
+        if r.ok() {
+            Ok(())
+        } else {
+            Err(r.message())
+        }
+    })
+}
+
+/// Deletes what `register_history` made; what was never made is fine.
+fn unregister_history(l: &Layout, manifest: &str) -> Result<(), String> {
+    let k = kube(l, manifest)?;
+    for (dir, name) in HISTORY_OBJECTS {
+        let r = k.delete(&format!("{dir}/{name}"))?;
+        if !r.ok() && r.status != 404 {
+            return Err(format!("{dir}/{name}: {}", r.message()));
+        }
+    }
+    Ok(())
+}
 
 fn err(context: impl std::fmt::Display) -> impl FnOnce(io::Error) -> String {
     move |e| format!("{context}: {e}")
@@ -194,14 +391,23 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn store_unit(l: &Layout) -> String {
+fn store_unit(l: &Layout, history: Option<&History>) -> String {
+    let api = history.map_or(String::new(), |h| {
+        format!(
+            " --api-listen {} --api-cert {} --api-key {} --api-client-ca {}",
+            h.listen,
+            l.history("server.crt").display(),
+            l.history("server.key").display(),
+            h.client_ca.display()
+        )
+    });
     format!(
         "[Unit]\n\
          Description=QuantyKube store\n\
          After=network-online.target\n\
          [Service]\n\
          ExecStart={bin} serve --data {data} --socket /run/quantykube/store.sock --wal \
-         --listen 127.0.0.1:{port} --cert {cert} --key {key} --client-ca {ca}\n\
+         --listen 127.0.0.1:{port} --cert {cert} --key {key} --client-ca {ca}{api}\n\
          RuntimeDirectory=quantykube\n\
          Restart=always\n\
          RestartSec=1\n\
@@ -256,6 +462,18 @@ pub fn install(l: &Layout) -> Result<(), String> {
         ));
     }
 
+    let history = History::of(&manifest);
+    let history_ca = match &history {
+        Some(_) => Some(history_pki(l)?),
+        None => {
+            eprintln!(
+                "quantykube: no --requestheader-client-ca-file in the manifest; \
+                 the store serves no history API"
+            );
+            None
+        }
+    };
+
     fs::create_dir_all(l.journal()).map_err(err(l.journal().display()))?;
     fs::write(l.original(), &manifest).map_err(err(l.original().display()))?;
     step(l, "stopping the API server")?;
@@ -275,7 +493,7 @@ pub fn install(l: &Layout) -> Result<(), String> {
         fs::write(l.journal().join("revision"), format!("{}\n", copy.revision))
             .map_err(err("journal"))?;
         step(l, "starting the store")?;
-        fs::write(UNIT, store_unit(l)).map_err(err(UNIT))?;
+        fs::write(UNIT, store_unit(l, history.as_ref())).map_err(err(UNIT))?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", "quantykube-store.service"])?;
         wait("the store starting", 60, || store_ready(l))?;
@@ -289,6 +507,17 @@ pub fn install(l: &Layout) -> Result<(), String> {
     })();
     match moved {
         Ok(copy) => {
+            if let (Some(h), Some(ca)) = (&history, &history_ca) {
+                // the cluster runs without it; the move stays
+                match register_history(l, &switched, h, ca) {
+                    Ok(()) => {
+                        eprintln!("quantykube: the history API is registered as {APISERVICE}")
+                    }
+                    Err(e) => {
+                        eprintln!("quantykube: WARNING: the history API is not registered: {e}")
+                    }
+                }
+            }
             step(l, "done")?;
             println!(
                 "the API server is on QuantyKube: {} keys as of etcd revision {}; \
@@ -320,10 +549,13 @@ fn copy_back(l: &Layout, original: &str, at: &str) -> Result<(), String> {
     // read from the file, with the store stopped: nothing writes to it
     // now, and a large answer over gRPC is what C1 of the review is about
     systemctl(&["stop", "quantykube-store.service"])?;
-    let copy = {
+    let mut copy = {
         let store = crate::store::Quanty::open(&l.data()).map_err(|e| e.to_string())?;
         crate::etcd::copy_of(&store).map_err(|e| format!("reading the store: {e}"))?
     };
+    // etcd's API server has no store to send history requests to
+    copy.records
+        .retain(|r| !HISTORY_KEYS.iter().any(|k| r.key == k.as_bytes()));
     if copy.revision == recorded {
         return Ok(());
     }
@@ -366,6 +598,11 @@ pub fn undo(l: &Layout) -> Result<(), String> {
     eprintln!("quantykube: undoing the move recorded at step {at}");
     let parked = l.journal().join("kube-apiserver.parked");
     let current = fs::read_to_string(l.manifest()).ok();
+    if let Some(c) = current.as_deref().filter(|_| at == "done") {
+        if let Err(e) = unregister_history(l, c) {
+            eprintln!("quantykube: the history API stays registered on the store: {e}");
+        }
+    }
     if current.is_some() {
         fs::rename(l.manifest(), &parked).map_err(err(l.manifest().display()))?;
     }
@@ -432,6 +669,59 @@ mod tests {
             "only the value changes"
         );
         assert_eq!(with_flag(MANIFEST, "etcd-cafile", "x"), None);
+    }
+
+    #[test]
+    fn base64_is_standard_and_padded() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(&[0xfb, 0xff]), "+/8=");
+    }
+
+    #[test]
+    fn the_history_api_is_served_on_the_node_s_address_to_the_front_proxy() {
+        let m = MANIFEST.replace(
+            "    image",
+            "    - --requestheader-client-ca-file=/k/pki/front-proxy-ca.crt\n    image",
+        );
+        assert!(
+            History::of(MANIFEST).is_none(),
+            "no front proxy, no history API"
+        );
+        let h = History::of(&m).unwrap();
+        assert_eq!(h.listen, "10.0.0.5:2480");
+        let dir = std::env::temp_dir().join(format!("qk-history-{}", std::process::id()));
+        let l = Layout {
+            kubernetes: "/k".into(),
+            state: dir.clone(),
+            port: 2479,
+            binary: "/q".into(),
+        };
+        let unit = store_unit(&l, Some(&h));
+        assert!(unit.contains(&format!(
+            " --api-listen 10.0.0.5:2480 --api-cert {d}/history/server.crt \
+             --api-key {d}/history/server.key --api-client-ca /k/pki/front-proxy-ca.crt\n",
+            d = dir.display()
+        )));
+        assert!(!store_unit(&l, None).contains("--api-listen"));
+        let ca = history_pki(&l).unwrap();
+        assert!(ca.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert_eq!(history_pki(&l).unwrap(), ca, "made once, then kept");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(l.history("server.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "the key is the owner's alone");
+        crate::tlsnet::server_config(
+            &l.history("server.crt"),
+            &l.history("server.key"),
+            &l.history("ca.crt"),
+        )
+        .expect("the store can serve with them");
+        let _ = fs::remove_dir_all(dir);
     }
 }
 

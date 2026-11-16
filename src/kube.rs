@@ -59,6 +59,22 @@ impl Kube {
         })
     }
 
+    /// The API server at `addr`, as the holder of a client certificate,
+    /// which is how the installer on a control plane node asks it.
+    pub fn with_certificate(
+        addr: &str,
+        ca: &Path,
+        cert: &Path,
+        key: &Path,
+    ) -> Result<Kube, String> {
+        let config = crate::etcdclient::client_config(ca, Some((cert, key)), &[b"http/1.1"])?;
+        Ok(Kube {
+            addr: addr.to_string(),
+            token: String::new(),
+            config: Arc::new(config),
+        })
+    }
+
     pub fn get(&self, path: &str) -> Result<Response, String> {
         self.request("GET", path, None)
     }
@@ -80,6 +96,17 @@ impl Kube {
         )
     }
 
+    /// A server-side apply of the whole object, as `kubectl apply
+    /// --server-side --force-conflicts` does.
+    pub fn apply(&self, path: &str, body: &Value) -> Result<Response, String> {
+        let path = format!("{path}?fieldManager=quantykube&force=true");
+        self.request(
+            "PATCH",
+            &path,
+            Some(("application/apply-patch+yaml", body.to_string())),
+        )
+    }
+
     fn request(
         &self,
         method: &str,
@@ -88,10 +115,12 @@ impl Kube {
     ) -> Result<Response, String> {
         let fail = |e: std::io::Error| format!("{method} {path}: {e}");
         let mut stream = crate::etcdclient::connect(&self.addr, &self.config).map_err(fail)?;
-        let mut head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
-             Accept: application/json\r\nUser-Agent: quantykube\r\nConnection: close\r\n",
-            self.addr, self.token
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", self.addr);
+        if !self.token.is_empty() {
+            head.push_str(&format!("Authorization: Bearer {}\r\n", self.token));
+        }
+        head.push_str(
+            "Accept: application/json\r\nUser-Agent: quantykube\r\nConnection: close\r\n",
         );
         let payload = match &body {
             Some((ctype, text)) => {

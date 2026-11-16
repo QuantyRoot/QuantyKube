@@ -235,6 +235,8 @@ if [ "$mode" = apply ]; then
     [ "$(kubectl logs probe)" = hello-from-web ] || fail "the probe's answer"
     kubectl delete pod probe >/dev/null
     kubectl create configmap during --from-literal=v=2 >/dev/null
+    kubectl get --raw /apis/quanty.quantyroot.io/v1alpha1 >/dev/null ||
+        fail "the history API is not registered"
     echo "kubectl apply: ok"
 
     kubectl patch installation quantykube --type merge \
@@ -247,6 +249,8 @@ if [ "$mode" = apply ]; then
         fail "what was written on the store is not in etcd"
     kubectl rollout status deploy/web --timeout=180s >/dev/null ||
         fail "web is not ready after the undo"
+    kubectl get apiservice v1alpha1.quanty.quantyroot.io >/dev/null 2>&1 &&
+        fail "the history API is still registered on etcd"
     echo "undo: ok"
     exit 0
 fi
@@ -342,6 +346,23 @@ if [ "$mode" = move ]; then
         -o jsonpath='{.metadata.resourceVersion}')
     echo "install store: ok"
 
+    # the history through the Kubernetes API, as kubectl quanty asks it
+    # from a laptop (ADR-028)
+    kubectl get --raw /apis/quanty.quantyroot.io/v1alpha1 >/dev/null ||
+        { cat "$work/install.log"; fail "the history API is not registered"; }
+    plugin="${QKP:-target/release/kubectl-quanty}"
+    kubectl create configmap hist --from-literal=v=1 >/dev/null
+    kubectl patch configmap hist -p '{"data":{"v":"2"}}' >/dev/null
+    kubectl delete configmap hist >/dev/null
+    key=/registry/configmaps/default/hist
+    steps=$(KUBECTL=kubectl "$plugin" history "$key" | awk '{print $4}' | tr '\n' ' ')
+    [ "$steps" = "create update delete " ] || fail "the history of hist: '$steps'"
+    rev=$(KUBECTL=kubectl "$plugin" history "$key" | awk '$4 == "update" {print $1}')
+    KUBECTL=kubectl "$plugin" restore --rev "$rev" "$key" >/dev/null
+    [ "$(kubectl get configmap hist -o jsonpath='{.data.v}')" = 2 ] ||
+        fail "hist is not restored"
+    echo "kubectl quanty history and restore: ok"
+
     "$QK" undo store >"$work/undo.log" 2>&1 ||
         { cat "$work/undo.log"; fail "undo store"; }
     cmp -s "$manifest" "$work/original.yaml" ||
@@ -360,6 +381,10 @@ if [ "$mode" = move ]; then
     n=$(kubectl -n kube-system get deploy coredns -o jsonpath='{.spec.replicas}')
     [ "$n" = 3 ] || fail "the scale on the store is not in etcd: $n"
     systemctl is-active -q quantykube-store && fail "the store still runs"
+    kubectl get apiservice v1alpha1.quanty.quantyroot.io >/dev/null 2>&1 &&
+        fail "the history API is still registered on etcd"
+    kubectl -n kube-system get service quantykube >/dev/null 2>&1 &&
+        fail "the history API's service is still there on etcd"
     echo "undo store: ok"
     exit 0
 fi
