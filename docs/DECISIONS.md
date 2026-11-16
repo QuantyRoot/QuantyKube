@@ -912,8 +912,10 @@ so the CA the API server trusts does not change. The store serves on
 the node's `--advertise-address`, port 2480, to the front proxy CA
 from `--requestheader-client-ca-file` alone. After the API server is
 ready on the store, the installer applies the Service, its
-EndpointSlice and the APIService with the API server's kubelet client
-certificate. If that fails, the move stays and the installer says so:
+EndpointSlice and the APIService as kubeadm's cluster admin, with the
+client certificate from `admin.conf`; the API server's own kubelet
+client certificate is no cluster admin since Kubernetes 1.29, which CI
+found. If that fails, the move stays and the installer says so:
 the cluster works without its history. The undo deletes the three
 before the store's keys go back to etcd, and drops them from the copy
 in any case, because an APIService with no server behind it makes

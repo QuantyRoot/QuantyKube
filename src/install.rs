@@ -173,17 +173,62 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// The API server of this node, asked as a cluster admin with the
-/// certificate kubeadm gives it for its kubelets.
+/// Standard base64, padded or not.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    crate::aggapi::base64url_decode(&s.trim().replace('+', "-").replace('/', "_"))
+}
+
+/// The value of `name: ` in a kubeconfig, the first one.
+fn kubeconfig_field<'a>(config: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}: ");
+    config
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(&prefix))
+        .map(str::trim)
+}
+
+/// The API server of this node, asked as kubeadm's cluster admin, with
+/// the client certificate in admin.conf: since Kubernetes 1.29 the API
+/// server's own kubelet client certificate is no longer one.
 fn kube(l: &Layout, manifest: &str) -> Result<crate::kube::Kube, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let host = flag(manifest, "advertise-address").ok_or("no --advertise-address")?;
     let port = flag(manifest, "secure-port").unwrap_or_else(|| "6443".into());
-    crate::kube::Kube::with_certificate(
-        &format!("{host}:{port}"),
-        &l.pki("ca.crt"),
-        &l.pki("apiserver-kubelet-client.crt"),
-        &l.pki("apiserver-kubelet-client.key"),
-    )
+    let conf = l.kubernetes.join("admin.conf");
+    let text = fs::read_to_string(&conf).map_err(err(conf.display()))?;
+    let field = |name: &str| {
+        kubeconfig_field(&text, name)
+            .and_then(base64_decode)
+            .ok_or(format!("no {name} in {}", conf.display()))
+    };
+    let (cert, key) = (field("client-certificate-data")?, field("client-key-data")?);
+    // only for as long as the client is made: it reads them once
+    let dir = l.journal();
+    fs::create_dir_all(&dir).map_err(err(dir.display()))?;
+    let (cert_file, key_file) = (dir.join("admin.crt"), dir.join("admin.key"));
+    let write = |path: &Path, data: &[u8]| -> Result<(), String> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(err(path.display()))?;
+        io::Write::write_all(&mut f, data).map_err(err(path.display()))
+    };
+    let made = write(&cert_file, &cert)
+        .and_then(|()| write(&key_file, &key))
+        .and_then(|()| {
+            crate::kube::Kube::with_certificate(
+                &format!("{host}:{port}"),
+                &l.pki("ca.crt"),
+                &cert_file,
+                &key_file,
+            )
+        });
+    let _ = fs::remove_file(&cert_file);
+    let _ = fs::remove_file(&key_file);
+    made
 }
 
 /// Registers the history API with the API server: a Service without
@@ -669,6 +714,18 @@ mod tests {
             "only the value changes"
         );
         assert_eq!(with_flag(MANIFEST, "etcd-cafile", "x"), None);
+    }
+
+    #[test]
+    fn the_admin_s_certificate_is_read_from_admin_conf() {
+        let conf = "users:\n- name: kubernetes-admin\n  user:\n    \
+                    client-certificate-data: Zm9v+/8=\n    client-key-data: YmFy\n";
+        let v = kubeconfig_field(conf, "client-certificate-data").unwrap();
+        assert_eq!(base64_decode(v).unwrap(), b"foo\xfb\xff");
+        assert_eq!(
+            base64_decode(kubeconfig_field(conf, "client-key-data").unwrap()).unwrap(),
+            b"bar"
+        );
     }
 
     #[test]
