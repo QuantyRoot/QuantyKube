@@ -128,7 +128,7 @@ providers:
     options:
       path: /var/lib/grafana/dashboards
 CONF
-cp "$here/deploy/grafana/quantykube.json" /var/lib/grafana/dashboards/
+cp "$here"/deploy/grafana/*.json /var/lib/grafana/dashboards/
 chown -R grafana:grafana /var/lib/grafana/dashboards
 systemctl enable --now grafana-server >/dev/null 2>&1
 systemctl restart grafana-server

@@ -4,9 +4,9 @@
 # cp as root: kubectl with admin.conf, Prometheus from monitoring.sh on
 # 127.0.0.1:9090.
 #
-#   scripts/measure.sh <label> [node...]      default nodes: w1 w2
+#   [RUNS=3] scripts/measure.sh <label> [node...]   default nodes: w1 w2
 #
-# For each node, with the same pods pinned to it:
+# RUNS times (default 3), for each node, with the same pods pinned to it:
 #   start   20 single pods one after another, kubectl apply to Ready as
 #           kubectl sees it; the API server and scheduler are the same
 #           for every node, so the difference is the node
@@ -17,12 +17,14 @@
 # and once for the store on cp (etcd or quantykube-store).
 #
 # Results go to measure/<label>-<time>/: one CSV per kind and
-# summary.md. The image is pulled once per node before anything is
-# timed.
+# summary.md, which gives the median over the runs and, in brackets,
+# the lowest and highest run. The image is pulled once per node before
+# anything is timed.
 set -euo pipefail
 shopt -s inherit_errexit
 
 label=${1:?label, e.g. before or after}
+runs=${RUNS:-3}
 shift
 nodes=("$@")
 [ ${#nodes[@]} -gt 0 ] || nodes=(w1 w2)
@@ -110,12 +112,13 @@ runtime_of() {
     kubectl get node "$1" -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}'
 }
 
-echo "node,runtime,run,ms" >"$out/start.csv"
-echo "node,runtime,pods,ready_ms,runtime_mib,runtime_procs" >"$out/many.csv"
+echo "round,node,runtime,run,ms" >"$out/start.csv"
+echo "round,node,runtime,pods,ready_ms,runtime_mib,runtime_procs" >"$out/many.csv"
 
+for round in $(seq 1 "$runs"); do
 for n in "${nodes[@]}"; do
     rt=$(runtime_of "$n")
-    echo "== $n ($rt)"
+    echo "== run $round of $runs: $n ($rt)"
     pod warm "$n" | kubectl apply -f - >/dev/null
     kubectl -n "$ns" wait --for=condition=Ready pod/warm --timeout=300s >/dev/null
     kubectl -n "$ns" delete pod warm --wait=true >/dev/null
@@ -124,7 +127,7 @@ for n in "${nodes[@]}"; do
         t=$(date +%s%N)
         pod "p$i" "$n" | kubectl apply -f - >/dev/null
         kubectl -n "$ns" wait --for=condition=Ready "pod/p$i" --timeout=120s >/dev/null
-        echo "$n,$rt,$i,$(ms "$t")" >>"$out/start.csv"
+        echo "$round,$n,$rt,$i,$(ms "$t")" >>"$out/start.csv"
         kubectl -n "$ns" delete pod "p$i" --wait=true >/dev/null
     done
 
@@ -134,12 +137,13 @@ for n in "${nodes[@]}"; do
         kubectl -n "$ns" rollout status deploy/many --timeout=600s >/dev/null
         ready=$(ms "$t")
         sleep 60
-        echo "$n,$rt,$count,$ready,$(mem "$n"),$(procs "$n")" >>"$out/many.csv"
+        echo "$round,$n,$rt,$count,$ready,$(mem "$n"),$(procs "$n")" >>"$out/many.csv"
         echo "   $count pods ready in $ready ms"
         kubectl -n "$ns" delete deploy many --wait=true >/dev/null
         kubectl -n "$ns" wait --for=delete pod -l app=many --timeout=300s \
             >/dev/null 2>&1 || true
     done
+done
 done
 
 store=$(promq "sum(avg_over_time(namedprocess_namegroup_memory_bytes{memtype=\"resident\",node=\"cp\",groupname=~\"etcd|quantykube-store\"}[5m])) / 1048576")
@@ -157,19 +161,35 @@ out, label = sys.argv[1], sys.argv[2]
 start = list(csv.DictReader(open(f"{out}/start.csv")))
 many = list(csv.DictReader(open(f"{out}/many.csv")))
 store = list(csv.DictReader(open(f"{out}/store.csv")))
-lines = [f"# {label}", "", "## Pod start, apply to Ready, 20 pods one by one", "",
+rounds = len(set(r["round"] for r in start))
+
+def spread(values, fmt="{:.0f}"):
+    """The median of the runs, and the lowest and highest run."""
+    m = statistics.median(values)
+    if len(values) == 1:
+        return fmt.format(m)
+    return f"{fmt.format(m)} ({fmt.format(min(values))} to {fmt.format(max(values))})"
+
+lines = [f"# {label}", "", f"{rounds} runs; the median of the runs, in brackets the lowest and highest run.", "",
+         "## Pod start, apply to Ready, 20 pods one by one per run", "",
          "| node | runtime | median ms | p90 ms |", "| --- | --- | --- | --- |"]
 for node in dict.fromkeys(r["node"] for r in start):
-    v = sorted(int(r["ms"]) for r in start if r["node"] == node)
     rt = next(r["runtime"] for r in start if r["node"] == node)
-    p90 = v[min(len(v) - 1, int(len(v) * 0.9))]
-    lines.append(f"| {node} | {rt} | {statistics.median(v):.0f} | {p90} |")
+    med, p90 = [], []
+    for rd in dict.fromkeys(r["round"] for r in start):
+        v = sorted(int(r["ms"]) for r in start if r["node"] == node and r["round"] == rd)
+        med.append(statistics.median(v))
+        p90.append(v[min(len(v) - 1, int(len(v) * 0.9))])
+    lines.append(f"| {node} | {rt} | {spread(med)} | {spread(p90)} |")
 lines += ["", "## Many pods", "",
           "| node | pods | all Ready ms | runtime MiB | runtime processes |",
           "| --- | --- | --- | --- | --- |"]
-for r in many:
-    lines.append(f"| {r['node']} | {r['pods']} | {r['ready_ms']} | "
-                 f"{float(r['runtime_mib']):.1f} | {float(r['runtime_procs']):.0f} |")
+for node in dict.fromkeys(r["node"] for r in many):
+    for pods in dict.fromkeys(r["pods"] for r in many):
+        rs = [r for r in many if r["node"] == node and r["pods"] == pods]
+        lines.append(f"| {node} | {pods} | {spread([int(r['ready_ms']) for r in rs])} | "
+                     f"{spread([float(r['runtime_mib']) for r in rs], '{:.1f}')} | "
+                     f"{spread([float(r['runtime_procs']) for r in rs])} |")
 lines += ["", "## Store on cp, resident memory over 5 minutes", ""]
 for r in store:
     lines.append(f"{r['store']}: {float(r['mib_5m']):.1f} MiB")
