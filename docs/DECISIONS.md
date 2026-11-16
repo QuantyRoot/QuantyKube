@@ -922,6 +922,13 @@ in any case, because an APIService with no server behind it makes
 every discovery by kubectl report an error. A cluster without a front
 proxy CA gets a store without the history API, as before.
 
+*Addendum, 16 November:* the undo moved etcd's revision on one write
+at a time, each on a connection of its own: about 4 ms a revision,
+two minutes after a few hours on the store, two hours after ten days.
+The writes now go over one connection, 256 at once, and etcd puts
+those that arrive together under one fsync: 50 000 revisions in about
+three seconds (tests/etcd_revision.rs, against etcd 3.6).
+
 ## ADR-029: The demonstration and the installer target kubeadm
 
 The cluster on stage is upstream Kubernetes set up with kubeadm, on

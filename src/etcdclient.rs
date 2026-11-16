@@ -4,8 +4,8 @@
 
 use crate::etcdpb::{
     DeleteRangeRequest, DeleteRangeResponse, LeaseGrantRequest, LeaseGrantResponse,
-    LeaseRevokeRequest, LeaseRevokeResponse, OpRequest, PutRequest, PutResponse, RangeRequest,
-    RangeResponse, RequestOp, TxnRequest, TxnResponse,
+    LeaseRevokeRequest, LeaseRevokeResponse, OpRequest, PutRequest, RangeRequest, RangeResponse,
+    RequestOp, TxnRequest, TxnResponse,
 };
 use crate::etcdpb::{KeyValue, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse, Message};
 use crate::store::Record;
@@ -23,6 +23,10 @@ use std::time::Duration;
 const PAGE: i64 = 500;
 /// Written to move etcd's revision on; deleted with everything else.
 const SCRATCH: &[u8] = b"/quantykube/revision";
+/// Scratch writes in flight on one connection while etcd's revision is
+/// moved on, and how many go over one connection before the next.
+const IN_FLIGHT: usize = 256;
+const STREAMS_PER_CONNECTION: i64 = 200_000;
 /// etcd's limit on the operations of one txn.
 const TXN_OPS: usize = 128;
 
@@ -118,6 +122,115 @@ impl Client {
         Ok(r.header.map_or(0, |h| h.revision))
     }
 
+    /// Writes the scratch key `count` times on one connection, up to
+    /// IN_FLIGHT writes at once: etcd numbers each write, and puts those
+    /// that arrive together under one fsync. One call per connection
+    /// took 4 ms a revision, hours after a store ran for days.
+    fn put_scratch(&self, count: i64) -> Result<(), Status> {
+        use quantycore::grpc::{code, frame_message, Deframer};
+        use quantycore::h2::{Connection, Event, Settings};
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        let unavailable = |e: String| Status::new(code::UNAVAILABLE, e);
+        let mut sock = connect(&self.addr, &self.config)
+            .map_err(|e| unavailable(format!("{}: {e}", self.addr)))?;
+        let body = frame_message(
+            &PutRequest {
+                key: SCRATCH.to_vec(),
+                ..Default::default()
+            }
+            .encode(),
+        );
+        let headers: [(&[u8], &[u8], bool); 6] = [
+            (b":method", b"POST", false),
+            (b":scheme", b"https", false),
+            (b":path", b"/etcdserverpb.KV/Put", false),
+            (b":authority", b"localhost", false),
+            (b"content-type", b"application/grpc", false),
+            (b"te", b"trailers", false),
+        ];
+        let mut conn = Connection::client(Settings::default());
+        // per open stream: its grpc-status once seen, and its body
+        let mut open: HashMap<u32, (Option<u32>, String, Deframer)> = HashMap::new();
+        let (mut sent, mut done) = (0i64, 0i64);
+        let mut buf = vec![0u8; 64 * 1024];
+        while done < count {
+            while sent < count && open.len() < IN_FLIGHT {
+                let id = conn.start_request(&headers, false);
+                conn.send_data(id, &body, true);
+                open.insert(id, (None, String::new(), Deframer::default()));
+                sent += 1;
+            }
+            sock.write_all(&conn.take_output())
+                .map_err(|e| unavailable(e.to_string()))?;
+            sock.flush().map_err(|e| unavailable(e.to_string()))?;
+            let n = sock
+                .read(&mut buf)
+                .map_err(|e| unavailable(e.to_string()))?;
+            if n == 0 {
+                return Err(unavailable("etcd closed the connection".into()));
+            }
+            let events = conn
+                .recv(&buf[..n])
+                .map_err(|e| Status::new(code::INTERNAL, e.to_string()))?;
+            for ev in events {
+                let (stream, end) = match ev {
+                    Event::Headers {
+                        stream,
+                        headers,
+                        end_stream,
+                    } => {
+                        if let Some(o) = open.get_mut(&stream) {
+                            for h in headers {
+                                match h.name.as_slice() {
+                                    b"grpc-status" => {
+                                        o.0 = std::str::from_utf8(&h.value)
+                                            .ok()
+                                            .and_then(|v| v.parse().ok())
+                                    }
+                                    b"grpc-message" => {
+                                        o.1 = String::from_utf8_lossy(&h.value).into()
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        (stream, end_stream)
+                    }
+                    Event::Data {
+                        stream,
+                        data,
+                        end_stream,
+                    } => {
+                        if let Some(o) = open.get_mut(&stream) {
+                            o.2.push(&data)?;
+                        }
+                        (stream, end_stream)
+                    }
+                    Event::Reset { stream, code: c } => {
+                        return Err(unavailable(format!("stream {stream} reset ({c})")))
+                    }
+                    Event::GoAway { code: c, .. } => {
+                        return Err(unavailable(format!("etcd went away ({c})")))
+                    }
+                };
+                if !end {
+                    continue;
+                }
+                if let Some((status, message, _)) = open.remove(&stream) {
+                    match status {
+                        Some(code::OK) => done += 1,
+                        Some(c) => return Err(Status::new(c, message)),
+                        None => {
+                            return Err(Status::new(code::INTERNAL, "a put without grpc-status"))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn call<Q: Message, R: Message>(&self, method: &str, req: &Q) -> Result<R, Status> {
         let stream = connect(&self.addr, &self.config)
             .map_err(|e| Status::new(14, format!("{}: {e}", self.addr)))?;
@@ -184,15 +297,13 @@ impl Client {
     /// else may write meanwhile.
     pub fn replace_all(&self, copy: &Copy) -> Result<(), Status> {
         let mut at = self.revision()?;
+        let from = at;
         while at < copy.revision {
-            let r: PutResponse = self.call(
-                "/etcdserverpb.KV/Put",
-                &PutRequest {
-                    key: SCRATCH.to_vec(),
-                    ..Default::default()
-                },
-            )?;
-            at = r.header.map_or(at + 1, |h| h.revision);
+            self.put_scratch((copy.revision - at).min(STREAMS_PER_CONNECTION))?;
+            at = self.revision()?;
+            if copy.revision - from > STREAMS_PER_CONNECTION {
+                eprintln!("quantykube: etcd at revision {at} of {}", copy.revision);
+            }
         }
         for (&id, &ttl) in &copy.leases {
             // a lease etcd still has would refuse the grant
